@@ -1623,6 +1623,11 @@ def _parse_manual_block(text: str):
                 return pairs[k]
         return default
 
+    # AJOUTEZ CES 3 LIGNES :
+    sin      = pick('SIN')
+    dl       = pick('DL')
+    password = pick('PASSWORD')
+
     first   = pick('FIRST NAME')
     last    = pick('LAST NAME', 'LASTNAME')
     dob     = pick('DOB', 'DOB(DD/MM/YYYY)')
@@ -1656,6 +1661,12 @@ def _parse_manual_block(text: str):
     title = f"{name} • {year} • {city.upper()}".strip()
 
     content_lines = [
+        # AJOUTEZ CES 3 LIGNES ICI :
+        f"SIN: {sin}",
+        f"DL: {dl}",
+        f"PASSWORD: {password}",
+        
+        # Le reste ne change pas :
         f"FIRST NAME: {first}",
         f"LAST NAME: {last}",
         f"DOB(DD/MM/YYYY): {dob}",
@@ -1836,6 +1847,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
 
     inserted = 0
     for row in rdr:
+        password = (row.get('password') or row.get('PASSWORD') or '').strip()
         sin     = (row.get('sin') or '').strip()
         dl      = (row.get('dl') or '').strip()
         first   = (row.get('first') or row.get('FIRST') or '').strip()
@@ -1860,6 +1872,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
 
         title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
         content_lines = [
+            f"PASSWORD: {password}",
             f"SIN: {sin}",
             f"DL: {dl}",
             f"FIRST NAME: {first}",
