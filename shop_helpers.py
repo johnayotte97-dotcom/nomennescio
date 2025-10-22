@@ -816,3 +816,7 @@ async def cmd_panier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
+
+
