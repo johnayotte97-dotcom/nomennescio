@@ -168,6 +168,7 @@ ASK_QTY, ASK_MODE, MANUAL_PRENOM, MANUAL_NOM, MANUAL_DATE, CSV_WAIT, BULK_CONFIR
 ADMIN_AWAIT_AMOUNT = 200
 ADMIN_WAIT_PRODUCT_TEXT = 201
 ADMIN_WAIT_CSV = 202
+HISTORY_FILTER_CHOICE, HISTORY_FILTER_INPUT = range(300, 302)
 
 # Paliers
 FORFAITS = {
@@ -1061,23 +1062,56 @@ async def hist_menu(update, context):
     ]
     await replace_view(q, "📜 Choisissez une section :", reply_markup=InlineKeyboardMarkup(kb))
 
+# CODE À COLLER À LA LIGNE 1056
 async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche l'historique des produits achetés, avec pagination propre (pas d'accumulation)."""
+    """Affiche l'historique des produits achetés, avec pagination ET FILTRE."""
     from shop_helpers import full_product_text
     import json
 
     q = update.callback_query
     await q.answer()
     uid = str(q.from_user.id)
+    chat_id = update.effective_chat.id
 
     # Supprimer les anciens messages envoyés (pour ne pas accumuler)
     old_msgs = context.user_data.get("hist_msgs", [])
     for mid in old_msgs:
         try:
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=mid)
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
         except:
             pass
     context.user_data["hist_msgs"] = []  # Réinitialiser la liste
+
+    # === DÉBUT DE LA LOGIQUE DE FILTRE ===
+    active_filter = context.user_data.get('history_filter')
+    filter_clause = ""
+    params = [uid] # Paramètre SQL de base (user_id)
+
+    filter_text = "Filtre: Aucun"
+    if active_filter:
+        f_type = active_filter.get('type')
+        f_value = active_filter.get('value', '')
+
+        search_key = ""
+        if f_type == 'sin':
+            search_key = 'sin'
+            filter_text = f"Filtre (SIN): {f_value}"
+        elif f_type == 'dl':
+            search_key = 'dl'
+            filter_text = f"Filtre (DL): {f_value}"
+        elif f_type == 'name':
+            # Recherche dans la colonne 'title' de la table 'purchases'
+            filter_clause = " AND title LIKE ?"
+            params.append(f"%{f_value}%")
+            filter_text = f"Filtre (Nom): {f_value}"
+
+        if search_key:
+            # Recherche dans le blob JSON 'full_data'
+            # On cherche la chaîne "key": "value" (ou une partie)
+            filter_clause = f" AND full_data LIKE ?"
+            params.append(f'%"{search_key}": "{f_value}%')
+    # === FIN DE LA LOGIQUE DE FILTRE ===
+
 
     # Pagination
     page = 0
@@ -1090,32 +1124,36 @@ async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
 
-    cur.execute("SELECT COUNT(*) FROM purchases WHERE user_id = ?", (uid,))
+    # Requête SQL modifiée pour compter avec le filtre
+    count_query = f"SELECT COUNT(*) FROM purchases WHERE user_id = ? {filter_clause}"
+    cur.execute(count_query, tuple(params))
     total = cur.fetchone()[0]
-    per_page = 2
+
+    per_page = 2 # Votre règle de 2 par page
     total_pages = max(1, (total + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     offset = page * per_page
 
-    cur.execute("""
+    # Requête SQL modifiée pour chercher avec filtre et pagination
+    query = f"""
         SELECT id, product_id, full_data, created_at
         FROM purchases
-        WHERE user_id = ?
+        WHERE user_id = ? {filter_clause}
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
-    """, (uid, per_page, offset))
+    """
+    params_page = tuple(params + [per_page, offset])
+    cur.execute(query, params_page)
     rows = cur.fetchall()
     con.close()
 
-    if not rows:
-        await q.edit_message_text("🧾 Aucun achat trouvé.")
-        return
-
-    # Supprimer le message précédent de pagination
+    # Supprimer le message précédent de pagination (le "Page 1/19")
     try:
         await q.message.delete()
     except Exception:
         pass
+
+    sent_messages = [] # Pour stocker les ID des nouveaux messages
 
     # Envoie chaque fiche séparément
     for row in rows:
@@ -1128,7 +1166,7 @@ async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             parsed = {}
 
-        fiche = full_product_text(parsed)
+        fiche = full_product_text(parsed) # Utilise la fonction de shop_helpers
         fiche += f"\n📅 {date}\n🆔 ID achat: `{pid}`"
 
         kb = InlineKeyboardMarkup([
@@ -1141,38 +1179,53 @@ async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=kb
         )
-        # Enregistrer le message pour suppression future
-        context.user_data["hist_msgs"].append(msg_sent.message_id)
+        sent_messages.append(msg_sent.message_id)
 
-    # Pagination + retour (message séparé)
+    # --- Pagination + Filtre + Retour (message séparé) ---
+    nav_row = [
+        InlineKeyboardButton("«", callback_data=f"hist:pros:page:{max(0, page-1)}"),
+        InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+        InlineKeyboardButton("»", callback_data=f"hist:pros:page:{min(total_pages-1, page+1)}"),
+    ]
+
+    # Le bouton filtre que vous vouliez
+    filter_row = [InlineKeyboardButton("🔎 Filtrer", callback_data="history_filter_start")]
+    if active_filter:
+        # Ajoute le bouton Reset SEULEMENT si un filtre est actif
+        filter_row.append(InlineKeyboardButton("❌ Reset Filtre", callback_data="history_filter_reset"))
+
+    back_row = [InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")] # Retour vers le menu hist
+
+    # Désactive les flèches si une seule page
     if total_pages == 1:
-        # Si une seule page, on désactive les flèches gauche/droite
-        nav_kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("«", callback_data="noop"),
-                InlineKeyboardButton("1/1", callback_data="noop"),
-                InlineKeyboardButton("»", callback_data="noop"),
-            ],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")],
-        ])
-    else:
-        nav_kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("«", callback_data=f"hist:pros:page:{max(0, page-1)}"),
-                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
-                InlineKeyboardButton("»", callback_data=f"hist:pros:page:{min(total_pages-1, page+1)}"),
-            ],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")],
-        ])
+        nav_row = [
+            InlineKeyboardButton("«", callback_data="noop"),
+            InlineKeyboardButton(f"1/1", callback_data="noop"),
+            InlineKeyboardButton("»", callback_data="noop"),
+        ]
+
+    kb_layout = [nav_row, filter_row, back_row]
+
+    # Affiche le statut du filtre
+    pagination_msg_text = f"📄 Page {page+1}/{total_pages} ({filter_text})"
+    if not rows and total == 0 and not active_filter:
+         pagination_msg_text = "🧾 Aucun achat trouvé."
+    elif not rows and (total > 0 or active_filter):
+        pagination_msg_text = f"❌ Aucun achat trouvé pour ce filtre. ({filter_text})"
 
     pagination_msg = await context.bot.send_message(
         chat_id=q.message.chat.id,
-        text=f"📄 Page {page+1}/{total_pages}",
-        reply_markup=nav_kb
+        text=pagination_msg_text,
+        reply_markup=InlineKeyboardMarkup(kb_layout)
     )
 
-    # Ajouter aussi le message de pagination à la liste pour qu’il soit supprimé au changement de page
-    context.user_data["hist_msgs"].append(pagination_msg.message_id)
+    # Ajouter tous les messages (fiches + nav) à la liste pour suppression future
+    context.user_data["hist_msgs"] = sent_messages + [pagination_msg.message_id]
+
+
+
+
+
 
 
 async def close_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1201,9 +1254,6 @@ async def close_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Retour propre au menu principal
     await show_main_menu(update.effective_user.id)
     
-
-
-
 async def hist_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1233,6 +1283,126 @@ async def hist_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"\n🕓 Dernière mise à jour : {rows[0][3]}")
 
     await replace_view(q, "\n".join(lines), reply_markup=kb_back_to_menu())
+
+    # CODE À COLLER À LA LIGNE 1222 (SANS ESPACES DEVANT)
+
+async def history_filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche les options de filtre pour l'historique."""
+    q = update.callback_query
+    await q.answer()
+
+    keyboard = [
+        [InlineKeyboardButton("Par Nom (Titre)", callback_data="history_filter_type:name")],
+        [InlineKeyboardButton("Par SIN", callback_data="history_filter_type:sin")],
+        [InlineKeyboardButton("Par DL", callback_data="history_filter_type:dl")],
+        [InlineKeyboardButton("Annuler", callback_data="history_filter_cancel")]
+    ]
+
+    try:
+        await q.edit_message_text(
+            "🔎 Sur quel champ voulez-vous filtrer ?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception:
+        # Failsafe si le message ne peut être édité
+        await q.message.reply_text(
+            "🔎 Sur quel champ voulez-vous filtrer ?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    return HISTORY_FILTER_CHOICE
+
+async def history_filter_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reçoit le type de filtre et demande la valeur."""
+    q = update.callback_query
+    await q.answer()
+
+    filter_type = q.data.split(':')[-1] # 'name', 'sin', ou 'dl'
+    context.user_data['history_filter_type'] = filter_type
+
+    prompts = {
+        'name': "✍️ Entrez le Nom (ou partie du nom) :",
+        'sin': "🧾 Entrez le SIN (ou partie) :",
+        'dl': "🚗 Entrez le DL (ou partie) :",
+    }
+
+    try:
+        await q.message.delete() # Supprime le message de choix
+    except Exception:
+        pass
+
+    await q.message.reply_text(prompts.get(filter_type, "Entrez la valeur :"))
+    return HISTORY_FILTER_INPUT
+
+async def history_filter_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reçoit la valeur du filtre, l'enregistre et relance l'historique."""
+    filter_type = context.user_data.pop('history_filter_type', None)
+    if not filter_type:
+        return ConversationHandler.END # Sécurité
+
+    filter_value = update.message.text.strip()
+
+    # Enregistre le filtre dans la session
+    context.user_data['history_filter'] = {'type': filter_type, 'value': filter_value}
+
+    # Crée un faux Update avec un CallbackQuery pour appeler hist_pros
+    # C'est nécessaire car hist_pros attend un callback_query
+    class MockFromUser:
+        id = update.effective_user.id
+
+    class MockMessage:
+        chat_id = update.effective_chat.id
+        chat = update.effective_chat # Ajout pour la suppression de message
+        async def delete(self):
+            try: await update.message.delete() # Supprime le message de l'utilisateur
+            except: pass
+        async def reply_text(self, *args, **kwargs):
+            return await update.message.reply_text(*args, **kwargs)
+
+    class MockCallbackQuery:
+        data = "hist:pros:page:0" # Force la page 0
+        message = MockMessage()
+        from_user = MockFromUser()
+        async def answer(self): pass
+
+    mock_update = Update(update.update_id, callback_query=MockCallbackQuery())
+
+    await hist_pros(mock_update, context) # Appelle hist_pros avec le filtre activé
+    return ConversationHandler.END
+
+async def history_filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Annule le processus de filtre."""
+    q = update.callback_query
+    await q.answer()
+
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
+    context.user_data.pop('history_filter_type', None)
+
+    # Relance l'historique normal
+    q.data = "hist:pros:page:0" # simule un retour à la page 0
+    await hist_pros(update, context)
+    return ConversationHandler.END
+
+async def history_filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Réinitialise le filtre et relance l'historique."""
+    q = update.callback_query
+    await q.answer()
+
+    # Supprime le filtre
+    context.user_data.pop('history_filter', None)
+
+    # Relance l'historique (qui verra que le filtre est parti)
+    q.data = "hist:pros:page:0" # simule un retour à la page 0
+    await hist_pros(update, context)
+
+# FIN DU BLOC À AJOUTER
+
+   
+
+
 
 # ========================== FLOWS VALIDATION ==========================
 def reset_session(user_id: int):
@@ -1821,8 +1991,11 @@ async def admin_prod_csv_start(update: Update, context: ContextTypes.DEFAULT_TYP
     return ADMIN_WAIT_CSV
 
 
+# REMPLACE l'ancienne fonction admin_prod_csv_receive (vers ligne 1460) par celle-ci:
+
 async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    user_id_str = str(update.effective_user.id) # Pour les logs
+    if user_id_str != ADMIN_ID:
         return
 
     doc = update.message.document
@@ -1830,83 +2003,165 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Aucun fichier. Réessaie.")
         return ADMIN_WAIT_CSV
 
+    print(f"[CSV Import - User {user_id_str}] Fichier reçu: {doc.file_name}") # DEBUG LOG 1
+
     db = _get_db_from_context(context)
     if not db:
         await update.message.reply_text("DB indisponible.")
         return ConversationHandler.END
 
     c = db.cursor()
-    from io import BytesIO, StringIO
-    f = await context.bot.get_file(doc.file_id)
-    bio = BytesIO(); await f.download(out=bio); bio.seek(0)
-    text = bio.read().decode('utf-8', errors='replace')
-
-    import csv, re
-    rdr = csv.DictReader(StringIO(text))
-    cols = _guess_columns(c)
-
     inserted = 0
-    for row in rdr:
-        password = (row.get('password') or row.get('PASSWORD') or '').strip()
-        sin     = (row.get('sin') or '').strip()
-        dl      = (row.get('dl') or '').strip()
-        first   = (row.get('first') or row.get('FIRST') or '').strip()
-        last    = (row.get('last') or row.get('LAST') or '').strip()
-        dob     = (row.get('dob') or row.get('DOB') or '').strip()
-        address = (row.get('address') or row.get('ADRESSE') or '').strip()
-        city    = (row.get('city') or row.get('CITY') or '').strip()
-        postal  = (row.get('postal') or '').strip()
-        base    = (row.get('base') or row.get('BASE') or 'FAKEPERSON').strip()
-        email   = (row.get('email') or '').strip()
-        phone   = (row.get('phone') or '').strip()
-        price   = _parse_price(row.get('price') or row.get('PRICE') or '0')
-
+    
+    try: # --- Début du bloc try ---
+        from io import BytesIO, StringIO
+        f = await context.bot.get_file(doc.file_id)
+        bio = BytesIO()
+        await f.download(out=bio)
+        bio.seek(0)
+        
         try:
-            stock = int((row.get('stock') or '1').strip() or 1)
-        except Exception:
-            stock = 1
+            text = bio.read().decode('utf-8')
+            print(f"[CSV Import - User {user_id_str}] Fichier décodé en UTF-8 avec succès.") # DEBUG LOG 2
+        except UnicodeDecodeError:
+            try:
+                # Essayer avec un autre encodage commun si UTF-8 échoue
+                bio.seek(0)
+                text = bio.read().decode('latin-1')
+                print(f"[CSV Import - User {user_id_str}] ATTENTION: Fichier décodé en latin-1 (pas UTF-8).") # DEBUG LOG 2bis
+            except Exception as decode_err:
+                 print(f"[CSV Import - User {user_id_str}] ERREUR: Impossible de décoder le fichier. Erreur: {decode_err}") # DEBUG LOG ERROR
+                 await update.message.reply_text(f"❌ Erreur: Impossible de lire l'encodage du fichier ({decode_err}). Assurez-vous qu'il est en UTF-8.")
+                 return ConversationHandler.END
 
-        year = ''
-        m = re.search(r'(\d{4})', dob)
-        if m: year = m.group(1)
+        import csv, re
+        # Sniffer pour deviner le délimiteur (virgule ou point-virgule)
+        try:
+            dialect = csv.Sniffer().sniff(text.splitlines()[0]) # Regarde la 1ère ligne
+            delimiter = dialect.delimiter
+            print(f"[CSV Import - User {user_id_str}] Délimiteur détecté: '{delimiter}'") # DEBUG LOG 3
+        except csv.Error:
+             print(f"[CSV Import - User {user_id_str}] ATTENTION: Impossible de détecter le délimiteur, utilisation de ',' par défaut.") # DEBUG LOG 3bis
+             delimiter = ',' # Fallback sur la virgule
 
-        title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
-        content_lines = [
-            f"PASSWORD: {password}",
-            f"SIN: {sin}",
-            f"DL: {dl}",
-            f"FIRST NAME: {first}",
-            f"LAST NAME: {last}",
-            f"DOB(DD/MM/YYYY): {dob}",
-            f"ADRESSE: {address}",
-            f"CITY: {city}",
-            f"CODE POSTAL: {postal}",
-            f"EMAIL: {email}",
-            f"PHONE NUMBER: {phone}",
-            f"BASE: {base}",
-            f"PRICE: {price:.2f} CAD",
-        ]
-        content = "\n".join(content_lines)
+        rdr = csv.DictReader(StringIO(text), delimiter=delimiter)
+        
+        try:
+            headers = rdr.fieldnames
+            if not headers:
+                raise ValueError("L'en-tête CSV est vide ou illisible.")
+            print(f"[CSV Import - User {user_id_str}] En-têtes lues: {headers}") # DEBUG LOG 4
+            required_headers = {'first', 'last', 'dob', 'price'} # Minimum requis
+            if not required_headers.issubset({h.lower() for h in headers if h}):
+                 print(f"[CSV Import - User {user_id_str}] ERREUR: En-têtes manquantes. Requis au minimum: {required_headers}") # DEBUG LOG ERROR
+                 await update.message.reply_text(f"❌ Erreur: En-têtes manquantes dans le CSV. Il faut au moins: first, last, dob, price.")
+                 return ConversationHandler.END
+        except Exception as header_err:
+             print(f"[CSV Import - User {user_id_str}] ERREUR lecture en-têtes: {header_err}") # DEBUG LOG ERROR
+             await update.message.reply_text(f"❌ Erreur: Impossible de lire les en-têtes du CSV ({header_err}).")
+             return ConversationHandler.END
 
-        fields, values = [], []
-        if 'title'    in cols: fields.append('title');    values.append(title)
-        if 'content'  in cols: fields.append('content');  values.append(content)
-        if 'price'    in cols: fields.append('price');    values.append(price)
-        if 'tier'     in cols: fields.append('tier');     values.append(base)
-        if 'city'     in cols: fields.append('city');     values.append(city)
-        if 'year'     in cols: fields.append('year');     values.append(year)
-        if 'stock'    in cols: fields.append('stock');    values.append(stock)
-        if 'category' in cols: fields.append('category'); values.append('propro')
-        if 'currency' in cols: fields.append('currency'); values.append('CAD')
-        if 'is_active' in cols: fields.append('is_active'); values.append(1)
+        cols = _guess_columns(c)
+        
+        print(f"[CSV Import - User {user_id_str}] Début de l'itération des lignes...") # DEBUG LOG 5
+        line_num = 1 # Pour le logging d'erreur
+        for row in rdr:
+            line_num += 1
+            try:
+                # Ton code existant pour traiter chaque ligne
+                password = (row.get('password') or row.get('PASSWORD') or '').strip()
+                sin     = (row.get('sin') or row.get('SIN') or '').strip() # Corrigé SIN majuscule
+                dl      = (row.get('dl') or row.get('DL') or '').strip() # Corrigé DL majuscule
+                first   = (row.get('first') or row.get('FIRST') or '').strip()
+                last    = (row.get('last') or row.get('LAST') or '').strip()
+                dob     = (row.get('dob') or row.get('DOB') or '').strip()
+                address = (row.get('address') or row.get('ADRESSE') or '').strip()
+                city    = (row.get('city') or row.get('CITY') or '').strip()
+                postal  = (row.get('postal') or row.get('POSTAL') or '').strip() # Corrigé POSTAL majuscule
+                base    = (row.get('base') or row.get('BASE') or 'FAKEPERSON').strip()
+                email   = (row.get('email') or row.get('EMAIL') or '').strip() # Corrigé EMAIL majuscule
+                phone   = (row.get('phone') or row.get('PHONE') or '').strip() # Corrigé PHONE majuscule
+                price   = _parse_price(row.get('price') or row.get('PRICE') or '0')
 
-        q = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
-        c.execute(q, values)
-        inserted += 1
+                # Vérification minimale que des données essentielles existent
+                if not first or not last or not dob:
+                    print(f"[CSV Import - User {user_id_str}] Ligne {line_num} ignorée: first, last ou dob manquant.")
+                    continue # Ignore cette ligne
 
-    db.commit()
-    await update.message.reply_text(f"✅ Import terminé. {inserted} produit(s) ajouté(s).")
+                try:
+                    stock = int((row.get('stock') or row.get('STOCK') or '1').strip() or 1) # Corrigé STOCK majuscule
+                except Exception:
+                    stock = 1
+
+                year = ''
+                m = re.search(r'(\d{4})', dob) # Cherche 4 chiffres pour l'année
+                if m: year = m.group(1)
+
+                title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
+                content_lines = [
+                    # Ordre logique pour la fiche
+                    f"FIRST NAME: {first}",
+                    f"LAST NAME: {last}",
+                    f"DOB(DD/MM/YYYY): {dob}", # Garde le format original
+                    f"SIN: {sin}",
+                    f"DL: {dl}",
+                    f"PASSWORD: {password}",
+                    f"ADRESSE: {address}",
+                    f"CITY: {city}",
+                    f"CODE POSTAL: {postal}",
+                    f"EMAIL: {email}",
+                    f"PHONE NUMBER: {phone}", # Mis PHONE NUMBER pour correspondre à l'ajout manuel
+                    f"BASE: {base}",
+                    f"PRICE: {price:.2f} CAD",
+                ]
+                content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip()) # Ne garde que les lignes avec une valeur
+
+                fields, values = [], []
+                # Ton code existant pour remplir fields et values
+                if 'title'    in cols: fields.append('title');    values.append(title)
+                if 'content'  in cols: fields.append('content');  values.append(content)
+                if 'price'    in cols: fields.append('price');    values.append(price)
+                if 'tier'     in cols: fields.append('tier');     values.append(base) # Utilise 'base' pour 'tier'
+                if 'city'     in cols: fields.append('city');     values.append(city)
+                if 'year'     in cols: fields.append('year');     values.append(year)
+                if 'stock'    in cols: fields.append('stock');    values.append(stock)
+                if 'category' in cols: fields.append('category'); values.append('propro')
+                if 'currency' in cols: fields.append('currency'); values.append('CAD')
+                if 'is_active' in cols: fields.append('is_active'); values.append(1)
+
+                if not fields: # Sécurité
+                    print(f"[CSV Import - User {user_id_str}] ERREUR Ligne {line_num}: Aucun champ à insérer ?!")
+                    continue
+
+                q = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
+                c.execute(q, values)
+                inserted += 1
+            
+            except Exception as row_err:
+                 # Log l'erreur pour cette ligne spécifique mais continue avec les autres
+                 print(f"[CSV Import - User {user_id_str}] ERREUR Ligne {line_num}: {row_err}. Ligne ignorée. Données: {row}") # DEBUG LOG ERROR LIGNE
+
+        print(f"[CSV Import - User {user_id_str}] Fin de l'itération. {inserted} lignes traitées.") # DEBUG LOG 6
+
+        if inserted > 0:
+            db.commit()
+            print(f"[CSV Import - User {user_id_str}] Commit effectué.") # DEBUG LOG 7
+            await update.message.reply_text(f"✅ Import terminé. {inserted} produit(s) ajouté(s).")
+        else:
+             print(f"[CSV Import - User {user_id_str}] Aucune ligne valide trouvée ou insérée.") # DEBUG LOG 7bis
+             await update.message.reply_text("⚠️ Fichier traité, mais aucun produit valide n'a pu être ajouté. Vérifiez les en-têtes et les données.")
+
+    except Exception as e:
+         # Erreur générale pendant le traitement
+         print(f"[CSV Import - User {user_id_str}] ERREUR GLOBALE: {e}") # DEBUG LOG ERREUR GLOBALE
+         try:
+             db.rollback() # Annule les changements si erreur
+         except: pass
+         await update.message.reply_text(f"❌ Erreur critique lors de l'import : {e}")
+    
     return ConversationHandler.END
+
+# FIN DU REMPLACEMENT
 
 # ========================== ADMIN (sections ajustées) ==========================
 
@@ -2685,6 +2940,55 @@ async def delete_history_handler(update: Update, context: ContextTypes.DEFAULT_T
         print(f"Erreur dans delete_history_handler: {e}")
         await update.effective_message.reply_text("❌ Une erreur est survenue.")
 
+history_filter_conv = ConversationHandler(
+    entry_points=[
+        # Déclencheur: le bouton "Filtrer"
+        CallbackQueryHandler(history_filter_start, pattern="^history_filter_start$")
+    ],
+    states={
+        # Etat 1: Attend le choix (Nom, SIN, DL)
+        HISTORY_FILTER_CHOICE: [
+            CallbackQueryHandler(history_filter_choice, pattern="^history_filter_type:(name|sin|dl)$")
+        ],
+        # Etat 2: Attend la valeur texte
+        HISTORY_FILTER_INPUT: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, history_filter_input)
+        ],
+    },
+    fallbacks=[
+        # Gère le bouton "Annuler"
+        CallbackQueryHandler(history_filter_cancel, pattern="^history_filter_cancel$"),
+        # Failsafe si l'utilisateur fait /start
+        CommandHandler("start", goto_menu)
+    ],
+    allow_reentry=True # Important
+)
+app_telegram.add_handler(history_filter_conv, group=5) # group=5 pour priorité
+
+# Handler pour le bouton "Reset Filtre" (en dehors de la conversation)
+app_telegram.add_handler(CallbackQueryHandler(history_filter_reset, pattern=r"^history_filter_reset$"), group=5)
+
+# === NOUVEAU: Conversation pour Admin Import CSV ===
+admin_csv_conv = ConversationHandler(
+    entry_points=[
+        # Déclenché par le bouton "Import CSV" dans le menu admin produits
+        CallbackQueryHandler(admin_prod_csv_start, pattern="^admin_prod_csv$")
+    ],
+    states={
+        # Etat 1: Attend le fichier CSV
+        ADMIN_WAIT_CSV: [
+            MessageHandler(filters.Document.ALL & ~filters.COMMAND, admin_prod_csv_receive)
+        ],
+    },
+    fallbacks=[
+        # Permet de revenir au menu admin si on clique sur un bouton de retour ou autre commande
+        CallbackQueryHandler(admin_menu, pattern="^admin_menu$"),
+        CommandHandler("start", goto_menu) # Failsafe
+    ],
+)
+app_telegram.add_handler(admin_csv_conv, group=6) # Mettre un groupe différent
+
+
 # === Navigation / Historique ===
 app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
 app_telegram.add_handler(CallbackQueryHandler(on_category,  pattern=r"^cat:.+$"))
@@ -2764,7 +3068,6 @@ app_telegram.add_handler(CallbackQueryHandler(callback_faq,           pattern="^
 # === Admin ===
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm,   pattern="^admin_prod_del_\d+$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_del,           pattern="^admin_prod_del$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_csv_start,     pattern="^admin_prod_csv$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start,     pattern="^admin_prod_add$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_list,          pattern="^admin_prod_list$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_products,           pattern="^admin_products$"))
