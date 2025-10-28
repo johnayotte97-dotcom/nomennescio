@@ -799,6 +799,54 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
  
 
+# AJOUTEZ CETTE FONCTION (après la fin de show_products, ligne 821)
+def _filter_products(products: list, key: str, value: str) -> list:
+    """Fonction de filtrage manquante. Utilise le parser de shop_helpers."""
+    if not value:
+        return products
+    
+    value_lower = value.lower()
+    filtered = []
+    
+    for p in products:
+        # Utilise le parseur existant de shop_helpers pour obtenir des champs propres
+        try:
+            # Cette fonction magique fait tout le parsing pour nous
+            f = shop_helpers._parse_product_fields(p) #
+        except Exception as e:
+            logger.warning(f"Erreur _parse_product_fields pendant le filtre: {e}")
+            continue # Ignore ce produit en cas d'erreur de parsing
+
+        # --- Application des filtres ---
+        if key == 'name':
+            # Cherche dans le prénom ou le nom
+            if value_lower in f.get('first', '').lower() or value_lower in f.get('last', '').lower():
+                filtered.append(p)
+        
+        elif key == 'city':
+            if value_lower in f.get('city', '').lower():
+                filtered.append(p)
+
+        elif key == 'base':
+            if value_lower in f.get('base', '').lower():
+                filtered.append(p)
+                
+        elif key == 'year':
+            # 'year' est l'année (ex: 2001), 'dob' est la date complète
+            if value_lower in f.get('year', '') or value_lower in f.get('dob', ''):
+                filtered.append(p)
+
+        elif key == 'price':
+            # Filtre pour "prix maximum"
+            try:
+                max_price = float(value)
+                if f.get('price', 0.0) <= max_price:
+                    filtered.append(p)
+            except ValueError:
+                pass # Ignore le filtre si la valeur n'est pas un nombre
+    
+    return filtered
+# FIN DE LA NOUVELLE FONCTION
 # REMPLACE les 3 fonctions filter_open, filter_select, on_filter_text (lignes 718-862) par TOUT CE BLOC :
 
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
@@ -924,21 +972,25 @@ async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CATALOG_FILTER_MAIN
 
 async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Réinitialise tous les filtres en attente et rafraîchit le menu."""
+    """Réinitialise les filtres et nettoie les fiches produits."""
     q = update.callback_query
+    await q.answer("Filtres réinitialisés")
     
-    # Vide les filtres en attente
+    # Vide tous les filtres (en attente et actifs)
     context.user_data.pop('pending_filters', None)
+    context.user_data.pop('active_filters', None)
     
-    # Si des filtres étaient actifs, on les vide et on relance la recherche
-    if context.user_data.pop('active_filters', None):
-        await q.answer("Filtres réinitialisés")
-        await show_products(update, context, page=0, tier=None, from_filter=True)
-    else:
-        await q.answer("Aucun filtre à réinitialiser")
+    # --- CORRECTION: Nettoie les fiches produits affichées ---
+    prev_filter_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
+    for mid in prev_filter_fiches:
+         try:
+             await context.bot.delete_message(chat_id=q.message.chat_id, message_id=mid)
+         except: 
+             pass # Ignore les erreurs si le message est déjà supprimé
+    # --- FIN DE LA CORRECTION ---
 
-    # Ré-affiche le menu de filtre (propre)
-    kb = _build_filter_menu(context)
+    # Ré-affiche le menu de filtre (maintenant vide)
+    kb = _build_filter_menu(context) #
     await q.message.edit_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
 
     return CATALOG_FILTER_MAIN # On reste dans la conversation
