@@ -169,6 +169,9 @@ ADMIN_AWAIT_AMOUNT = 200
 ADMIN_WAIT_PRODUCT_TEXT = 201
 ADMIN_WAIT_CSV = 202
 HISTORY_FILTER_CHOICE, HISTORY_FILTER_INPUT = range(300, 302)
+ADMIN_IVR_AWAIT_VALUE = 400 # Nouvelle constante
+IVR_TIMINGS_FILE = "ivr_timings.json"
+CATALOG_FILTER_MAIN, CATALOG_FILTER_AWAIT_VALUE = range(500, 502)
 
 # Paliers
 FORFAITS = {
@@ -603,9 +606,13 @@ def _build_products_keyboard(page, total_pages, tier=None):
     back_row = [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     return InlineKeyboardMarkup([filt_row, nav_row, back_row])
 
-async def show_products(update, context, page=0, tier=None):
+
+# REMPLACE la fonction show_products (ligne 607) par CELLE-CI :
+
+async def show_products(update, context, page=0, tier=None, from_filter=False):
     chat_id = None
     query = getattr(update, "callback_query", None)
+    
     if query:
         chat_id = query.message.chat_id
         try:
@@ -613,25 +620,47 @@ async def show_products(update, context, page=0, tier=None):
         except Exception:
             pass
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
+            # Supprime le message sur lequel on a cliqué (le menu principal ou la nav de page)
+            if not from_filter: # Ne supprime pas le menu de filtre si on vient de cliquer "Search"
+                await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
         except Exception:
             pass
     else:
         chat_id = update.effective_chat.id
 
-    # Nettoyage anciennes bulles catalogue
+    # --- CORRECTION : Nettoyage amélioré ---
+    # Nettoie TOUS les anciens messages du catalogue OU du filtre
     try:
-        prev = CATALOG_MSGS.get(chat_id, [])
-        for mid in prev:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-            except Exception:
-                pass
-        CATALOG_MSGS[chat_id] = []
-    except Exception:
-        pass
+        if from_filter:
+            # Si on vient du filtre, ne nettoie que les fiches (garde le menu)
+            prev_filter_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
+            for mid in prev_filter_fiches:
+                 try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+                 except: pass
+        else:
+            # Sinon (menu Pro's), nettoie tout (catalogue ET filtre)
+            prev_catalog = CATALOG_MSGS.pop(chat_id, [])
+            prev_filter = context.user_data.pop("filter_msgs", [])
+            prev_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
+            all_to_delete = list(set(prev_catalog + prev_filter + prev_fiches))
+            for mid in all_to_delete:
+                try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+                except: pass
+    except Exception as e:
+        logger.warning(f"Erreur pendant le nettoyage de show_products: {e}")
+    # --- FIN CORRECTION ---
 
-    prods = _get_products(category="propro", tier=tier)
+    # --- NOUVEAU : Applique les filtres s'ils existent ---
+    active_filters = context.user_data.get('active_filters', {})
+    prods_all = _get_products(category="propro", tier=tier)
+    
+    prods = prods_all
+    if active_filters:
+        # Applique chaque filtre sauvegardé l'un après l'autre
+        for f_key, f_val in active_filters.items():
+            prods = _filter_products(prods, f_key, f_val)
+    # --- FIN ---
+
     # --- pagination ---
     PER_PAGE = 2
     total_pages = max(1, (len(prods) + PER_PAGE - 1) // PER_PAGE)
@@ -639,8 +668,20 @@ async def show_products(update, context, page=0, tier=None):
     start = page * PER_PAGE
     chunk = prods[start:start + PER_PAGE]
 
+    sent_ids = [] # Liste pour les nouveaux messages
+
     # Rien à afficher
     if not prods or not chunk:
+        text_to_send = "Aucun produit SSN/DOB pour le moment."
+        if active_filters:
+            text_to_send = "Aucun produit ne correspond à vos filtres."
+        
+        # Si on vient du filtre, on modifie le menu de filtre existant
+        if from_filter:
+            await query.message.edit_text(text_to_send, reply_markup=query.message.reply_markup)
+            return
+
+        # Sinon, on affiche le menu de pagination normal
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
             [
@@ -652,11 +693,309 @@ async def show_products(update, context, page=0, tier=None):
         ])
         m = await context.bot.send_message(
             chat_id=chat_id,
-            text="Aucun produit SSN/DOB pour le moment.",
+            text=text_to_send,
             reply_markup=kb
         )
-        CATALOG_MSGS[chat_id] = [m.message_id]
+        sent_ids.append(m.message_id) # Ajoute le message "Aucun produit"
+        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste
         return
+
+    # ========== 1) formatter une fiche produit ==========
+    def fmt_product(p):
+        raw = (p.get("content") or "").strip()
+
+        # Définit la fonction grab au niveau supérieur pour qu'elle soit toujours disponible
+        import re
+        def grab(keys):
+            for key in keys:
+                # Modifié pour être insensible à la casse (flag re.IGNORECASE)
+                m = re.search(rf"^{re.escape(key)}\s*:\s*(.+)$",
+                              raw, flags=re.IGNORECASE | re.MULTILINE)
+                if m:
+                    return m.group(1).strip()
+            return ""
+
+        if not raw:
+            # fallback depuis 'title'
+            t = (p.get("title") or "").strip()
+            parts = [x.strip() for x in t.split("•")]
+            name  = parts[0] if parts else "John Doe"
+            first = name.split()[0].upper() if name else "JOHN"
+            year     = parts[1] if len(parts) > 1 else ""
+            city     = parts[2] if len(parts) > 2 else ""
+            dob_full = ""
+            base = p.get("tier") or "FAKEPERSON" # Lit depuis la colonne 'tier'
+        else:
+            first    = (grab(["FIRST NAME"]) or "JOHN").split()[0].upper()
+            dob_full = grab(["DOB(DD/MM/YYYY)", "DOB"]) or ""
+            
+            # 1) essaie de lire l’année dans DOB
+            m = re.search(r'(19|20)\d{2}', dob_full or "")
+            year = m.group(0) if m else ""
+
+            # 2) fallback sur la colonne 'year' si vide
+            if not year:
+                year = (p.get("year") or "").strip()
+
+            # 3) dernier recours: tente de lire 4 chiffres dans le title
+            if not year:
+                t = (p.get("title") or "")
+                m2 = re.search(r'(19|20)\d{2}', t)
+                year = m2.group(0) if m2 else ""
+
+            # Lit la ville depuis le 'content' OU la colonne 'city'
+            city = grab(["CITY"]) or (p.get("city") or "")
+            # Lit la base/tier depuis la colonne 'tier' OU le 'content'
+            base = p.get("tier") or grab(["BASE"]) or "FAKEPERSON"
+
+        try:
+            price = float(p.get("price", 10.0) or 10.0)
+        except Exception:
+            price = 10.0
+        curr  = p.get("currency") or "CAD"
+
+        # Année en priorité, sinon date complète, sinon N/A
+        return "\n".join([
+            f"FIRST NAME: {first}",
+            f"DOB: {year or dob_full or 'N/A'}",
+            f"CITY: {city or '—'}",
+            f"BASE: {base}",
+            f"PRICE: {price:.2f} {curr}",
+        ])
+
+    # ========== 2) envoi des cartes produits ==========
+    
+    for idx, p in enumerate(chunk, start=1):
+        txt = fmt_product(p)
+        pid = p.get("id")
+
+        kb_rows = [[
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"),
+            InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cart:add:{pid}"),
+        ]]
+
+        kb = InlineKeyboardMarkup(kb_rows)
+        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
+        sent_ids.append(m.message_id) # Ajoute la fiche à la liste
+
+    # --- CORRECTION : Affiche le bon menu en bas ---
+    if from_filter:
+        # Si on vient du filtre, on sauvegarde les fiches dans une liste séparée
+        context.user_data['filter_fiches_msg_ids'] = sent_ids
+        # On ne ré-affiche pas le menu, il est déjà là (on l'a gardé)
+    else:
+        # Si on est en mode catalogue normal, on affiche la pagination
+        kb_nav = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
+            [
+                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"),
+                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}"),
+            ],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+        ])
+        m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
+        sent_ids.append(m_nav.message_id)
+        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
+    # --- FIN CORRECTION ---
+
+    # ========== 1) formatter une fiche produit ==========
+    def fmt_product(p):
+        raw = (p.get("content") or "").strip()
+
+        # Définit la fonction grab au niveau supérieur pour qu'elle soit toujours disponible
+        import re
+        def grab(keys):
+            for key in keys:
+                # Modifié pour être insensible à la casse (flag re.IGNORECASE)
+                m = re.search(rf"^{re.escape(key)}\s*:\s*(.+)$",
+                              raw, flags=re.IGNORECASE | re.MULTILINE)
+                if m:
+                    return m.group(1).strip()
+            return ""
+
+        if not raw:
+            # fallback depuis 'title'
+            t = (p.get("title") or "").strip()
+            parts = [x.strip() for x in t.split("•")]
+            name  = parts[0] if parts else "John Doe"
+            first = name.split()[0].upper() if name else "JOHN"
+            year     = parts[1] if len(parts) > 1 else ""
+            city     = parts[2] if len(parts) > 2 else ""
+            dob_full = ""
+            base = p.get("tier") or "FAKEPERSON" # Lit depuis la colonne 'tier'
+        else:
+            first    = (grab(["FIRST NAME"]) or "JOHN").split()[0].upper()
+            dob_full = grab(["DOB(DD/MM/YYYY)", "DOB"]) or ""
+            
+            # 1) essaie de lire l’année dans DOB
+            m = re.search(r'(19|20)\d{2}', dob_full or "")
+            year = m.group(0) if m else ""
+
+            # 2) fallback sur la colonne 'year' si vide
+            if not year:
+                year = (p.get("year") or "").strip()
+
+            # 3) dernier recours: tente de lire 4 chiffres dans le title
+            if not year:
+                t = (p.get("title") or "")
+                m2 = re.search(r'(19|20)\d{2}', t)
+                year = m2.group(0) if m2 else ""
+
+            # Lit la ville depuis le 'content' OU la colonne 'city'
+            city = grab(["CITY"]) or (p.get("city") or "")
+            # Lit la base/tier depuis la colonne 'tier' OU le 'content'
+            base = p.get("tier") or grab(["BASE"]) or "FAKEPERSON"
+
+        try:
+            price = float(p.get("price", 10.0) or 10.0)
+        except Exception:
+            price = 10.0
+        curr  = p.get("currency") or "CAD"
+
+        # Année en priorité, sinon date complète, sinon N/A
+        return "\n".join([
+            f"FIRST NAME: {first}",
+            f"DOB: {year or dob_full or 'N/A'}",
+            f"CITY: {city or '—'}",
+            f"BASE: {base}",
+            f"PRICE: {price:.2f} {curr}",
+        ])
+
+    # ========== 2) envoi des cartes produits ==========
+    
+    for idx, p in enumerate(chunk, start=1):
+        txt = fmt_product(p)
+        pid = p.get("id")
+
+        kb_rows = [[
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"),
+            InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cart:add:{pid}"),
+        ]]
+
+        kb = InlineKeyboardMarkup(kb_rows)
+        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
+        sent_ids.append(m.message_id) # Ajoute la fiche à la liste
+
+    # --- CORRECTION : Affiche le bon menu en bas ---
+    if from_filter:
+        # Si on vient du filtre, on sauvegarde les fiches dans une liste séparée
+        context.user_data['filter_fiches_msg_ids'] = sent_ids
+        # On ne ré-affiche pas le menu, il est déjà là (on l'a gardé)
+    else:
+        # Si on est en mode catalogue normal, on affiche la pagination
+        kb_nav = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
+            [
+                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"),
+                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}"),
+            ],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+        ])
+        m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
+        sent_ids.append(m_nav.message_id)
+        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
+    # --- FIN CORRECTION ---
+
+    # ========== 1) formatter une fiche produit ==========
+    def fmt_product(p):
+        raw = (p.get("content") or "").strip()
+
+        # Définit la fonction grab au niveau supérieur pour qu'elle soit toujours disponible
+        import re
+        def grab(keys):
+            for key in keys:
+                # Modifié pour être insensible à la casse (flag re.IGNORECASE)
+                m = re.search(rf"^{re.escape(key)}\s*:\s*(.+)$",
+                              raw, flags=re.IGNORECASE | re.MULTILINE)
+                if m:
+                    return m.group(1).strip()
+            return ""
+
+        if not raw:
+            # fallback depuis 'title'
+            t = (p.get("title") or "").strip()
+            parts = [x.strip() for x in t.split("•")]
+            name  = parts[0] if parts else "John Doe"
+            first = name.split()[0].upper() if name else "JOHN"
+            year     = parts[1] if len(parts) > 1 else ""
+            city     = parts[2] if len(parts) > 2 else ""
+            dob_full = ""
+            base = p.get("tier") or "FAKEPERSON" # Lit depuis la colonne 'tier'
+        else:
+            first    = (grab(["FIRST NAME"]) or "JOHN").split()[0].upper()
+            dob_full = grab(["DOB(DD/MM/YYYY)", "DOB"]) or ""
+            
+            # 1) essaie de lire l’année dans DOB
+            m = re.search(r'(19|20)\d{2}', dob_full or "")
+            year = m.group(0) if m else ""
+
+            # 2) fallback sur la colonne 'year' si vide
+            if not year:
+                year = (p.get("year") or "").strip()
+
+            # 3) dernier recours: tente de lire 4 chiffres dans le title
+            if not year:
+                t = (p.get("title") or "")
+                m2 = re.search(r'(19|20)\d{2}', t)
+                year = m2.group(0) if m2 else ""
+
+            # Lit la ville depuis le 'content' OU la colonne 'city'
+            city = grab(["CITY"]) or (p.get("city") or "")
+            # Lit la base/tier depuis la colonne 'tier' OU le 'content'
+            base = p.get("tier") or grab(["BASE"]) or "FAKEPERSON"
+
+        try:
+            price = float(p.get("price", 10.0) or 10.0)
+        except Exception:
+            price = 10.0
+        curr  = p.get("currency") or "CAD"
+
+        # Année en priorité, sinon date complète, sinon N/A
+        return "\n".join([
+            f"FIRST NAME: {first}",
+            f"DOB: {year or dob_full or 'N/A'}",
+            f"CITY: {city or '—'}",
+            f"BASE: {base}",
+            f"PRICE: {price:.2f} {curr}",
+        ])
+
+    # ========== 2) envoi des cartes produits ==========
+    
+    for idx, p in enumerate(chunk, start=1):
+        txt = fmt_product(p)
+        pid = p.get("id")
+
+        kb_rows = [[
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"),
+            InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cart:add:{pid}"),
+        ]]
+
+        kb = InlineKeyboardMarkup(kb_rows)
+        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
+        sent_ids.append(m.message_id) # Ajoute la fiche à la liste
+
+    # --- CORRECTION : Affiche le bon menu en bas ---
+    if from_filter:
+        # Si on vient du filtre, on sauvegarde les fiches dans une liste séparée
+        context.user_data['filter_fiches_msg_ids'] = sent_ids
+        # On ne ré-affiche pas le menu, il est déjà là (on l'a gardé)
+    else:
+        # Si on est en mode catalogue normal, on affiche la pagination
+        kb_nav = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
+            [
+                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"),
+                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}"),
+            ],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+        ])
+        m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
+        sent_ids.append(m_nav.message_id)
+        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
+    # --- FIN CORRECTION ---
 
     # ========== 1) formatter une fiche produit ==========
     def fmt_product(p):
@@ -717,7 +1056,7 @@ async def show_products(update, context, page=0, tier=None):
         ])
 
     # ========== 2) envoi des cartes produits ==========
-    sent_ids = []
+    
     for idx, p in enumerate(chunk, start=1):
         txt = fmt_product(p)
         pid = p.get("id")
@@ -729,6 +1068,7 @@ async def show_products(update, context, page=0, tier=None):
 
         is_last_of_page = (idx == len(chunk))
         if is_last_of_page:
+            # Si c'est le dernier item, on ajoute les boutons de filtre et de navigation
             kb_rows.append([InlineKeyboardButton("🔎 Filter", callback_data="filter_open")])
             kb_rows.append([
                 InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"),
@@ -739,37 +1079,74 @@ async def show_products(update, context, page=0, tier=None):
 
         kb = InlineKeyboardMarkup(kb_rows)
         m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
-        sent_ids.append(m.message_id)
+        sent_ids.append(m.message_id) # Ajoute la fiche à la liste
 
-    CATALOG_MSGS[chat_id] = sent_ids
+    CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
 
-async def filter_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = getattr(update, "callback_query", None)
-    if q:
-        await q.answer()
+
+# REMPLACE les 3 fonctions filter_open, filter_select, on_filter_text (lignes 718-862) par TOUT CE BLOC :
+
+def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    """Construit le menu de filtre dynamique avec les filtres actifs."""
+    filters = context.user_data.get('pending_filters', {})
+    
+    def get_label(key, default):
+        val = filters.get(key)
+        # Ajoute une coche si le filtre est actif
+        return f"✅ {default}: {val}" if val else default
+
     kb = [
-        [InlineKeyboardButton("Name",  callback_data="filter:name"),
-         InlineKeyboardButton("City",  callback_data="filter:city")],
-        [InlineKeyboardButton("Base",  callback_data="filter:base"),
-         InlineKeyboardButton("Price", callback_data="filter:price")],
-        [InlineKeyboardButton("Year",  callback_data="filter:year")],
-        [InlineKeyboardButton("🛒 Panier",     callback_data="cart:view"),
-         InlineKeyboardButton("🧾 Historique", callback_data="hist:view")],
-        [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")],
+        [
+            InlineKeyboardButton(get_label("name", "Name"),  callback_data="filter:name"),
+            InlineKeyboardButton(get_label("city", "City"),  callback_data="filter:city")
+        ],
+        [
+            InlineKeyboardButton(get_label("base", "Base"),  callback_data="filter:base"),
+            InlineKeyboardButton(get_label("price", "Price"), callback_data="filter:price")
+        ],
+        [InlineKeyboardButton(get_label("year", "Year"),  callback_data="filter:year")],
+        [
+            InlineKeyboardButton("❌ Reset", callback_data="filter_reset"),
+            InlineKeyboardButton("SEARCH 🔎", callback_data="filter_search")
+        ],
+        [InlineKeyboardButton("⬅️ Annuler (Retour Catalogue)", callback_data="filter_cancel")]
     ]
-    if q:
-        await replace_view(q, "Choose a filter:", reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await update.message.reply_text("Choose a filter:", reply_markup=InlineKeyboardMarkup(kb))
+    return InlineKeyboardMarkup(kb)
 
-async def filter_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Démarre la conversation de filtre."""
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception:
-        pass
-    _, field = q.data.split(':', 1)  # name|city|base|price|year
-    context.user_data['awaiting_filter'] = field
+    await q.answer()
+    chat_id = q.message.chat_id
+
+    # Initialise les filtres en attente
+    context.user_data['pending_filters'] = {}
+    context.user_data.pop('active_filters', None) # Vide les filtres actifs
+    
+    # Nettoie les anciens messages du catalogue
+    old_catalog_msgs = CATALOG_MSGS.pop(chat_id, [])
+    for mid in old_catalog_msgs:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+    # Construit le menu
+    kb = _build_filter_menu(context)
+    m = await q.message.reply_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb) # Envoie un nouveau message
+    
+    # Stocke l'ID du menu de filtre pour le nettoyer
+    context.user_data['filter_msgs'] = [m.message_id] 
+    return CATALOG_FILTER_MAIN
+
+async def filter_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """L'utilisateur a choisi un type de filtre (ex: Name). Demande la valeur."""
+    q = update.callback_query
+    await q.answer()
+    
+    field = q.data.split(':', 1)[1]  # name|city|base|price|year
+    context.user_data['current_filter_key'] = field
+    
     prompts = {
         'name':  "Type a name fragment (ex: John):",
         'city':  "Type a city fragment (ex: Toronto):",
@@ -777,82 +1154,92 @@ async def filter_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'price': "Max price (number, e.g. 12):",
         'year':  "Year digits (e.g. 1991):",
     }
-    await q.message.reply_text(prompts[field])
+    
+    # Modifie le menu de filtre en question
+    await q.message.edit_text(prompts[field], reply_markup=kb_back_cancel())
+    return CATALOG_FILTER_AWAIT_VALUE
 
-def _filter_products(products, field, value):
-    val = (value or "").strip().lower()
-    if not val:
-        return products
-    def norm(s): 
-        return (s or "").strip().lower()
-    out = []
-    for p in products:
-        title = norm(p.get("title",""))
-        price = float(p.get("price", 0) or 0)
-        tier  = norm(p.get("tier",""))
-        # heuristique de découpe (FIRST LAST • YEAR • CITY)
-        parts = [x.strip() for x in (p.get("title","") or "").split("•")]
-        name = parts[0] if parts else ""
-        year = (parts[1] if len(parts)>1 else "")
-        city = (parts[2] if len(parts)>2 else "")
-        if field == "name" and val in norm(name):
-            out.append(p)
-        elif field == "city" and val in norm(city):
-            out.append(p)
-        elif field == "base" and val in tier:
-            out.append(p)
-        elif field == "price":
-            try:
-                maxp = float(val)
-                if price <= maxp:
-                    out.append(p)
-            except:
-                pass
-        elif field == "year" and val in norm(year):
-            out.append(p)
-    return out
+async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """L'utilisateur a envoyé une valeur (ex: "MAUDE")."""
+    key = context.user_data.pop('current_filter_key', None)
+    if not key:
+        return CATALOG_FILTER_MAIN # Sécurité
+        
+    value = update.message.text.strip()
+    
+    # Sauvegarde le filtre
+    context.user_data.setdefault('pending_filters', {})[key] = value
+    
+    # Supprime la question "Type a name..." et la réponse "MAUDE"
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data['filter_msgs'][0])
+    except: pass
+    try:
+        await update.message.delete()
+    except: pass
+        
+    # Envoie la notification temporaire
+    notif_msg = await update.message.reply_text(f"✅ Filtre '{key}' mis à jour: {value}", quote=False)
+    
+    # Ré-affiche le menu de filtre principal (mis à jour avec la coche ✅)
+    kb = _build_filter_menu(context)
+    m = await update.message.reply_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
+    context.user_data['filter_msgs'] = [m.message_id] # Stocke le nouvel ID de menu
+    
+    # Supprime la notification après 2 secondes
+    await asyncio.sleep(2)
+    try:
+        await notif_msg.delete()
+    except:
+        pass
+    
+    return CATALOG_FILTER_MAIN
 
-async def on_filter_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ✅ Ne rien faire si on n’est pas en mode filtre
-    if not context.user_data.get('awaiting_filter'):
-        return
+async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Applique les filtres et lance la recherche."""
+    q = update.callback_query
+    
+    # 1. Transfère les filtres en attente vers les filtres actifs
+    context.user_data['active_filters'] = context.user_data.get('pending_filters', {})
+    
+    # 2. Appelle show_products, en lui disant qu'on vient du filtre
+    await show_products(update, context, page=0, tier=None, from_filter=True)
+    
+    # On reste dans le menu principal du filtre
+    return CATALOG_FILTER_MAIN
 
-    field = context.user_data.get('awaiting_filter')
-    value = (update.message.text or '').strip()
-    prods_all = _get_products(category="propro", tier=None)
-    prods = _filter_products(prods_all, field, value)
+async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Réinitialise tous les filtres en attente et rafraîchit le menu."""
+    q = update.callback_query
+    
+    # Vide les filtres en attente
+    context.user_data.pop('pending_filters', None)
+    
+    # Si des filtres étaient actifs, on les vide et on relance la recherche
+    if context.user_data.pop('active_filters', None):
+        await q.answer("Filtres réinitialisés")
+        await show_products(update, context, page=0, tier=None, from_filter=True)
+    else:
+        await q.answer("Aucun filtre à réinitialiser")
 
-    if not prods:
-        await update.message.reply_text("Aucun résultat pour ce filtre.")
-        return
+    # Ré-affiche le menu de filtre (propre)
+    kb = _build_filter_menu(context)
+    await q.message.edit_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
 
-    # Affiche max 3 résultats
-    chunk = prods[:3]
-    for p in chunk:
-        t = p.get("title", "").strip()
-        parts = [x.strip() for x in t.split("•")]
-        name = parts[0] if parts else "John Doe"
-        first = name.split()[0].upper() if name else "JOHN"
-        masked = first + " " + ("*" * 3)
-        dob = parts[1] if len(parts) > 1 else "N/A"
-        city = parts[2] if len(parts) > 2 else ""
-        base = p.get("tier", "FAKEPERSON") or "FAKEPERSON"
-        price = f'{float(p.get("price", 10.0)):.2f}'
-        curr = p.get("currency", "CAD") or "CAD"
+    return CATALOG_FILTER_MAIN # On reste dans la conversation
 
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"),
-            InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cart:add:{p['id']}"),
-        ]])
-
-        txt = "\n".join([
-            f"FIRST NAME: {masked}",
-            f"DOB: {dob}",
-            f"CITY: {city or '—'}",
-            f"BASE: {base}",
-            f"PRICE: {price} {curr}",
-        ])
-        await update.message.reply_text(txt, reply_markup=kb)
+async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Annule le filtre et recharge le catalogue."""
+    q = update.callback_query
+    await q.answer()
+    
+    # Vide les filtres
+    context.user_data.pop('pending_filters', None)
+    context.user_data.pop('active_filters', None)
+    
+    # Appelle show_products (qui va nettoyer le menu de filtre)
+    await show_products(update, context, page=0, tier=None, from_filter=False) # from_filter=False pour recharger
+    return ConversationHandler.END
 
 # ========================== BOUTONS SIMPLES ==========================
 async def callback_show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -911,9 +1298,16 @@ async def callback_check_balance(update: Update, context: ContextTypes.DEFAULT_T
 
 from telegram.ext import ConversationHandler
 
+
+# REMPLACE la fonction goto_menu (ligne 866) par CELLE-CI :
+
+# REMPLACE la fonction goto_menu (ligne 866) par CELLE-CI :
+
 async def goto_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ferme proprement l’écran courant et affiche un menu tout neuf."""
     q = getattr(update, "callback_query", None)
+    user_id = update.effective_user.id # On récupère l'ID utilisateur ici
+
     if q:
         # stoppe le spinner (animation bleue Telegram)
         try:
@@ -925,16 +1319,128 @@ async def goto_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.delete()
         except:
             pass
+            
+    # --- CORRECTION MISE À JOUR ---
+    # Récupère TOUTES les listes de messages temporaires
+    hist_msgs = context.user_data.pop("hist_msgs", []) # De l'historique
+    verif_msgs = context.user_data.pop("verif_flow_msg_ids", []) # Du flux de vérification
+    filter_msgs = context.user_data.pop("filter_msgs", []) # <--- NOUVEAU (menu filtre)
+    filter_fiches = context.user_data.pop("filter_fiches_msg_ids", []) # <--- NOUVEAU (fiches filtre)
+    
+    # Récupère les messages du CATALOGUE depuis la variable globale
+    catalog_msgs = CATALOG_MSGS.pop(user_id, []) 
+    
+    # Combine et dédoublonne TOUTES les listes
+    all_msgs_to_delete = list(set(hist_msgs + verif_msgs + catalog_msgs + filter_msgs + filter_fiches)) 
 
-    # nettoie tout l’état de la conversation
+    if all_msgs_to_delete:
+        for mid in all_msgs_to_delete:
+            try:
+                # Utilise user_id car chat_id n'est pas dispo ici
+                await context.bot.delete_message(chat_id=user_id, message_id=mid)
+            except:
+                pass # Ignore les messages déjà supprimés
+    # --- FIN DE LA CORRECTION ---
+
+    # nettoie tout l’état de la conversation (sauf les listes qu'on vient de pop)
     context.user_data.clear()
 
     # affiche le menu principal proprement
-    user_id = update.effective_user.id
-    await show_main_menu(user_id, clear=True)
+    # On utilise clear=True pour que show_main_menu nettoie les messages de 'bot_messages' (sécurité)
+    await show_main_menu(user_id, clear=True) 
 
     # stoppe toute attente de réponse (empêche "1 ou 2")
     return ConversationHandler.END
+
+async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, batch_id: str, lang: str):
+    """
+    Anime un message "Décryptage en cours..." pendant que le batch s'exécute.
+    S'arrête quand br["notified"] passe à True.
+    """
+    i = 0
+    # Laisse le temps au batch d'être créé
+    await asyncio.sleep(1) 
+    br = batch_runs.get(batch_id)
+    if not br:
+        return
+
+    try:
+        # Boucle tant que le batch n'est pas marqué comme "notified" (terminé)
+        while not br.get("notified", False):
+            dots = "." * (i % 3 + 1) # Fait . .. ... . .. ...
+            
+            # Utilise la fonction msg() pour obtenir le texte dans la bonne langue
+            base_text = msg(chat_id, 'decrytage_en_cours').replace('…','') # Récupère '🔄 Décryptage en cours'
+            text = f"{base_text}{dots} ({br.get('resolved', 0)}/{br.get('total', '?')})"
+            
+            try:
+                await context.bot.edit_message_text(
+                    text=text,
+                    chat_id=chat_id,
+                    message_id=message_id
+                )
+            except Exception as e:
+                # Si le message est supprimé ou identique ("Message is not modified"), arrête la boucle
+                logger.info(f"Arrêt de l'animation (message {message_id}): {e}")
+                break
+            
+            i += 1
+            await asyncio.sleep(2) # IMPORTANT: Pause de 2s pour éviter le flood
+            
+            # Rafraîchit la référence au batch
+            br = batch_runs.get(batch_id)
+            if not br:
+                break # Le batch a été supprimé
+
+    except Exception as e:
+        logger.error(f"Erreur dans animate_wait_message: {e}")
+    finally:
+        # Une fois la boucle finie, supprime le message d'attente
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except:
+            pass
+
+        # AJOUTE CES DEUX FONCTIONS (après animate_wait_message, ligne 915)
+
+def get_ivr_timings():
+    """Charge les temps de pause depuis le fichier JSON, ou utilise les défauts."""
+    import json, os
+    # Définit les temps par défaut au cas où le fichier n'existe pas
+    defaults = {
+        "open_1": 55,  # Pause 1 (Ouvert) avant 4-4-6
+        "open_2": 41,  # Pause 2 (Ouvert) après 4-4-6
+        "closed_1": 40, # Pause 1 (Fermé) avant 1-1
+        "closed_2": 45  # Pause 2 (Fermé) après 1-1
+    }
+    try:
+        with open(IVR_TIMINGS_FILE, 'r') as f:
+            timings = json.load(f)
+        # S'assure que toutes les clés existent, sinon ajoute le défaut
+        for key, val in defaults.items():
+            timings.setdefault(key, val)
+        return timings
+    except Exception:
+        # Si le fichier n'existe pas ou est corrompu, on le crée
+        try:
+            with open(IVR_TIMINGS_FILE, 'w') as f:
+                json.dump(defaults, f, indent=2)
+        except Exception as e:
+            logger.error(f"Impossible de créer le fichier ivr_timings.json: {e}")
+        return defaults
+
+def set_ivr_timing(key, value):
+    """Met à jour une valeur de temps dans le fichier JSON."""
+    import json, os
+    timings = get_ivr_timings() # Charge les valeurs actuelles
+    try:
+        timings[key] = int(value) # Met à jour la valeur
+        with open(IVR_TIMINGS_FILE, 'w') as f:
+            json.dump(timings, f, indent=2) # Ré-écrit le fichier complet
+        return True
+    except Exception as e:
+        logger.error(f"Erreur set_ivr_timing: {e}")
+        return False
 
 async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await goto_menu(update, context)
@@ -1416,14 +1922,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_exists(str(user_id)):
         update_user_balance(str(user_id), 0.0)
         upgrade_user_statut_auto(str(user_id))
-    await show_main_menu(user_id)
+    
+    # --- CORRECTION ---
+    # Appelle goto_menu qui va TOUT nettoyer (historique, catalogue, etc.)
+    await goto_menu(update, context)
+    # --- FIN CORRECTION ---
 
 async def start_verifier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reset_session(user_id); context.user_data.clear()
     msgx = await update.message.reply_text(msg(user_id, "enter_bulk_qty"), reply_markup=kb_back_cancel())
-    bot_messages.setdefault(user_id, []).append(msgx.message_id)
+    context.user_data['verif_flow_msg_ids'] = [msgx.message_id] # <-- CORRECTION ICI
     return ASK_QTY
+
 
 async def start_verifier_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import logging
@@ -1441,10 +1952,17 @@ async def start_verifier_main(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.clear()
     logger.info("🧹 Session et user_data reset")
 
-    await q.message.edit_text(
+    # --- CORRECTION ICI ---
+    # On utilise replace_view pour remplacer le menu et on sauvegarde le message
+    await replace_view(
+        q,
         text=msg(user_id, "enter_bulk_qty"),
         reply_markup=kb_back_cancel()
     )
+    # On ajoute l'ID du message à la liste pour qu'il soit supprimé plus tard
+    context.user_data['verif_flow_msg_ids'] = [q.message.message_id]
+    # --- FIN CORRECTION ---
+    
     logger.info("📤 Message ASK_QTY envoyé")
 
     return ASK_QTY
@@ -1482,7 +2000,7 @@ async def ask_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msgx = await (update.message or update.callback_query.message).reply_text(
             msg(user_id, "enter_firstname")
         )
-        bot_messages.setdefault(user_id, []).append(msgx.message_id)
+        context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
         return ASK_PRENOM
 
     await (update.message or update.callback_query.message).reply_text(
@@ -1497,7 +2015,7 @@ async def choose_mode_manual(update: Update, context: ContextTypes.DEFAULT_TYPE)
     msgx = await update.callback_query.message.reply_text(
         f"✍️ Saisie #{context.user_data['current_index']} — " + msg(user_id, "enter_firstname")
     )
-    bot_messages.setdefault(user_id, []).append(msgx.message_id)
+    context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
     return MANUAL_PRENOM
 
 async def choose_mode_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1512,13 +2030,13 @@ async def choose_mode_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def manual_receive_prenom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["tmp_prenom"] = update.message.text.strip()
     msgx = await update.message.reply_text(msg(update.effective_user.id, "enter_lastname"))
-    bot_messages.setdefault(update.effective_user.id, []).append(msgx.message_id)
+    context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
     return MANUAL_NOM
 
 async def manual_receive_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["tmp_nom"] = update.message.text.strip()
     msgx = await update.message.reply_text(msg(update.effective_user.id, "enter_birth"))
-    bot_messages.setdefault(update.effective_user.id, []).append(msgx.message_id)
+    context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
     return MANUAL_DATE
 
 async def manual_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1545,7 +2063,7 @@ async def manual_receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"✅ Saisie #{idx} enregistrée.\n\n"
             f"✍️ Saisie #{idx+1} — " + msg(user_id, "enter_firstname")
         )
-        bot_messages.setdefault(user_id, []).append(msgx.message_id)
+        context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
         return MANUAL_PRENOM
 
     qty = len(context.user_data["entries"])
@@ -1605,6 +2123,8 @@ async def csv_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return BULK_CONFIRM
 
+# REMPLACE la fonction bulk_confirm (ligne 1429) par CELLE-CI :
+
 async def bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reply = update.message.text.strip().lower()
@@ -1641,53 +2161,59 @@ async def bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🏦 {msg(user_id, 'balance', balance=new_balance)}\n"
         f"{FORFAITS[statut]['label']} ({unit_price:.2f}$ x {len(entries)} permis = {total_cost:.2f}$)"
     )
-    await update.message.reply_text(msg(user_id, "decrytage_en_cours"))
+    
+    # --- MODIFICATION ICI ---
+    total_entries = len(entries)
+    # Envoie le premier message de l'animation
+    msgx = await update.message.reply_text(f"🔄 {msg(user_id, 'decrytage_en_cours').replace('…','.')} (0/{total_entries})")
+    # --- FIN MODIFICATION ---
 
     batch_id = f"{user_id}:{int(datetime.now().timestamp())}"
-    batch_runs[batch_id] = {"total": len(entries), "resolved": 0, "notified": False,"lock": asyncio.Lock(),}
+    
+    # --- MODIFICATION ICI ---
+    batch_runs[batch_id] = {
+        "total": total_entries, 
+        "resolved": 0, 
+        "notified": False,
+        "lock": asyncio.Lock(),
+        # On ne stocke plus l'ID du message ici
+    }
+    # --- FIN MODIFICATION ---
+
+    # --- LANCE L'ANIMATION ---
+    asyncio.create_task(animate_wait_message(context, update.effective_chat.id, msgx.message_id, batch_id, lang))
+    # --- FIN ---
 
     tasks = []
 
     for item in entries:
-
         fullname = f"{item['prenom']} {item['nom']}"
-
         tasks.append(asyncio.create_task(
-
             launch_parallel_calls(
-
                 item["base"], user_id, num_calls=10,
-
                 fullname=fullname, formatted=item["formatted"],
-
                 batch_id=batch_id
-
             )
-
         ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for (item, res) in zip(entries, results):
-
         if isinstance(res, Exception):
-
             log(f"Bulk launch error for {item['prenom']} {item['nom']}: {res}", user_id, "error")
-
-
 
     return ConversationHandler.END
 
 async def receive_prenom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prenom"] = update.message.text.strip()
     msgx = await update.message.reply_text(msg(update.effective_user.id, "enter_lastname"))
-    bot_messages.setdefault(update.effective_user.id, []).append(msgx.message_id)
+    context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id) # <-- CORRECTION
     return ASK_NOM
 
 async def receive_nom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["nom"] = update.message.text.strip()
     msgx = await update.message.reply_text(msg(update.effective_user.id, "enter_birth"))
-    bot_messages.setdefault(update.effective_user.id, []).append(msgx.message_id)
+    context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id) # <-- CORRECTION
     return ASK_DATE
 
 async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1709,8 +2235,9 @@ async def receive_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg(user_id, "show_permis", permis=formatted, prix=prix, statut=statut),
         parse_mode="Markdown"
     )
-    bot_messages.setdefault(user_id, []).append(msgx.message_id)
+    context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
     return CONFIRM_VERIF
+
 
 async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -1722,30 +2249,70 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prix = get_permit_price(str(user_id))
     statut = get_user_statut(str(user_id))
 
+    # --- CORRECTION AJOUTÉE ---
+    # On récupère la liste de TOUS les messages de la conversation
+    verif_msgs = context.user_data.pop("verif_flow_msg_ids", [])
+    
+    # On essaie de supprimer le message de l'utilisateur (ex: "Non" ou "Oui")
+    try:
+        verif_msgs.append(update.message.message_id)
+    except Exception:
+        pass
+    # --- FIN CORRECTION ---
+
     if reponse in ["non", "no"]:
-        await update.message.reply_text(f"📄 {formatted.replace('**', '00')}")
-        await update.message.reply_text("🔙 Retour au menu principal..." if lang == "fr" else "🔙 Back to main menu...")
-        await show_main_menu(user_id)
+        # --- CORRECTION PRINCIPALE ---
+        # On n'envoie plus les messages "D0005..." ou "Retour...".
+        
+        for mid in verif_msgs: # Supprime "Combien de permis...", "Prénom...", "Nom...", "Date...", "Permis proposé..."
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=mid)
+            except:
+                pass
+                
+        await show_main_menu(user_id, clear=True) # clear=True nettoie les messages de 'bot_messages' (sécurité)
+        # --- FIN CORRECTION ---
         return ConversationHandler.END
 
     if reponse in ["oui", "yes"]:
         balance = get_user_balance(str(user_id))
         if balance < prix:
             keyboard = [[InlineKeyboardButton("💳 Recharger" if lang == "fr" else "💳 Top up", callback_data="add_balance")]]
+            
+            # On nettoie la conversation avant d'afficher le message de solde
+            for mid in verif_msgs:
+                try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
+                except: pass
+            
             await update.message.reply_text(
                 msg(user_id, "solde_insuffisant", balance=balance, prix=prix, statut=FORFAITS[statut]['label']),
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            return ConversationHandler.END
+            return ConversationHandler.END # On quitte la convo
         else:
+            # On nettoie la conversation avant de payer
+            for mid in verif_msgs:
+                try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
+                except: pass
+        
             new_balance = update_user_balance(str(user_id), -prix)
             await update.message.reply_text(
                 f"🏦 {msg(user_id, 'balance', balance=new_balance)}\n{FORFAITS[statut]['label']} ({prix:.2f}$/permis)"
             )
-            await update.message.reply_text(msg(user_id, "decrytage_en_cours"))
+            
+            msgx = await update.message.reply_text(f"🔄 {msg(user_id, 'decrytage_en_cours').replace('…','.')} (0/1)")
 
             batch_id = f"{user_id}:{context.user_data.get('code_base','one')}"
-            batch_runs[batch_id] = {"total": 1, "resolved": 0, "notified": False,"lock": asyncio.Lock(),}
+            
+            batch_runs[batch_id] = {
+                "total": 1, 
+                "resolved": 0, 
+                "notified": False,
+                "lock": asyncio.Lock(),
+                # On ne stocke plus l'ID du message ici
+            }
+
+            asyncio.create_task(animate_wait_message(context, update.effective_chat.id, msgx.message_id, batch_id, lang))
 
             await launch_parallel_calls(
                 base, user_id, num_calls=10,
@@ -1754,7 +2321,10 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-    await update.message.reply_text("❓ Oui ou Non / Yes or No?")
+    # Si la réponse n'est ni "oui" ni "non", on repose la question
+    msgx = await update.message.reply_text("❓ Oui ou Non / Yes or No?")
+    # On ajoute la nouvelle question à la liste des messages à supprimer
+    context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
     return CONFIRM_VERIF
 
 
@@ -1993,6 +2563,8 @@ async def admin_prod_csv_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # REMPLACE l'ancienne fonction admin_prod_csv_receive (vers ligne 1460) par celle-ci:
 
+# REMPLACE la fonction admin_prod_csv_receive (de ligne 1473 à 1599) par CELLE-CI :
+
 async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_str = str(update.effective_user.id) # Pour les logs
     if user_id_str != ADMIN_ID:
@@ -2017,7 +2589,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
         from io import BytesIO, StringIO
         f = await context.bot.get_file(doc.file_id)
         bio = BytesIO()
-        await f.download(out=bio)
+        await f.download_to_memory(out=bio) # CORRECTION : download_to_memory
         bio.seek(0)
         
         try:
@@ -2037,7 +2609,9 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
         import csv, re
         # Sniffer pour deviner le délimiteur (virgule ou point-virgule)
         try:
-            dialect = csv.Sniffer().sniff(text.splitlines()[0]) # Regarde la 1ère ligne
+            # Prend les 5 premières lignes pour deviner
+            sample_text = "\n".join(text.splitlines()[:5])
+            dialect = csv.Sniffer().sniff(sample_text)
             delimiter = dialect.delimiter
             print(f"[CSV Import - User {user_id_str}] Délimiteur détecté: '{delimiter}'") # DEBUG LOG 3
         except csv.Error:
@@ -2047,13 +2621,18 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
         rdr = csv.DictReader(StringIO(text), delimiter=delimiter)
         
         try:
+            # CORRECTION : Convertit tous les en-têtes en minuscules
+            if rdr.fieldnames:
+                rdr.fieldnames = [h.lower().strip() for h in rdr.fieldnames if h] # Met en minuscule et enlève les espaces
+            
             headers = rdr.fieldnames
             if not headers:
                 raise ValueError("L'en-tête CSV est vide ou illisible.")
-            print(f"[CSV Import - User {user_id_str}] En-têtes lues: {headers}") # DEBUG LOG 4
+            print(f"[CSV Import - User {user_id_str}] En-têtes lues (en minuscule): {headers}") # DEBUG LOG 4
+            
             required_headers = {'first', 'last', 'dob', 'price'} # Minimum requis
-            if not required_headers.issubset({h.lower() for h in headers if h}):
-                 print(f"[CSV Import - User {user_id_str}] ERREUR: En-têtes manquantes. Requis au minimum: {required_headers}") # DEBUG LOG ERROR
+            if not required_headers.issubset(set(headers)): # Vérifie si tous sont présents
+                 print(f"[CSV Import - User {user_id_str}] ERREUR: En-têtes manquantes. Requis au minimum: {required_headers}. Trouvé: {headers}") # DEBUG LOG ERROR
                  await update.message.reply_text(f"❌ Erreur: En-têtes manquantes dans le CSV. Il faut au moins: first, last, dob, price.")
                  return ConversationHandler.END
         except Exception as header_err:
@@ -2068,20 +2647,20 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
         for row in rdr:
             line_num += 1
             try:
-                # Ton code existant pour traiter chaque ligne
-                password = (row.get('password') or row.get('PASSWORD') or '').strip()
-                sin     = (row.get('sin') or row.get('SIN') or '').strip() # Corrigé SIN majuscule
-                dl      = (row.get('dl') or row.get('DL') or '').strip() # Corrigé DL majuscule
-                first   = (row.get('first') or row.get('FIRST') or '').strip()
-                last    = (row.get('last') or row.get('LAST') or '').strip()
-                dob     = (row.get('dob') or row.get('DOB') or '').strip()
-                address = (row.get('address') or row.get('ADRESSE') or '').strip()
-                city    = (row.get('city') or row.get('CITY') or '').strip()
-                postal  = (row.get('postal') or row.get('POSTAL') or '').strip() # Corrigé POSTAL majuscule
-                base    = (row.get('base') or row.get('BASE') or 'FAKEPERSON').strip()
-                email   = (row.get('email') or row.get('EMAIL') or '').strip() # Corrigé EMAIL majuscule
-                phone   = (row.get('phone') or row.get('PHONE') or '').strip() # Corrigé PHONE majuscule
-                price   = _parse_price(row.get('price') or row.get('PRICE') or '0')
+                # CORRECTION : On ne cherche que les en-têtes en minuscules maintenant
+                password = (row.get('password') or '').strip()
+                sin      = (row.get('sin') or '').strip()
+                dl       = (row.get('dl') or '').strip()
+                first    = (row.get('first') or '').strip()
+                last     = (row.get('last') or '').strip()
+                dob      = (row.get('dob') or '').strip()
+                address  = (row.get('address') or '').strip()
+                city     = (row.get('city') or '').strip()
+                postal   = (row.get('postal') or '').strip()
+                base     = (row.get('base') or 'FAKEPERSON').strip() # 'base' (minuscule) lira 'Base'
+                email    = (row.get('email') or '').strip()
+                phone    = (row.get('phone') or '').strip()
+                price    = _parse_price(row.get('price') or '0')
 
                 # Vérification minimale que des données essentielles existent
                 if not first or not last or not dob:
@@ -2089,7 +2668,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                     continue # Ignore cette ligne
 
                 try:
-                    stock = int((row.get('stock') or row.get('STOCK') or '1').strip() or 1) # Corrigé STOCK majuscule
+                    stock = int((row.get('stock') or '1').strip() or 1)
                 except Exception:
                     stock = 1
 
@@ -2114,7 +2693,8 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                     f"BASE: {base}",
                     f"PRICE: {price:.2f} CAD",
                 ]
-                content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip()) # Ne garde que les lignes avec une valeur
+                # Ne garde que les lignes qui ont une valeur APRÈS le ":"
+                content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip()) 
 
                 fields, values = [], []
                 # Ton code existant pour remplir fields et values
@@ -2160,8 +2740,6 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
          await update.message.reply_text(f"❌ Erreur critique lors de l'import : {e}")
     
     return ConversationHandler.END
-
-# FIN DU REMPLACEMENT
 
 # ========================== ADMIN (sections ajustées) ==========================
 
@@ -2217,6 +2795,8 @@ async def admin_prod_del_confirm(update: Update, context: ContextTypes.DEFAULT_T
     await admin_prod_del(update, context)
 
 
+# REMPLACE la fonction admin_users (ligne 1618) par CELLE-CI :
+
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ADMIN_ID:
         await update.callback_query.answer("Accès refusé / Access denied.")
@@ -2226,8 +2806,11 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
 
         users = get_users()
+        kb_back_admin = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
+
         if not users:
-            await q.message.reply_text("Aucun utilisateur trouvé / No user found.")
+            # CORRIGÉ: Utilise replace_view et ajoute un bouton Retour
+            await replace_view(q, "Aucun utilisateur trouvé / No user found.", reply_markup=kb_back_admin)
             return
 
         keyboard = []
@@ -2242,28 +2825,44 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Évite les messages trop gros
         if not keyboard:
-            await q.message.reply_text("Aucun utilisateur trouvé / No user found.")
+            await replace_view(q, "Aucun utilisateur trouvé / No user found.", reply_markup=kb_back_admin)
             return
         if len(keyboard) > 80:
             keyboard = keyboard[:80]
+        
+        # CORRIGÉ: Ajoute le bouton Retour au clavier
+        keyboard.append([InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")])
 
-        await q.message.reply_text(
+        # CORRIGÉ: Utilise replace_view au lieu de reply_text
+        await replace_view(
+            q,
             "Clique un utilisateur pour ajuster son solde :",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception as e:
-        log(f"admin_users error: {e}", level="error")
-        await q.message.reply_text("⚠️ Erreur lors du chargement des utilisateurs.")
+        log(f"admin_users error: {e}", str(update.effective_user.id), "error")
+        try:
+            # CORRIGÉ: Utilise replace_view pour le message d'erreur
+            await replace_view(
+                q, 
+                "⚠️ Erreur lors du chargement des utilisateurs.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
+            )
+        except: pass
 
+
+# REMPLACE la fonction admin_adjust_user (ligne 1654) par CELLE-CI :
 
 async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
     if str(update.effective_user.id) != ADMIN_ID:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
-    await update.callback_query.answer()
+    
+    q = update.callback_query # CORRIGÉ : Définit q
+    await q.answer()
 
-    cbdata = update.callback_query.data
+    cbdata = q.data # CORRIGÉ : Utilise q.data
     telegram_id = cbdata.replace("admin_adjust_", "")
     context.user_data["target_user"] = telegram_id
 
@@ -2279,9 +2878,12 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("-250$", callback_data=f"admin_adjval_{telegram_id}_-250"),
         ],
         [InlineKeyboardButton("Montant personnalisé", callback_data=f"admin_customamount_{telegram_id}")],
-        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_users")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_users")], # Ce bouton ramène à la liste des utilisateurs, c'est bon
     ]
-    await update.callback_query.message.reply_text(
+    
+    # CORRIGÉ: Utilise replace_view au lieu de reply_text
+    await replace_view(
+        q,
         f"Quel ajustement pour l'utilisateur {telegram_id[-5:]} ?",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -2363,6 +2965,8 @@ async def admin_customamount_receive(update: Update, context: ContextTypes.DEFAU
     return ConversationHandler.END
 
 
+# REMPLACE la fonction admin_setstatut (ligne 1709) par CELLE-CI :
+
 async def admin_setstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != ADMIN_ID:
         await update.callback_query.answer("Accès refusé / Access denied.")
@@ -2370,6 +2974,9 @@ async def admin_setstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
         await q.answer()
+        
+        # CORRIGÉ: Définit un clavier de retour au menu admin
+        kb_back_admin = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
 
         users = get_users()
         keyboard = []
@@ -2381,36 +2988,56 @@ async def admin_setstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(display, callback_data=f"admin_userstatut_{tid}")])
 
         if not keyboard:
-            await q.message.reply_text("Aucun utilisateur trouvé / No user found.")
+            # CORRIGÉ: Utilise replace_view
+            await replace_view(q, "Aucun utilisateur trouvé / No user found.", reply_markup=kb_back_admin)
             return
         if len(keyboard) > 80:
             keyboard = keyboard[:80]
 
-        await q.message.reply_text(
+        # CORRIGÉ: Ajoute le bouton Retour
+        keyboard.append([InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")])
+
+        # CORRIGÉ: Utilise replace_view
+        await replace_view(
+            q,
             "Sélectionner un utilisateur :",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
     except Exception as e:
-        log(f"admin_setstatut error: {e}", level="error")
-        await q.message.reply_text("⚠️ Erreur lors du chargement de la liste.")
+        log(f"admin_setstatut error: {e}", str(update.effective_user.id), "error")
+        try:
+            # CORRIGÉ: Utilise replace_view pour le message d'erreur
+            await replace_view(
+                q, 
+                "⚠️ Erreur lors du chargement de la liste.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
+            )
+        except: pass
 
+# REMPLACE la fonction admin_userstatut (ligne 1735) par CELLE-CI :
 
 async def admin_userstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
     if str(update.effective_user.id) != ADMIN_ID:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
-    await update.callback_query.answer()
+    
+    q = update.callback_query # CORRIGÉ : Définit q
+    await q.answer()
 
-    cbdata = update.callback_query.data
+    cbdata = q.data # CORRIGÉ : Utilise q.data
     telegram_id = cbdata.replace("admin_userstatut_", "")
     keyboard = [
         [InlineKeyboardButton(f"{FORFAITS['bronze']['label']}",   callback_data=f"admin_statut_{telegram_id}_bronze")],
         [InlineKeyboardButton(f"{FORFAITS['silver']['label']}",   callback_data=f"admin_statut_{telegram_id}_silver")],
         [InlineKeyboardButton(f"{FORFAITS['gold']['label']}",     callback_data=f"admin_statut_{telegram_id}_gold")],
         [InlineKeyboardButton(f"{FORFAITS['platinum']['label']}", callback_data=f"admin_statut_{telegram_id}_platinum")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_setstatut")] # CORRIGÉ : Bouton Retour
     ]
-    await update.callback_query.message.reply_text(
+    
+    # CORRIGÉ: Utilise replace_view
+    await replace_view(
+        q,
         "Nouveau statut :",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -2463,6 +3090,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🏷 Forfait utilisateur", callback_data="admin_setstatut")],
         [InlineKeyboardButton("🔁 Redémarrer le bot", callback_data="admin_hard_reboot")],
         [InlineKeyboardButton("🧱 Produits Pro's", callback_data="admin_products")],
+        [InlineKeyboardButton("⏱️ Réglages Temps IVR", callback_data="admin_ivr_settings")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")],
     ]
 
@@ -2472,7 +3100,90 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Si l’edit échoue (message trop ancien), on envoie un nouveau
         await q.message.reply_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ========================== IVR & SIGNALWIRE ==========================
+# AJOUTE CES 3 FONCTIONS (après admin_menu, ligne 1800)
+
+async def admin_ivr_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu de réglage des temps IVR."""
+    if str(update.effective_user.id) != ADMIN_ID:
+        return
+    q = update.callback_query
+    await q.answer()
+    
+    timings = get_ivr_timings()
+    
+    kb = [
+        [InlineKeyboardButton(f"Pause 1 (Ouvert): {timings.get('open_1', 55)}s", callback_data="admin_ivr_change:open_1")],
+        [InlineKeyboardButton(f"Pause 2 (Ouvert): {timings.get('open_2', 41)}s", callback_data="admin_ivr_change:open_2")],
+        [InlineKeyboardButton(f"Pause 1 (Fermé): {timings.get('closed_1', 40)}s", callback_data="admin_ivr_change:closed_1")],
+        [InlineKeyboardButton(f"Pause 2 (Fermé): {timings.get('closed_2', 45)}s", callback_data="admin_ivr_change:closed_2")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]
+    ]
+    
+    await replace_view(q, "⏱️ Régler les temps d'attente IVR (en secondes) :", reply_markup=InlineKeyboardMarkup(kb))
+    # On ne retourne pas de nouvel état, on reste dans le menu admin principal
+
+async def admin_ivr_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Demande la nouvelle valeur pour un temps de pause."""
+    if str(update.effective_user.id) != ADMIN_ID:
+        return
+    q = update.callback_query
+    await q.answer()
+    
+    key_to_change = q.data.split(":")[-1]
+    context.user_data['ivr_timing_key'] = key_to_change
+    
+    await q.message.reply_text(f"Entrez la nouvelle valeur en secondes pour '{key_to_change}' (ex: 50) :")
+    return ADMIN_IVR_AWAIT_VALUE # Démarre la conversation pour attendre la réponse
+
+async def admin_ivr_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reçoit la nouvelle valeur, la sauvegarde, et ré-affiche le menu."""
+    if str(update.effective_user.id) != ADMIN_ID:
+        return
+        
+    key = context.user_data.pop('ivr_timing_key', None)
+    if not key:
+        return ConversationHandler.END
+    
+    try:
+        value = int(update.message.text.strip())
+        if value < 0 or value > 120: # Sécurité: 0-120 secondes
+            raise ValueError("Valeur hors limites (0-120s)")
+    except Exception as e:
+        await update.message.reply_text(f"Valeur invalide: {e}. Entrez un nombre (ex: 50).")
+        context.user_data['ivr_timing_key'] = key # Redemande
+        return ADMIN_IVR_AWAIT_VALUE 
+    
+    # Sauvegarder la valeur
+    set_ivr_timing(key, value)
+    
+    await update.message.reply_text(f"✅ Valeur pour '{key}' mise à jour à {value}s.")
+    
+    # Recréer un faux "update" pour rappeler admin_ivr_settings
+    class MockCallbackQuery:
+        message = update.message
+        async def answer(self): pass
+        async def delete(self): pass # Simule la suppression
+    
+    # Simule un objet q.message.delete()
+    mock_update = Update(update.update_id, callback_query=MockCallbackQuery())
+    
+    # On simule un "replace_view" manuel pour ré-afficher le menu des réglages
+    try:
+        await update.message.delete() # Supprime le message de la valeur (ex: "50")
+    except: pass
+
+    timings = get_ivr_timings()
+    kb = [
+        [InlineKeyboardButton(f"Pause 1 (Ouvert): {timings.get('open_1', 55)}s", callback_data="admin_ivr_change:open_1")],
+        [InlineKeyboardButton(f"Pause 2 (Ouvert): {timings.get('open_2', 41)}s", callback_data="admin_ivr_change:open_2")],
+        [InlineKeyboardButton(f"Pause 1 (Fermé): {timings.get('closed_1', 40)}s", callback_data="admin_ivr_change:closed_1")],
+        [InlineKeyboardButton(f"Pause 2 (Fermé): {timings.get('closed_2', 45)}s", callback_data="admin_ivr_change:closed_2")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]
+    ]
+    await update.message.reply_text("⏱️ Régler les temps d'attente IVR (en secondes) :", reply_markup=InlineKeyboardMarkup(kb))
+    
+    return ConversationHandler.END
+
 # ========================== IVR & SIGNALWIRE ==========================
 def is_system_open():
     tz = pytz.timezone("America/Toronto")
@@ -2587,12 +3298,19 @@ async def cancel_all_calls(batch_id: str | None = None, user_id: int | str | Non
     log(f"cancel_all_calls: {canceled} appel(s) traités (batch_id={batch_id}, user_id={user_id})", "SYSTEM")
     return canceled
 
+# REMPLACE la fonction twilio_handler (ligne 1749) par CELLE-CI :
+
 @app.route("/twilio_handler", methods=["GET", "POST"], endpoint="twilio_handler_main")
 def twilio_handler():
     code = request.args.get("code", "")
     uid = request.args.get("uid")
     bid = request.args.get("bid")
     call_sid = request.form.get("CallSid", f"call_{datetime.now().timestamp()}")
+    
+    # --- MODIFICATION ---
+    # Charge les temps de pause depuis le fichier
+    timings = get_ivr_timings()
+    # --- FIN MODIFICATION ---
 
     print(f"📞 Appel reçu — CallSid: {call_sid} | UID: {uid} | Code: {code} | BID: {bid}")
 
@@ -2606,20 +3324,24 @@ def twilio_handler():
 
     if is_system_open():
         print("🕐 SAAQ ouverte — Menu 4-4-6 déclenché")
-        r.pause(length=33)
+        # --- MODIFICATION ---
+        r.pause(length=timings.get("open_1", 55)) # Default 55
         r.play(digits="4")
-        r.pause(length=3)
+        r.pause(length=3) # Garde les petites pauses hard-codées
         r.play(digits="4")
         r.pause(length=3)
         r.play(digits="6")
-        r.pause(length=41)
+        r.pause(length=timings.get("open_2", 41)) # Default 41
+        # --- FIN MODIFICATION ---
     else:
         print("🕐 SAAQ fermée — Menu 1-1 déclenché")
-        r.pause(length=40)
+        # --- MODIFICATION ---
+        r.pause(length=timings.get("closed_1", 40)) # Default 40
         r.play(digits="1")
         r.pause(length=3)
         r.play(digits="1")
-        r.pause(length=45)
+        r.pause(length=timings.get("closed_2", 45)) # Default 45
+        # --- FIN MODIFICATION ---
 
     redirect_url = f"{SERVER_URL}/composer_code?code={code}&uid={uid}"
     print(f"🔁 Redirection vers: {redirect_url}")
@@ -2710,16 +3432,32 @@ def analyze_response():
             br = batch_runs.get(batch_id)
             if not br:
                 return
+
             async with br.setdefault("lock", asyncio.Lock()):
+                
+                # --- DÉBUT DES MODIFICATIONS ---
+                
+                # 1. Gère l'envoi du message de résultat (valide/invalide)
                 if add_result_text:
                     await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text)
-                if not state["resolved"]:
+                
+                # 2. Gère la mise à jour du compteur de permis résolus
+                #    (Se déclenche 1 fois par personne, soit si valide, soit si 10e échec)
+                if not state["resolved"] and (add_result_text or state.get("total", 0) >= 10): 
                     state["resolved"] = True
-                    br["resolved"] += 1
-                    if br["resolved"] >= br["total"] and not br["notified"]:
-                        br["notified"] = True
-                        await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
-                        await show_main_menu(user_id)
+                    br["resolved"] += 1 # Incrémente le compteur global du batch
+                
+                # 3. Gère la fin du batch complet
+                if br["resolved"] >= br["total"] and not br["notified"]:
+                    br["notified"] = True # CELA VA ARRÊTER LA BOUCLE D'ANIMATION
+                    
+                    # On n'édite plus ou ne supprime plus le message d'ici.
+                    # La tâche d'animation s'arrêtera d'elle-même.
+
+                    await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
+                    await show_main_menu(user_id)
+                # --- FIN DES MODIFICATIONS ---
+                    
         asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
 
     try:
@@ -2793,11 +3531,34 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+# REMPLACE l'ancienne fonction hist_view_callback (ligne 1801) par CELLE-CI :
+
 async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await hist_menu(update, context)
+        q = update.callback_query
+        user_id = q.from_user.id
+        chat_id = q.message.chat_id
+        nav_message_id = q.message.message_id # L'ID du message de navigation ("Page 1/1...")
+
+        # --- CORRECTION AJOUTÉE ---
+        # Récupère la liste des messages (fiches + nav) et la vide
+        old_msgs = context.user_data.pop("hist_msgs", []) 
+        if old_msgs:
+            for mid in old_msgs:
+                if mid != nav_message_id: # Ne supprime pas le message de nav lui-même
+                    try:
+                        # Supprime les anciennes fiches de l'historique
+                        await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+                    except:
+                        pass # Ignore les messages déjà supprimés
+        # --- FIN DE LA CORRECTION ---
+        
+        # Appelle hist_menu, qui va maintenant remplacer le message de navigation (q.message)
+        # par le menu "Choisissez une section :"
+        await hist_menu(update, context) 
+    
     except Exception as e:
-        log(f"hist_view_callback error: {e}", level="error")
+        log(f"hist_view_callback error: {e}", str(update.effective_user.id), "error")
 
 if __name__ == "__main__":
 # --- DB ---
@@ -2988,6 +3749,29 @@ admin_csv_conv = ConversationHandler(
 )
 app_telegram.add_handler(admin_csv_conv, group=6) # Mettre un groupe différent
 
+# AJOUTE CE BLOC (après admin_csv_conv, ligne 1853)
+
+# === NOUVEAU: Conversation pour Réglages IVR ===
+admin_ivr_conv = ConversationHandler(
+    entry_points=[
+        # Déclenché par les boutons "Modifier..."
+        CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:.*$")
+    ],
+    states={
+        # Attend la nouvelle valeur en secondes
+        ADMIN_IVR_AWAIT_VALUE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ivr_receive)
+        ],
+    },
+    fallbacks=[
+        CallbackQueryHandler(admin_menu, pattern="^admin_menu$"),
+        CommandHandler("start", goto_menu)
+    ],
+    # Permet de revenir au menu admin si on clique sur un bouton de retour
+    map_to_parent={ ConversationHandler.END: -1 }
+)
+app_telegram.add_handler(admin_ivr_conv, group=7) # Nouveau groupe
+
 
 # === Navigation / Historique ===
 app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
@@ -3039,11 +3823,31 @@ conv_handler = ConversationHandler(
 
 app_telegram.add_handler(conv_handler)
 
-# === Filtres catalogue ===
-app_telegram.add_handler(CallbackQueryHandler(filter_open,   pattern="^filter_open$"))
-app_telegram.add_handler(CallbackQueryHandler(filter_select, pattern="^filter:(name|city|base|price|year)$"))
-app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_filter_text, block=False),group=10,)
-
+# === Filtres catalogue (NOUVEAU SYSTÈME) ===
+catalog_filter_conv = ConversationHandler(
+    entry_points=[
+        CallbackQueryHandler(filter_start, pattern="^filter_open$"),
+    ],
+    states={
+        CATALOG_FILTER_MAIN: [
+            CallbackQueryHandler(filter_select_type, pattern="^filter:(name|city|base|price|year)$"),
+            CallbackQueryHandler(filter_search, pattern="^filter_search$"),
+            CallbackQueryHandler(filter_reset, pattern="^filter_reset$"),
+        ],
+        CATALOG_FILTER_AWAIT_VALUE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value),
+        ],
+    },
+    fallbacks=[
+        CallbackQueryHandler(filter_cancel, pattern="^filter_cancel$"),
+        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
+        CommandHandler("start", goto_menu)
+    ],
+    allow_reentry=True,
+    persistent=False, # Ne pas sauvegarder les états de filtre si le bot redémarre
+    name="catalog_filter_conversation"
+)
+app_telegram.add_handler(catalog_filter_conv, group=10) # Doit être dans un groupe
 # === Produits ===
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_preview_callback, pattern=r"^prod:preview:\d+$"),group=-1)
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback,     pattern=r"^buy:\d+$"),group=-1)
@@ -3080,6 +3884,7 @@ app_telegram.add_handler(CallbackQueryHandler(admin_setstatut,          pattern=
 app_telegram.add_handler(CallbackQueryHandler(admin_userstatut,         pattern="^admin_userstatut_.*$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final,    pattern="^admin_statut_.*$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot,        pattern="^admin_hard_reboot$"))
+app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings,       pattern="^admin_ivr_settings$"))
 
 from telegram.ext import filters, MessageHandler
 app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive),     group=21)
@@ -3106,3 +3911,4 @@ except Exception as _e:
 import time
 while True:
     time.sleep(3600)
+
