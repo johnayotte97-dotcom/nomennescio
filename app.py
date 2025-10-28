@@ -779,10 +779,24 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         sent_ids.append(m.message_id) # Ajoute la fiche à la liste
 
     # --- CORRECTION : Affiche le bon menu en bas ---
+# REMPLACEZ le bloc 'if from_filter: ... else: ...' (lignes 800-821) par ceci :
+
+    # --- CORRECTION : Affiche le bon menu en bas ---
     if from_filter:
         # Si on vient du filtre, on sauvegarde les fiches dans une liste séparée
         context.user_data['filter_fiches_msg_ids'] = sent_ids
-        # On ne ré-affiche pas le menu, il est déjà là (on l'a gardé)
+        
+        # --- NOUVEAU : Met à jour le menu de filtre avec la pagination ---
+        page_info = {'page': page, 'total_pages': total_pages}
+        kb_with_nav = _build_filter_menu(context, page_info=page_info)
+        
+        try:
+            # Modifie le message du menu de filtre (query.message) pour ajouter la pagination
+            await query.message.edit_reply_markup(reply_markup=kb_with_nav)
+        except Exception as e:
+            logger.warning(f"Impossible de modifier le menu de filtre pour pagination: {e}")
+        # --- FIN NOUVEAU ---
+
     else:
         # Si on est en mode catalogue normal, on affiche la pagination
         kb_nav = InlineKeyboardMarkup([
@@ -796,7 +810,7 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         ])
         m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
         sent_ids.append(m_nav.message_id)
-        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
+        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messagesSauvegarde la nouvelle liste de messages
  
 
 # AJOUTEZ CETTE FONCTION (après la fin de show_products, ligne 821)
@@ -849,13 +863,14 @@ def _filter_products(products: list, key: str, value: str) -> list:
 # FIN DE LA NOUVELLE FONCTION
 # REMPLACE les 3 fonctions filter_open, filter_select, on_filter_text (lignes 718-862) par TOUT CE BLOC :
 
-def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
-    """Construit le menu de filtre dynamique avec les filtres actifs."""
+# REMPLACEZ la fonction _build_filter_menu (lignes 865-888) par ceci :
+
+def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
+    """Construit le menu de filtre dynamique, AVEC pagination optionnelle."""
     filters = context.user_data.get('pending_filters', {})
     
     def get_label(key, default):
         val = filters.get(key)
-        # Ajoute une coche si le filtre est actif
         return f"✅ {default}: {val}" if val else default
 
     kb = [
@@ -871,9 +886,25 @@ def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMark
         [
             InlineKeyboardButton("❌ Reset", callback_data="filter_reset"),
             InlineKeyboardButton("SEARCH 🔎", callback_data="filter_search")
-        ],
-        [InlineKeyboardButton("⬅️ Annuler (Retour Catalogue)", callback_data="filter_cancel")]
+        ]
     ]
+    
+    # --- BLOC AJOUTÉ : Ajoute la pagination si fournie ---
+    if page_info:
+        page = page_info.get('page', 0)
+        total_pages = page_info.get('total_pages', 1)
+        
+        # N'affiche la pagination que s'il y a plus d'une page
+        if total_pages > 1:
+            nav_row = [
+                InlineKeyboardButton("«", callback_data=f"filter:page:{max(0, page-1)}"),
+                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton("»", callback_data=f"filter:page:{min(total_pages-1, page+1)}"),
+            ]
+            kb.append(nav_row)
+    # --- FIN DU BLOC AJOUTÉ ---
+
+    kb.append([InlineKeyboardButton("⬅️ Annuler (Retour Catalogue)", callback_data="filter_cancel")])
     return InlineKeyboardMarkup(kb)
 
 async def filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -958,6 +989,23 @@ async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYP
     
     return CATALOG_FILTER_MAIN
 
+async def filter_page_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la navigation de page PENDANT un filtre."""
+    q = update.callback_query
+    
+    try:
+        page = int(q.data.split(":")[-1])
+    except Exception:
+        page = 0
+        
+    # Appelle show_products, en lui disant qu'on vient du filtre
+    # et en passant le nouveau numéro de page.
+    # Les 'active_filters' sont toujours dans context.user_data
+    await show_products(update, context, page=page, tier=None, from_filter=True)
+    
+    # On reste dans le menu principal du filtre
+    return CATALOG_FILTER_MAIN
+
 async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Applique les filtres et lance la recherche."""
     q = update.callback_query
@@ -970,6 +1018,8 @@ async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # On reste dans le menu principal du filtre
     return CATALOG_FILTER_MAIN
+
+# REMPLACEZ la fonction filter_reset (lignes 1018-1035) par ceci :
 
 async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Réinitialise les filtres et nettoie les fiches produits."""
@@ -989,8 +1039,8 @@ async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
              pass # Ignore les erreurs si le message est déjà supprimé
     # --- FIN DE LA CORRECTION ---
 
-    # Ré-affiche le menu de filtre (maintenant vide)
-    kb = _build_filter_menu(context) #
+    # Ré-affiche le menu de filtre (maintenant vide et SANS pagination)
+    kb = _build_filter_menu(context, page_info=None) # Force la suppression de la pagination
     await q.message.edit_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
 
     return CATALOG_FILTER_MAIN # On reste dans la conversation
@@ -3596,6 +3646,7 @@ catalog_filter_conv = ConversationHandler(
             CallbackQueryHandler(filter_select_type, pattern="^filter:(name|city|base|price|year)$"),
             CallbackQueryHandler(filter_search, pattern="^filter_search$"),
             CallbackQueryHandler(filter_reset, pattern="^filter_reset$"),
+            CallbackQueryHandler(filter_page_nav, pattern="^filter:page:\d+$"),
         ],
         CATALOG_FILTER_AWAIT_VALUE: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value),
