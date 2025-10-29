@@ -172,6 +172,7 @@ HISTORY_FILTER_CHOICE, HISTORY_FILTER_INPUT = range(300, 302)
 ADMIN_IVR_AWAIT_VALUE = 400 # Nouvelle constante
 IVR_TIMINGS_FILE = "ivr_timings.json"
 CATALOG_FILTER_MAIN, CATALOG_FILTER_AWAIT_VALUE = range(500, 502)
+CCS_FILTER_MAIN, CCS_FILTER_AWAIT_VALUE = range(600, 602)
 
 # Paliers
 FORFAITS = {
@@ -507,6 +508,7 @@ def convertir_en_code_saaq(code: str) -> str:
 def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
     lang = get_user_lang(str(user_id))
     menu = [
+        [InlineKeyboardButton("💳 Cc's", callback_data="ccs")],
         [InlineKeyboardButton("👥 Pro's", callback_data="propro")],
         [InlineKeyboardButton("🛒 Panier", callback_data="cart:view")],
         [InlineKeyboardButton("📜 Historique", callback_data="hist:view")],
@@ -628,13 +630,16 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     else:
         chat_id = update.effective_chat.id
 
-    # --- CORRECTION : Nettoyage amélioré ---
+# --- CORRECTION : Nettoyage amélioré ---
     # Nettoie TOUS les anciens messages du catalogue OU du filtre
     try:
         if from_filter:
-            # Si on vient du filtre, ne nettoie que les fiches (garde le menu)
+            # Si on vient du filtre, nettoie les fiches ET LE MENU DE FILTRE
             prev_filter_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
-            for mid in prev_filter_fiches:
+            prev_filter_menu = context.user_data.pop("filter_msgs", []) # <-- LIGNE MODIFIÉE
+            all_to_delete = list(set(prev_filter_fiches + prev_filter_menu)) # <-- LIGNE MODIFIÉE
+            
+            for mid in all_to_delete: # <-- LIGNE MODIFIÉE
                  try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
                  except: pass
         else:
@@ -778,24 +783,24 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
         sent_ids.append(m.message_id) # Ajoute la fiche à la liste
 
-    # --- CORRECTION : Affiche le bon menu en bas ---
-# REMPLACEZ le bloc 'if from_filter: ... else: ...' (lignes 800-821) par ceci :
 
-    # --- CORRECTION : Affiche le bon menu en bas ---
     if from_filter:
         # Si on vient du filtre, on sauvegarde les fiches dans une liste séparée
         context.user_data['filter_fiches_msg_ids'] = sent_ids
         
-        # --- NOUVEAU : Met à jour le menu de filtre avec la pagination ---
+        # Construit le menu de filtre AVEC la pagination
         page_info = {'page': page, 'total_pages': total_pages}
         kb_with_nav = _build_filter_menu(context, page_info=page_info)
         
-        try:
-            # Modifie le message du menu de filtre (query.message) pour ajouter la pagination
-            await query.message.edit_reply_markup(reply_markup=kb_with_nav)
-        except Exception as e:
-            logger.warning(f"Impossible de modifier le menu de filtre pour pagination: {e}")
-        # --- FIN NOUVEAU ---
+        # --- MODIFICATION : Envoie le NOUVEAU menu de filtre en bas ---
+        m_nav = await context.bot.send_message(
+            chat_id=chat_id, 
+            text=f"Filtre actif - Page {page+1}/{total_pages}", 
+            reply_markup=kb_with_nav
+        )
+        
+        # Sauvegarde l'ID du nouveau menu pour le prochain nettoyage
+        context.user_data['filter_msgs'] = [m_nav.message_id]
 
     else:
         # Si on est en mode catalogue normal, on affiche la pagination
@@ -810,7 +815,7 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         ])
         m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
         sent_ids.append(m_nav.message_id)
-        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messagesSauvegarde la nouvelle liste de messages
+        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
  
 
 # AJOUTEZ CETTE FONCTION (après la fin de show_products, ligne 821)
@@ -1057,6 +1062,342 @@ async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Appelle show_products (qui va nettoyer le menu de filtre)
     await show_products(update, context, page=0, tier=None, from_filter=False) # from_filter=False pour recharger
     return ConversationHandler.END
+
+# ========================== CATALOGUE PRODUITS (CCS CLONE) ==========================
+#
+#   Ce bloc est un clone de 'show_products' et 'filter_...'
+#   dédié uniquement à la catégorie 'ccs'
+#
+# ====================================================================================
+
+CCS_CATALOG_MSGS = {} # Variable globale SÉPARÉE pour les messages CCS
+
+async def show_products_ccs(update, context, page=0, tier=None, from_filter=False):
+    chat_id = None
+    query = getattr(update, "callback_query", None)
+    
+    if query:
+        chat_id = query.message.chat_id
+        try:
+            await query.answer()
+        except Exception:
+            pass
+    else:
+        chat_id = update.effective_chat.id
+
+    # --- Nettoyage amélioré (pour CCS) ---
+    try:
+        if from_filter:
+            # Si on vient du filtre, nettoie les fiches ET LE MENU DE FILTRE
+            prev_filter_fiches = context.user_data.pop("ccs_filter_fiches_msg_ids", [])
+            prev_filter_menu = context.user_data.pop("ccs_filter_msgs", []) 
+            all_to_delete = list(set(prev_filter_fiches + prev_filter_menu))
+            
+            for mid in all_to_delete:
+                 try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+                 except: pass
+        else:
+            # Sinon (menu Cc's), nettoie tout (catalogue ET filtre)
+            prev_catalog = CCS_CATALOG_MSGS.pop(chat_id, [])
+            prev_filter = context.user_data.pop("ccs_filter_msgs", [])
+            prev_fiches = context.user_data.pop("ccs_filter_fiches_msg_ids", [])
+            all_to_delete = list(set(prev_catalog + prev_filter + prev_fiches))
+            for mid in all_to_delete:
+                try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+                except: pass
+    except Exception as e:
+        logger.warning(f"Erreur pendant le nettoyage de show_products_ccs: {e}")
+
+    # Applique les filtres s'ils existent
+    active_filters = context.user_data.get('ccs_active_filters', {})
+    prods_all = _get_products(category="ccs", tier=tier) # <-- CHANGÉ POUR 'ccs'
+    
+    prods = prods_all
+    if active_filters:
+        for f_key, f_val in active_filters.items():
+            prods = _filter_products(prods, f_key, f_val) # Réutilise la logique de filtre
+    
+    # --- pagination ---
+    PER_PAGE = 2
+    total_pages = max(1, (len(prods) + PER_PAGE - 1) // PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * PER_PAGE
+    chunk = prods[start:start + PER_PAGE]
+
+    sent_ids = [] 
+
+    # Rien à afficher
+    if not prods or not chunk:
+        text_to_send = "Aucun produit 'Cc's' pour le moment."
+        if active_filters:
+            text_to_send = "Aucun produit ne correspond à vos filtres."
+        
+        # Construit le menu de filtre (vide)
+        kb = _build_filter_menu_ccs(context, page_info=None)
+        
+        # Si on vient du filtre, on modifie le menu existant
+        if from_filter:
+            await query.message.edit_text(text_to_send, reply_markup=kb)
+            return
+
+        # Sinon, on supprime le menu principal et on envoie le catalogue vide
+        try: await query.message.delete()
+        except: pass
+        
+        m = await context.bot.send_message(
+            chat_id=chat_id,
+            text=text_to_send,
+            reply_markup=kb
+        )
+        sent_ids.append(m.message_id) 
+        CCS_CATALOG_MSGS[chat_id] = sent_ids
+        return
+
+    # Formatter une fiche produit (utilise la même fonction que Pro's)
+    def fmt_product(p):
+        raw = (p.get("content") or "").strip()
+        import re
+        def grab(keys):
+            for key in keys:
+                m = re.search(rf"^{re.escape(key)}\s*:\s*(.+)$",
+                              raw, flags=re.IGNORECASE | re.MULTILINE)
+                if m:
+                    return m.group(1).strip()
+            return ""
+        if not raw:
+            t = (p.get("title") or "").strip()
+            parts = [x.strip() for x in t.split("•")]
+            name  = parts[0] if parts else "John Doe"
+            first = name.split()[0].upper() if name else "JOHN"
+            year     = parts[1] if len(parts) > 1 else ""
+            city     = parts[2] if len(parts) > 2 else ""
+            dob_full = ""
+            base = p.get("tier") or "FAKEPERSON"
+        else:
+            first    = (grab(["FIRST NAME"]) or "JOHN").split()[0].upper()
+            dob_full = grab(["DOB(DD/MM/YYYY)", "DOB"]) or ""
+            m = re.search(r'(19|20)\d{2}', dob_full or "")
+            year = m.group(0) if m else ""
+            if not year: year = (p.get("year") or "").strip()
+            if not year:
+                t = (p.get("title") or "")
+                m2 = re.search(r'(19|20)\d{2}', t)
+                year = m2.group(0) if m2 else ""
+            city = grab(["CITY"]) or (p.get("city") or "")
+            base = p.get("tier") or grab(["BASE"]) or "FAKEPERSON"
+        try:
+            price = float(p.get("price", 10.0) or 10.0)
+        except Exception:
+            price = 10.0
+        curr  = p.get("currency") or "CAD"
+        return "\n".join([
+            f"FIRST NAME: {first}", # Vous pouvez changer ceci pour ex: "BIN: 123456"
+            f"DOB: {year or dob_full or 'N/A'}", # ou "EXP: 12/25"
+            f"CITY: {city or '—'}", # ou "BANK: RBC"
+            f"BASE: {base}",
+            f"PRICE: {price:.2f} {curr}",
+        ])
+    
+    for idx, p in enumerate(chunk, start=1):
+        txt = fmt_product(p)
+        pid = p.get("id")
+        kb_rows = [[
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"),
+            InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cart:add:{pid}"),
+        ]]
+        kb = InlineKeyboardMarkup(kb_rows)
+        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
+        sent_ids.append(m.message_id) 
+
+    # Affiche le bon menu en bas
+    if from_filter:
+        context.user_data['ccs_filter_fiches_msg_ids'] = sent_ids
+        page_info = {'page': page, 'total_pages': total_pages}
+        kb_with_nav = _build_filter_menu_ccs(context, page_info=page_info) # Fonction CCS
+        m_nav = await context.bot.send_message(
+            chat_id=chat_id, 
+            text=f"Filtre actif - Page {page+1}/{total_pages}", 
+            reply_markup=kb_with_nav
+        )
+        context.user_data['ccs_filter_msgs'] = [m_nav.message_id]
+    else:
+        kb_nav = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 Filter", callback_data="ccs_filter_open")], # Callback CCS
+            [
+                InlineKeyboardButton("«", callback_data=f"ccs:page:{max(0, page-1)}"), # Callback CCS
+                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton("»", callback_data=f"ccs:page:{min(total_pages-1, page+1)}"), # Callback CCS
+            ],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+        ])
+        m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
+        sent_ids.append(m_nav.message_id)
+        CCS_CATALOG_MSGS[chat_id] = sent_ids
+
+# --- Fonctions de filtre (Clone pour CCS) ---
+
+def _build_filter_menu_ccs(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
+    """Construit le menu de filtre dynamique pour CCS."""
+    filters = context.user_data.get('ccs_pending_filters', {}) # ccs_
+    
+    def get_label(key, default):
+        val = filters.get(key)
+        return f"✅ {default}: {val}" if val else default
+
+    kb = [
+        [
+            InlineKeyboardButton(get_label("name", "Name"),  callback_data="ccs_filter:name"),
+            InlineKeyboardButton(get_label("city", "City"),  callback_data="ccs_filter:city")
+        ],
+        [
+            InlineKeyboardButton(get_label("base", "Base"),  callback_data="ccs_filter:base"),
+            InlineKeyboardButton(get_label("price", "Price"), callback_data="ccs_filter:price")
+        ],
+        [InlineKeyboardButton(get_label("year", "Year"),  callback_data="ccs_filter:year")],
+        [
+            InlineKeyboardButton("❌ Reset", callback_data="ccs_filter_reset"),
+            InlineKeyboardButton("SEARCH 🔎", callback_data="ccs_filter_search")
+        ]
+    ]
+    
+    if page_info:
+        page = page_info.get('page', 0)
+        total_pages = page_info.get('total_pages', 1)
+        if total_pages > 1:
+            nav_row = [
+                InlineKeyboardButton("«", callback_data=f"ccs_filter:page:{max(0, page-1)}"),
+                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton("»", callback_data=f"ccs_filter:page:{min(total_pages-1, page+1)}"),
+            ]
+            kb.append(nav_row)
+            
+    kb.append([InlineKeyboardButton("⬅️ Annuler (Retour Catalogue)", callback_data="ccs_filter_cancel")])
+    return InlineKeyboardMarkup(kb)
+
+async def filter_start_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Démarre la conversation de filtre CCS."""
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+
+    # Initialise les filtres en attente pour CCS
+    context.user_data['ccs_pending_filters'] = {}
+    context.user_data.pop('ccs_active_filters', None) 
+    
+    # Nettoie les anciens messages du catalogue CCS
+    old_catalog_msgs = CCS_CATALOG_MSGS.pop(chat_id, [])
+    for mid in old_catalog_msgs:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+    # Construit le menu de filtre CCS
+    kb = _build_filter_menu_ccs(context)
+    # Supprime l'ancien message (catalogue) et envoie le menu filtre
+    try:
+        await q.message.delete()
+    except: pass
+    m = await q.message.reply_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb) 
+    
+    # Stocke l'ID du nouveau menu de filtre CCS
+    context.user_data['ccs_filter_msgs'] = [m.message_id] 
+    return CCS_FILTER_MAIN # Retourne l'état de la conversation de filtre CCS
+
+async def filter_select_type_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    field = q.data.split(':', 1)[1]
+    context.user_data['ccs_current_filter_key'] = field
+    
+    prompts = {
+        'name':  "Type a name fragment (ex: John):",
+        'city':  "Type a city fragment (ex: Toronto):",
+        'base':  "Type a base fragment (ex: Montreal Pack / FAKEPERSON):",
+        'price': "Max price (number, e.g. 12):",
+        'year':  "Year digits (e.g. 1991):",
+    }
+    
+    await q.message.edit_text(prompts[field], reply_markup=kb_back_cancel())
+    return CCS_FILTER_AWAIT_VALUE
+
+async def filter_receive_value_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    key = context.user_data.pop('ccs_current_filter_key', None)
+    if not key:
+        return CCS_FILTER_MAIN
+        
+    value = update.message.text.strip()
+    context.user_data.setdefault('ccs_pending_filters', {})[key] = value
+    
+    try:
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data['ccs_filter_msgs'][0])
+    except: pass
+    try:
+        await update.message.delete()
+    except: pass
+        
+    notif_msg = await update.message.reply_text(f"✅ Filtre '{key}' mis à jour: {value}", quote=False)
+    
+    kb = _build_filter_menu_ccs(context)
+    m = await update.message.reply_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
+    context.user_data['ccs_filter_msgs'] = [m.message_id] 
+    
+    await asyncio.sleep(2)
+    try:
+        await notif_msg.delete()
+    except:
+        pass
+    
+    return CCS_FILTER_MAIN
+
+async def filter_search_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    
+    context.user_data['ccs_active_filters'] = context.user_data.get('ccs_pending_filters', {})
+    await show_products_ccs(update, context, page=0, tier=None, from_filter=True)
+    
+    return CCS_FILTER_MAIN
+
+async def filter_page_nav_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        page = int(q.data.split(":")[-1])
+    except Exception:
+        page = 0
+    await show_products_ccs(update, context, page=page, tier=None, from_filter=True)
+    return CCS_FILTER_MAIN
+
+async def filter_reset_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("Filtres réinitialisés")
+    
+    context.user_data.pop('ccs_pending_filters', None)
+    context.user_data.pop('ccs_active_filters', None)
+    
+    prev_filter_fiches = context.user_data.pop("ccs_filter_fiches_msg_ids", [])
+    for mid in prev_filter_fiches:
+         try:
+             await context.bot.delete_message(chat_id=q.message.chat_id, message_id=mid)
+         except: 
+             pass
+
+    kb = _build_filter_menu_ccs(context, page_info=None) 
+    await q.message.edit_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
+
+    return CCS_FILTER_MAIN 
+
+async def filter_cancel_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    context.user_data.pop('ccs_pending_filters', None)
+    context.user_data.pop('ccs_active_filters', None)
+    
+    await show_products_ccs(update, context, page=0, tier=None, from_filter=False)
+    return ConversationHandler.END
+
+# ========================== FIN DU BLOC CCS ==========================
 
 # ========================== BOUTONS SIMPLES ==========================
 async def callback_show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2244,18 +2585,6 @@ def _parse_manual_block(text: str):
         'currency': currency,
     }
 
-async def admin_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
-        await update.callback_query.answer("Accès refusé / Access denied.")
-        return
-    kb = [
-        [InlineKeyboardButton("➕ Ajouter (manuel)", callback_data="admin_prod_add")],
-        [InlineKeyboardButton("📥 Import CSV",       callback_data="admin_prod_csv")],
-        [InlineKeyboardButton("🗑 Supprimer",        callback_data="admin_prod_del")],
-        [InlineKeyboardButton("📦 Lister (10)",      callback_data="admin_prod_list")],
-        [InlineKeyboardButton("🔙 Retour",           callback_data="admin_menu")],
-    ]
-    await update.callback_query.message.reply_text("🧱 Gestion des produits PRO'S :", reply_markup=InlineKeyboardMarkup(kb))
 
 # ========================== ADMIN (sections ajustées) ==========================
 
@@ -2887,7 +3216,7 @@ async def admin_hard_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Guard admin
+    # Vérification Admin
     if str(update.effective_user.id) != ADMIN_ID:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
@@ -2898,22 +3227,25 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+    # --- MODIFICATION : Ajoute les deux boutons produits ici ---
     keyboard = [
         [InlineKeyboardButton("👥 Utilisateurs", callback_data="admin_users")],
         [InlineKeyboardButton("🏷 Forfait utilisateur", callback_data="admin_setstatut")],
         [InlineKeyboardButton("🔁 Redémarrer le bot", callback_data="admin_hard_reboot")],
-        [InlineKeyboardButton("🧱 Produits Pro's", callback_data="admin_products")],
+        # Nouveaux boutons pour chaque catégorie
+        [InlineKeyboardButton("💳 Produits Cc's", callback_data="admin_cat_menu:ccs")],
+        [InlineKeyboardButton("🧱 Produits Pro's", callback_data="admin_cat_menu:propro")],
         [InlineKeyboardButton("⏱️ Réglages Temps IVR", callback_data="admin_ivr_settings")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")],
     ]
+    # --- FIN MODIFICATION ---
 
     try:
+        # S'assure d'éditer le message existant si possible
         await q.message.edit_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception:
         # Si l’edit échoue (message trop ancien), on envoie un nouveau
         await q.message.reply_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
-
-# AJOUTE CES 3 FONCTIONS (après admin_menu, ligne 1800)
 
 async def admin_ivr_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le menu de réglage des temps IVR."""
@@ -3323,6 +3655,16 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "menu_accueil":
         return await goto_menu(update, context)
 
+    # --- DÉBUT MODIFICATION ---
+    if data == "ccs_menu":
+        context.user_data["prod_tier"] = None
+        return await show_products_ccs(update, context, page=0, tier=None)
+
+    if data.startswith("ccs:page:"):
+        page = int(data.split(":")[2])
+        tier = context.user_data.get("prod_tier")
+        return await show_products_ccs(update, context, page=page, tier=tier)
+
     if data == "propro":
         context.user_data["prod_tier"] = None
         return await show_products(update, context, page=0, tier=None)
@@ -3331,20 +3673,10 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page = int(data.split(":")[2])
         tier = context.user_data.get("prod_tier")
         return await show_products(update, context, page=page, tier=tier)
+    # --- FIN MODIFICATION ---
 
     if data == "noop":
         return
-
-    try:
-        print(f"[DBG] Unhandled callback_data: {data}", flush=True)
-    except Exception:
-        pass
-    try:
-        await q.answer("Action non gérée (voir logs)", show_alert=False)
-    except Exception:
-        pass
-
-# REMPLACE l'ancienne fonction hist_view_callback (ligne 1801) par CELLE-CI :
 
 async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -3586,6 +3918,28 @@ admin_ivr_conv = ConversationHandler(
 app_telegram.add_handler(admin_ivr_conv, group=7) # Nouveau groupe
 
 
+
+
+
+# ... autres handlers admin ...
+app_telegram.add_handler(CallbackQueryHandler(admin_prod_list,          pattern="^admin_prod_list$"))
+
+# CETTE LIGNE A ÉTÉ SUPPRIMÉE (c'est bien)
+# app_telegram.add_handler(CallbackQueryHandler(admin_products,           pattern="^admin_products$")) 
+
+app_telegram.add_handler(CallbackQueryHandler(admin_menu,               pattern="^admin_menu$"))
+
+# --- AJOUTEZ CETTE LIGNE ICI ---
+app_telegram.add_handler(CallbackQueryHandler(admin_category_menu,    pattern="^admin_cat_menu:.*$"))
+# --- FIN DE L'AJOUT ---
+
+app_telegram.add_handler(CallbackQueryHandler(admin_users,              pattern="^admin_users$"))
+app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user,        pattern="^admin_adjust_.*$"))
+# ... reste des handlers admin ...
+
+
+
+
 # === Navigation / Historique ===
 app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
 app_telegram.add_handler(CallbackQueryHandler(on_category,  pattern=r"^cat:.+$"))
@@ -3662,6 +4016,34 @@ catalog_filter_conv = ConversationHandler(
     name="catalog_filter_conversation"
 )
 app_telegram.add_handler(catalog_filter_conv, group=10) # Doit être dans un groupe
+
+
+# === Filtres catalogue (CLONE POUR CCS) ===
+ccs_catalog_filter_conv = ConversationHandler(
+    entry_points=[
+        CallbackQueryHandler(filter_start_ccs, pattern="^ccs_filter_open$"),
+    ],
+    states={
+        CCS_FILTER_MAIN: [
+            CallbackQueryHandler(filter_select_type_ccs, pattern="^ccs_filter:(name|city|base|price|year)$"),
+            CallbackQueryHandler(filter_search_ccs, pattern="^ccs_filter_search$"),
+            CallbackQueryHandler(filter_reset_ccs, pattern="^ccs_filter_reset$"),
+            CallbackQueryHandler(filter_page_nav_ccs, pattern="^ccs_filter:page:\d+$"),
+        ],
+        CCS_FILTER_AWAIT_VALUE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value_ccs),
+        ],
+    },
+    fallbacks=[
+        CallbackQueryHandler(filter_cancel_ccs, pattern="^ccs_filter_cancel$"),
+        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
+        CommandHandler("start", goto_menu)
+    ],
+    allow_reentry=True,
+    persistent=False,
+    name="ccs_catalog_filter_conversation"
+)
+app_telegram.add_handler(ccs_catalog_filter_conv, group=11) # Nouveau groupe (11)
 # === Produits ===
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_preview_callback, pattern=r"^prod:preview:\d+$"),group=-1)
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback,     pattern=r"^buy:\d+$"),group=-1)
@@ -3688,7 +4070,6 @@ app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm,   pattern=
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_del,           pattern="^admin_prod_del$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start,     pattern="^admin_prod_add$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_list,          pattern="^admin_prod_list$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_products,           pattern="^admin_products$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_menu,               pattern="^admin_menu$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_users,              pattern="^admin_users$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user,        pattern="^admin_adjust_.*$"))
