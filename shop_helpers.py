@@ -253,6 +253,11 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
     sin    = parsed.get("sin") or p.get("sin") or ""
     dl     = parsed.get("dl") or p.get("dl") or ""
     password = parsed.get("password") or p.get("password") or ""
+    cc     = parsed.get("cc") or p.get("cc") or ""
+    exp    = parsed.get("exp") or p.get("exp") or ""
+    cvc    = parsed.get("cvc") or p.get("cvc") or ""
+
+    
 
     # Validation du prix
     if not price:
@@ -286,6 +291,9 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
         "sin": sin.strip(),
         "dl": dl.strip(),
         "password": password.strip(),
+        "cc": cc.strip(),
+        "exp": exp.strip(),
+        "cvc": cvc.strip(),
     }
 # =========================
 # Rendu produits
@@ -309,6 +317,7 @@ def full_product_text(p: Dict[str, Any]) -> str:
     f["sin"] = f.get("sin") or p.get("sin", "")
     f["dl"] = f.get("dl") or p.get("dl", "")
     f["password"] = f.get("password") or p.get("password", "")
+    
 
     lines = [
         f"FIRST NAME: {f['first'] or f['first_up']}",
@@ -321,6 +330,13 @@ def full_product_text(p: Dict[str, Any]) -> str:
         lines.append(f"DOB(DD/MM/YYYY): {dob}")
     elif dob:
         lines.append(f"DOB: {dob}")
+    
+    if f.get("cc"):
+        lines.append(f"CC: {f['cc']}")
+    if f.get("exp"):
+        lines.append(f"EXP: {f['exp']}")
+    if f.get("cvc"):
+        lines.append(f"CVC: {f['cvc']}")
 
     # Champs sensibles
     if f.get("sin"):
@@ -813,6 +829,10 @@ async def cmd_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_panier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await cart_view_callback(update, context)
+
+
+
+
 
 
 
