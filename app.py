@@ -683,7 +683,12 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         
         # Si on vient du filtre, on modifie le menu de filtre existant
         if from_filter:
-            await query.message.edit_text(text_to_send, reply_markup=query.message.reply_markup)
+            m = await context.bot.send_message(
+              chat_id=chat_id,
+              text=text_to_send,
+              reply_markup=kb # kb a été défini juste au-dessus
+    )
+            context.user_data['filter_msgs'] = [m.message_id]
             return
 
         # Sinon, on affiche le menu de pagination normal
@@ -841,6 +846,11 @@ def _filter_products(products: list, key: str, value: str) -> list:
             # Cherche dans le prénom ou le nom
             if value_lower in f.get('first', '').lower() or value_lower in f.get('last', '').lower():
                 filtered.append(p)
+
+        elif key == 'bins':
+        # Utilise 'value' (pas value_lower) car ce sont des chiffres
+            if f.get('cc', '').startswith(value): 
+                filtered.append(p)
         
         elif key == 'city':
             if value_lower in f.get('city', '').lower():
@@ -889,8 +899,8 @@ def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = Non
         ],
         [InlineKeyboardButton(get_label("year", "Year"),  callback_data="filter:year")],
         [
-            InlineKeyboardButton("❌ Reset", callback_data="filter_reset"),
-            InlineKeyboardButton("SEARCH 🔎", callback_data="filter_search")
+            InlineKeyboardButton("🔄 Reset", callback_data="filter_reset"),
+            InlineKeyboardButton("🔎 Search ", callback_data="filter_search")
         ]
     ]
     
@@ -1079,9 +1089,19 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     if query:
         chat_id = query.message.chat_id
         try:
-            await query.answer()
+             await query.answer()
         except Exception:
             pass
+
+    # --- AJOUTEZ CE BLOC ---
+        try:
+        # Supprime le message sur lequel on a cliqué (le menu principal)
+             if not from_filter:
+                   await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
+        except Exception:
+            pass
+    # --- FIN DE L'AJOUT ---
+
     else:
         chat_id = update.effective_chat.id
 
@@ -1153,50 +1173,30 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
         CCS_CATALOG_MSGS[chat_id] = sent_ids
         return
 
-    # Formatter une fiche produit (utilise la même fonction que Pro's)
     def fmt_product(p):
-        raw = (p.get("content") or "").strip()
-        import re
-        def grab(keys):
-            for key in keys:
-                m = re.search(rf"^{re.escape(key)}\s*:\s*(.+)$",
-                              raw, flags=re.IGNORECASE | re.MULTILINE)
-                if m:
-                    return m.group(1).strip()
-            return ""
-        if not raw:
-            t = (p.get("title") or "").strip()
-            parts = [x.strip() for x in t.split("•")]
-            name  = parts[0] if parts else "John Doe"
-            first = name.split()[0].upper() if name else "JOHN"
-            year     = parts[1] if len(parts) > 1 else ""
-            city     = parts[2] if len(parts) > 2 else ""
-            dob_full = ""
-            base = p.get("tier") or "FAKEPERSON"
-        else:
-            first    = (grab(["FIRST NAME"]) or "JOHN").split()[0].upper()
-            dob_full = grab(["DOB(DD/MM/YYYY)", "DOB"]) or ""
-            m = re.search(r'(19|20)\d{2}', dob_full or "")
-            year = m.group(0) if m else ""
-            if not year: year = (p.get("year") or "").strip()
-            if not year:
-                t = (p.get("title") or "")
-                m2 = re.search(r'(19|20)\d{2}', t)
-                year = m2.group(0) if m2 else ""
-            city = grab(["CITY"]) or (p.get("city") or "")
-            base = p.get("tier") or grab(["BASE"]) or "FAKEPERSON"
-        try:
-            price = float(p.get("price", 10.0) or 10.0)
-        except Exception:
-            price = 10.0
-        curr  = p.get("currency") or "CAD"
-        return "\n".join([
-            f"FIRST NAME: {first}", # Vous pouvez changer ceci pour ex: "BIN: 123456"
-            f"DOB: {year or dob_full or 'N/A'}", # ou "EXP: 12/25"
-            f"CITY: {city or '—'}", # ou "BANK: RBC"
-            f"BASE: {base}",
-            f"PRICE: {price:.2f} {curr}",
-        ])
+        # Utilise le parseur complet de shop_helpers pour tout récupérer
+        f = shop_helpers._parse_product_fields(p)
+
+        # Crée les lignes
+        lines = []
+
+        # --- MODIFICATION ICI ---
+        # Champs CC (le user veut "BINS" au lieu de "CC")
+        if f.get("cc"):
+            # Affiche seulement les 6 premiers chiffres (le BIN)
+            lines.append(f"BINS: {f['cc'][:6]}") # <-- Affiche "BINS: 123456"
+        if f.get("exp"):
+            lines.append(f"EXP: {f['exp']}")
+        # --- FIN MODIFICATION ---
+
+        # Champs Pro's (on garde les mêmes)
+        lines.append(f"FIRST NAME: {f.get('first_up', 'N/A')}")
+        lines.append(f"DOB: {f.get('year') or f.get('dob', 'N/A')}")
+        lines.append(f"CITY: {f.get('city') or '—'}")
+        lines.append(f"BASE: {f.get('base', 'N/A')}")
+        lines.append(f"PRICE: {f.get('price', 0.0):.2f} {f.get('currency', 'CAD')}")
+
+        return "\n".join(lines)
     
     for idx, p in enumerate(chunk, start=1):
         txt = fmt_product(p)
@@ -1239,27 +1239,32 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
 def _build_filter_menu_ccs(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
     """Construit le menu de filtre dynamique pour CCS."""
     filters = context.user_data.get('ccs_pending_filters', {}) # ccs_
-    
+
     def get_label(key, default):
         val = filters.get(key)
         return f"✅ {default}: {val}" if val else default
 
+    # --- MODIFICATION ICI ---
     kb = [
         [
-            InlineKeyboardButton(get_label("name", "Name"),  callback_data="ccs_filter:name"),
-            InlineKeyboardButton(get_label("city", "City"),  callback_data="ccs_filter:city")
+            InlineKeyboardButton(get_label("bins", "Bins"),  callback_data="ccs_filter:bins"), # <-- LIGNE AJOUTÉE
+            InlineKeyboardButton(get_label("name", "Name"),  callback_data="ccs_filter:name")
         ],
+        [
+            InlineKeyboardButton(get_label("city", "City"),  callback_data="ccs_filter:city") # <-- LIGNE DÉPLACÉE
+        ],
+    # --- FIN MODIFICATION ---
         [
             InlineKeyboardButton(get_label("base", "Base"),  callback_data="ccs_filter:base"),
             InlineKeyboardButton(get_label("price", "Price"), callback_data="ccs_filter:price")
         ],
         [InlineKeyboardButton(get_label("year", "Year"),  callback_data="ccs_filter:year")],
         [
-            InlineKeyboardButton("❌ Reset", callback_data="ccs_filter_reset"),
-            InlineKeyboardButton("SEARCH 🔎", callback_data="ccs_filter_search")
+            InlineKeyboardButton("🔄️ Reset", callback_data="ccs_filter_reset"),
+            InlineKeyboardButton("🔎 Search", callback_data="ccs_filter_search")
         ]
     ]
-    
+
     if page_info:
         page = page_info.get('page', 0)
         total_pages = page_info.get('total_pages', 1)
@@ -1270,7 +1275,7 @@ def _build_filter_menu_ccs(context: ContextTypes.DEFAULT_TYPE, page_info: dict =
                 InlineKeyboardButton("»", callback_data=f"ccs_filter:page:{min(total_pages-1, page+1)}"),
             ]
             kb.append(nav_row)
-            
+
     kb.append([InlineKeyboardButton("⬅️ Annuler (Retour Catalogue)", callback_data="ccs_filter_cancel")])
     return InlineKeyboardMarkup(kb)
 
@@ -1312,6 +1317,7 @@ async def filter_select_type_ccs(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data['ccs_current_filter_key'] = field
     
     prompts = {
+        'bins':  "Type a BIN (ex: 450611):",
         'name':  "Type a name fragment (ex: John):",
         'city':  "Type a city fragment (ex: Toronto):",
         'base':  "Type a base fragment (ex: Montreal Pack / FAKEPERSON):",
@@ -2060,6 +2066,27 @@ async def history_filter_reset(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # FIN DU BLOC À AJOUTER
 
+async def admin_category_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu de gestion pour une catégorie spécifique."""
+    if str(update.effective_user.id) != ADMIN_ID:
+        await update.callback_query.answer("Accès refusé / Access denied.")
+        return
+
+    # Récupère la catégorie cliquée (ccs ou propro)
+    category = update.callback_query.data.split(":")[-1]
+    # Mémorise la catégorie pour les actions suivantes (TRÈS IMPORTANT)
+    context.user_data['admin_product_category'] = category 
+
+    # Construit le menu de gestion standard (avec les callbacks SIMPLES)
+    kb = [
+        [InlineKeyboardButton("➕ Ajouter (manuel)", callback_data="admin_prod_add")],
+        [InlineKeyboardButton("📥 Import CSV",       callback_data="admin_prod_csv")],
+        [InlineKeyboardButton("🗑 Supprimer",        callback_data="admin_prod_del")],
+        [InlineKeyboardButton("📦 Lister (10)",      callback_data="admin_prod_list")],
+        [InlineKeyboardButton("🔙 Retour Menu Admin", callback_data="admin_menu")], 
+    ]
+    # Affiche le menu en mentionnant la catégorie
+    await update.callback_query.message.edit_text(f"🧱 Gestion des produits [{category.upper()}] :", reply_markup=InlineKeyboardMarkup(kb))
    
 
 
@@ -2500,6 +2527,7 @@ def _parse_price(s):
     except Exception:
         return 0.0
 
+#
 # --- Parse manuellement le bloc (dictionnaire déjà extrait) ----
 def _parse_manual_block(text: str):
     import re
@@ -2517,7 +2545,12 @@ def _parse_manual_block(text: str):
                 return pairs[k]
         return default
 
-    # AJOUTEZ CES 3 LIGNES :
+    # --- MODIFICATION : Ajout des champs CC ---
+    cc = pick('CC')
+    exp = pick('EXP')
+    cvc = pick('CVC')
+    # --- FIN MODIFICATION ---
+
     sin      = pick('SIN')
     dl       = pick('DL')
     password = pick('PASSWORD')
@@ -2555,7 +2588,12 @@ def _parse_manual_block(text: str):
     title = f"{name} • {year} • {city.upper()}".strip()
 
     content_lines = [
-        # AJOUTEZ CES 3 LIGNES ICI :
+        # --- MODIFICATION : Ajout des champs CC ---
+        f"CC: {cc}",
+        f"EXP: {exp}",
+        f"CVC: {cvc}",
+        # --- FIN MODIFICATION ---
+        
         f"SIN: {sin}",
         f"DL: {dl}",
         f"PASSWORD: {password}",
@@ -2572,7 +2610,8 @@ def _parse_manual_block(text: str):
         f"BASE: {base}",
         f"PRICE: {price:.2f} {currency}",
     ]
-    content = "\n".join(content_lines)
+    # Filtre les lignes vides (ex: si CVC n'est pas fourni)
+    content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip())
 
     return {
         'title': title,
@@ -2596,13 +2635,14 @@ async def admin_prod_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
     db = _get_db_from_context(context)
+    category = context.user_data.get('admin_product_category', 'propro') # Récupère la catégorie
     if not db:
         await update.callback_query.message.reply_text("DB indisponible.")
         return
 
     c = db.cursor()
     rows = c.execute(
-        "SELECT id, title, price, stock FROM products ORDER BY id DESC LIMIT 10"
+        "SELECT id, title, price, stock FROM products WHERE category=? ORDER BY id DESC LIMIT 10", (category,)
     ).fetchall()
     if not rows:
         await update.callback_query.message.reply_text("Aucun produit.")
@@ -2620,29 +2660,56 @@ async def admin_prod_add_start(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await update.callback_query.answer()
 
-    # Indique qu’on attend le texte du produit
-    context.user_data["awaiting_admin_product_text"] = True
+    # --- MODIFICATION : Affiche le prompt selon la catégorie ---
+    category = context.user_data.get('admin_product_category', 'propro') # Récupère la catégorie
+    context.user_data["awaiting_admin_product_text"] = True # Indique qu'on attend du texte
 
-    # Message d'instructions avec tous les champs importants
-    await update.callback_query.message.reply_text(
-        "📦 *Ajout de produit*\n"
-        "Veuillez coller les infos dans ce format exact :\n\n"
-        "SIN: 123456789\n"
-        "DL: A123456789012\n"
-        "FIRST NAME: John\n"
-        "LAST NAME: Doe\n"
-        "DOB(DD/MM/YYYY): 01/01/1990\n"
-        "ADRESSE: 123 Rue Exemple\n"
-        "CITY: Montréal\n"
-        "CODE POSTAL: H1A 2B3\n"
-        "EMAIL: john@example.com\n"
-        "PASSWORD: swhsbhwbhww\n"
-        "PHONE NUMBER: 5141234567\n"
-        "BASE: Client régulier\n"
-        "PRICE: 50.00\n\n"
-        "_Chaque ajout crée 1 produit (stock = 1)._",
-        parse_mode="Markdown"
-    )
+    if category == 'ccs':
+        # --- NOUVEAU PROMPT POUR CCS ---
+        await update.callback_query.message.reply_text(
+            "📦 *Ajout de produit (CC's)*\n"
+            "Veuillez coller les infos dans ce format exact :\n\n"
+            "CC: 1234567812345678\n"
+            "EXP: 12/2027\n"
+            "CVC: 123\n"
+            "SIN: 123456789\n"
+            "DL: A123456789012\n"
+            "FIRST NAME: John\n"
+            "LAST NAME: Doe\n"
+            "DOB(DD/MM/YYYY): 01/01/1990\n"
+            "ADRESSE: 123 Rue Exemple\n"
+            "CITY: Montréal\n"
+            "CODE POSTAL: H1A 2B3\n"
+            "EMAIL: john@example.com\n"
+            "PASSWORD: swhsbhwbhww\n"
+            "PHONE NUMBER: 5141234567\n"
+            "BASE: TEST\n"
+            "PRICE: 50.00\n\n"
+            "_Chaque ajout crée 1 produit (stock = 1)._",
+            parse_mode="Markdown"
+        )
+    else: # 'propro' or default
+        # --- ANCIEN PROMPT POUR PRO'S ---
+        await update.callback_query.message.reply_text(
+            "📦 *Ajout de produit (Pro's)*\n" 
+            "Veuillez coller les infos dans ce format exact :\n\n"
+            "SIN: 123456789\n"
+            "DL: A123456789012\n"
+            "FIRST NAME: John\n"
+            "LAST NAME: Doe\n"
+            "DOB(DD/MM/YYYY): 01/01/1990\n"
+            "ADRESSE: 123 Rue Exemple\n"
+            "CITY: Montréal\n"
+            "CODE POSTAL: H1A 2B3\n"
+            "EMAIL: john@example.com\n"
+            "PASSWORD: swhsbhwbhww\n"
+            "PHONE NUMBER: 5141234567\n"
+            "BASE: Client régulier\n"
+            "PRICE: 50.00\n\n"
+            "_Chaque ajout crée 1 produit (stock = 1)._",
+            parse_mode="Markdown"
+        )
+    # --- FIN MODIFICATION ---
 
     return ADMIN_WAIT_PRODUCT_TEXT
 
@@ -2665,6 +2732,7 @@ async def admin_prod_add_receive(update: Update, context: ContextTypes.DEFAULT_T
     c = db.cursor()
     data = _parse_manual_block(update.message.text)
     cols = _guess_columns(c)
+    category = context.user_data.get('admin_product_category', 'propro') # Récupère la catégorie
 
     fields = []; values = []
     if 'title'    in cols: fields.append('title');    values.append(data['title'])
@@ -2674,7 +2742,7 @@ async def admin_prod_add_receive(update: Update, context: ContextTypes.DEFAULT_T
     if 'city'     in cols: fields.append('city');     values.append(data['city'])
     if 'year'     in cols: fields.append('year');     values.append(data['year'])
     if 'stock'    in cols: fields.append('stock');    values.append(data['stock'])
-    if 'category' in cols: fields.append('category'); values.append('propro')
+    if 'category' in cols: fields.append('category'); values.append(category)
     if 'currency' in cols: fields.append('currency'); values.append('CAD')
     if 'is_active' in cols: fields.append('is_active'); values.append(1)
 
@@ -2702,10 +2770,6 @@ async def admin_prod_csv_start(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return ADMIN_WAIT_CSV
 
-
-# REMPLACE l'ancienne fonction admin_prod_csv_receive (vers ligne 1460) par celle-ci:
-
-# REMPLACE la fonction admin_prod_csv_receive (de ligne 1473 à 1599) par CELLE-CI :
 
 async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_str = str(update.effective_user.id) # Pour les logs
@@ -2783,13 +2847,15 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
              return ConversationHandler.END
 
         cols = _guess_columns(c)
+        category = context.user_data.get('admin_product_category', 'propro') # Récupère la catégorie
         
         print(f"[CSV Import - User {user_id_str}] Début de l'itération des lignes...") # DEBUG LOG 5
         line_num = 1 # Pour le logging d'erreur
         for row in rdr:
             line_num += 1
             try:
-                # CORRECTION : On ne cherche que les en-têtes en minuscules maintenant
+                # --- MODIFICATION CLÉ ---
+                # Lit TOUTES les valeurs en premier
                 password = (row.get('password') or '').strip()
                 sin      = (row.get('sin') or '').strip()
                 dl       = (row.get('dl') or '').strip()
@@ -2799,10 +2865,16 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                 address  = (row.get('address') or '').strip()
                 city     = (row.get('city') or '').strip()
                 postal   = (row.get('postal') or '').strip()
-                base     = (row.get('base') or 'FAKEPERSON').strip() # 'base' (minuscule) lira 'Base'
+                base     = (row.get('base') or 'FAKEPERSON').strip()
                 email    = (row.get('email') or '').strip()
                 phone    = (row.get('phone') or '').strip()
                 price    = _parse_price(row.get('price') or '0')
+
+                # Lit les champs CC (ils seront vides si l'en-tête n'existe pas)
+                cc       = (row.get('cc') or '').strip()
+                exp      = (row.get('exp') or '').strip()
+                cvc      = (row.get('cvc') or '').strip()
+                # --- FIN DE LA MODIFICATION ---
 
                 # Vérification minimale que des données essentielles existent
                 if not first or not last or not dob:
@@ -2819,22 +2891,44 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                 if m: year = m.group(1)
 
                 title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
-                content_lines = [
-                    # Ordre logique pour la fiche
-                    f"FIRST NAME: {first}",
-                    f"LAST NAME: {last}",
-                    f"DOB(DD/MM/YYYY): {dob}", # Garde le format original
+                
+                # Maintenant, la logique 'if category == ccs' fonctionnera
+                if category == 'ccs':
+                  content_lines = [
+                    f"CC: {cc}",     # <--- Ne plantera plus
+                    f"EXP: {exp}",   # <--- Ne plantera plus
+                    f"CVC: {cvc}",   # <--- Ne plantera plus
                     f"SIN: {sin}",
                     f"DL: {dl}",
-                    f"PASSWORD: {password}",
+                    f"FIRST NAME: {first}",
+                    f"LAST NAME: {last}",
+                    f"DOB(DD/MM/YYYY): {dob}", 
                     f"ADRESSE: {address}",
                     f"CITY: {city}",
                     f"CODE POSTAL: {postal}",
                     f"EMAIL: {email}",
-                    f"PHONE NUMBER: {phone}", # Mis PHONE NUMBER pour correspondre à l'ajout manuel
+                    f"PHONE NUMBER: {phone}",
+                    f"PASSWORD: {password}",
                     f"BASE: {base}",
                     f"PRICE: {price:.2f} CAD",
                 ]
+                else: # 'propro' ou default
+                  content_lines = [
+                    f"SIN: {sin}",
+                    f"DL: {dl}",
+                    f"FIRST NAME: {first}",
+                    f"LAST NAME: {last}",
+                    f"DOB(DD/MM/YYYY): {dob}", 
+                    f"ADRESSE: {address}",
+                    f"CITY: {city}",
+                    f"CODE POSTAL: {postal}",
+                    f"EMAIL: {email}",
+                    f"PHONE NUMBER: {phone}",
+                    f"PASSWORD: {password}",
+                    f"BASE: {base}",
+                    f"PRICE: {price:.2f} CAD",
+                ]
+                
                 # Ne garde que les lignes qui ont une valeur APRÈS le ":"
                 content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip()) 
 
@@ -2847,7 +2941,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                 if 'city'     in cols: fields.append('city');     values.append(city)
                 if 'year'     in cols: fields.append('year');     values.append(year)
                 if 'stock'    in cols: fields.append('stock');    values.append(stock)
-                if 'category' in cols: fields.append('category'); values.append('propro')
+                if 'category' in cols: fields.append('category'); values.append(category)
                 if 'currency' in cols: fields.append('currency'); values.append('CAD')
                 if 'is_active' in cols: fields.append('is_active'); values.append(1)
 
@@ -2893,13 +2987,14 @@ async def admin_prod_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
     db = _get_db_from_context(context)
+    category = context.user_data.get('admin_product_category', 'propro') # Récupère la catégorie
     if not db:
         await update.callback_query.message.reply_text("DB indisponible.")
         return
 
     c = db.cursor()
     rows = c.execute(
-        "SELECT id, title FROM products ORDER BY id DESC LIMIT 10"
+        "SELECT id, title FROM products WHERE category=? ORDER BY id DESC LIMIT 10", (category,)
     ).fetchall()
     if not rows:
         await update.callback_query.message.reply_text("Aucun produit à supprimer.")
@@ -3656,7 +3751,7 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await goto_menu(update, context)
 
     # --- DÉBUT MODIFICATION ---
-    if data == "ccs_menu":
+    if data == "ccs":
         context.user_data["prod_tier"] = None
         return await show_products_ccs(update, context, page=0, tier=None)
 
@@ -4025,7 +4120,7 @@ ccs_catalog_filter_conv = ConversationHandler(
     ],
     states={
         CCS_FILTER_MAIN: [
-            CallbackQueryHandler(filter_select_type_ccs, pattern="^ccs_filter:(name|city|base|price|year)$"),
+            CallbackQueryHandler(filter_select_type_ccs, pattern="^ccs_filter:(bins|name|city|base|price|year)$"),
             CallbackQueryHandler(filter_search_ccs, pattern="^ccs_filter_search$"),
             CallbackQueryHandler(filter_reset_ccs, pattern="^ccs_filter_reset$"),
             CallbackQueryHandler(filter_page_nav_ccs, pattern="^ccs_filter:page:\d+$"),
