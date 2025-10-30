@@ -2857,6 +2857,9 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                 # --- MODIFICATION CLÉ ---
                 # Lit TOUTES les valeurs en premier
                 password = (row.get('password') or '').strip()
+                cc       = (row.get('cc') or '').strip()
+                exp      = (row.get('exp') or '').strip()
+                cvc      = (row.get('cvc') or '').strip()
                 sin      = (row.get('sin') or '').strip()
                 dl       = (row.get('dl') or '').strip()
                 first    = (row.get('first') or '').strip()
@@ -2870,12 +2873,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                 phone    = (row.get('phone') or '').strip()
                 price    = _parse_price(row.get('price') or '0')
 
-                # Lit les champs CC (ils seront vides si l'en-tête n'existe pas)
-                cc       = (row.get('cc') or '').strip()
-                exp      = (row.get('exp') or '').strip()
-                cvc      = (row.get('cvc') or '').strip()
-                # --- FIN DE LA MODIFICATION ---
-
+     
                 # Vérification minimale que des données essentielles existent
                 if not first or not last or not dob:
                     print(f"[CSV Import - User {user_id_str}] Ligne {line_num} ignorée: first, last ou dob manquant.")
