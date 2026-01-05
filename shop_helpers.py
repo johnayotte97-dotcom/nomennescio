@@ -237,11 +237,14 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
         if ":" not in line:
             continue
         key, val = line.split(":", 1)
-        key = key.strip().lower()
+        # --- MODIFICATION : Met la clé en minuscule ICI ---
+        key = key.strip().lower() 
         val = val.strip()
         parsed[key] = val
+    # --- FIN MODIFICATION ---
 
     # Récupération intelligente des champs
+    # Le parseur cherche maintenant 'first name' (minuscule)
     first  = p.get("firstname") or p.get("first_name") or parsed.get("first name") or parsed.get("firstname") or ""
     last   = p.get("lastname")  or p.get("last_name")  or parsed.get("last name") or parsed.get("lastname") or ""
     dob    = parsed.get("dob(dd/mm/yyyy)") or parsed.get("dob") or ""
@@ -250,19 +253,22 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
     postal = parsed.get("code postal") or parsed.get("postal code") or parsed.get("postal") or ""
     email  = parsed.get("email") or ""
     phone  = parsed.get("phone number") or parsed.get("phone") or ""
+
+    # --- MODIFICATION : Le parseur cherche 'sin', 'dl', 'cc', etc. (minuscules) ---
     sin    = parsed.get("sin") or p.get("sin") or ""
     dl     = parsed.get("dl") or p.get("dl") or ""
     password = parsed.get("password") or p.get("password") or ""
     cc     = parsed.get("cc") or p.get("cc") or ""
     exp    = parsed.get("exp") or p.get("exp") or ""
     cvc    = parsed.get("cvc") or p.get("cvc") or ""
+    # --- FIN MODIFICATION ---
 
-    
 
     # Validation du prix
     if not price:
         try:
-            price = float(parsed.get("price", "0").replace(",", "."))
+            # 'price' est aussi lu en minuscule
+            price = float(parsed.get("price", "0").replace(",", ".")) 
         except Exception:
             price = 0.0
 
@@ -270,7 +276,7 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
     dob_final = dob or year_from_title or "N/A"
     first_up  = (first or "").split()[0].upper() or "JOHN"
 
-    
+
 
     return {
         "first": first.strip(),
@@ -829,14 +835,6 @@ async def cmd_historique(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_panier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await cart_view_callback(update, context)
-
-
-
-
-
-
-
-
 
 
 
