@@ -151,7 +151,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 DESTINATION_NUMBER = os.environ.get("DESTINATION_NUMBER", "+18003617620")
 SIGNALWIRE_NUMBER = os.environ.get("SIGNALWIRE_NUMBER", "+12029928463")
 SERVER_URL = os.environ.get("SERVER_URL", "http://37.228.129.82:5001")
-ADMIN_ID = os.environ.get("ADMIN_ID", "7573645008" )
+ADMIN_IDS = ["7573645008", "8409831904"]
 
 DB_NAME = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
 
