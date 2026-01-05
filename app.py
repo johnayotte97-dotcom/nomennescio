@@ -519,7 +519,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📞 Support", callback_data="support")],
         [InlineKeyboardButton("📚 FAQ", callback_data="faq")],
     ]
-    if str(user_id) == ADMIN_ID:
+    if str(user_id) in ADMIN_IDS:
         menu.append([InlineKeyboardButton("⚙️ Admin", callback_data="admin_menu")])
     return InlineKeyboardMarkup(menu)
 
@@ -2099,7 +2099,7 @@ async def history_filter_reset(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def admin_category_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le menu de gestion pour une catégorie spécifique."""
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
 
@@ -2660,7 +2660,7 @@ def _parse_manual_block(text: str):
 
 async def admin_prod_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -2686,7 +2686,7 @@ async def admin_prod_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- keep this function as-is, just ADD the line that sets the flag (new) ---
 async def admin_prod_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Vérifie que seul l'admin peut utiliser cette commande
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -2748,7 +2748,7 @@ async def admin_prod_add_start(update: Update, context: ContextTypes.DEFAULT_TYP
 # --- modify admin_prod_add_receive with guards ---
 async def admin_prod_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard 1: only admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         return
     # Guard 2: only if we actually asked for a product text
     if not context.user_data.get("awaiting_admin_product_text"):
@@ -2789,7 +2789,7 @@ async def admin_prod_add_receive(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_prod_csv_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -3012,7 +3012,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
 
 async def admin_prod_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -3043,7 +3043,7 @@ async def admin_prod_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_prod_del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -3066,7 +3066,7 @@ async def admin_prod_del_confirm(update: Update, context: ContextTypes.DEFAULT_T
 # REMPLACE la fonction admin_users (ligne 1618) par CELLE-CI :
 
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     q = update.callback_query
@@ -3123,7 +3123,7 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     
@@ -3159,7 +3159,7 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_adjust_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -3186,7 +3186,7 @@ async def admin_adjust_value(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -3204,7 +3204,7 @@ async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT
 # --- admin_customamount_receive (message handler, pas de callback -> pas de q.answer) ---
 async def admin_customamount_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard 1: only admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         return
     # Guard 2: only when a target user has been set
     telegram_id = context.user_data.get("target_user")
@@ -3236,7 +3236,7 @@ async def admin_customamount_receive(update: Update, context: ContextTypes.DEFAU
 # REMPLACE la fonction admin_setstatut (ligne 1709) par CELLE-CI :
 
 async def admin_setstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     q = update.callback_query
@@ -3286,7 +3286,7 @@ async def admin_setstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_userstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     
@@ -3313,7 +3313,7 @@ async def admin_userstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_setstatut_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -3329,7 +3329,7 @@ async def admin_setstatut_final(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admin_hard_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
     await update.callback_query.answer()
@@ -3343,7 +3343,7 @@ async def admin_hard_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Vérification Admin
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         await update.callback_query.answer("Accès refusé / Access denied.")
         return
 
@@ -3375,7 +3375,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_ivr_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le menu de réglage des temps IVR."""
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         return
     q = update.callback_query
     await q.answer()
@@ -3395,7 +3395,7 @@ async def admin_ivr_settings(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def admin_ivr_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Demande la nouvelle valeur pour un temps de pause."""
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         return
     q = update.callback_query
     await q.answer()
@@ -3408,7 +3408,7 @@ async def admin_ivr_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_ivr_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reçoit la nouvelle valeur, la sauvegarde, et ré-affiche le menu."""
-    if str(update.effective_user.id) != ADMIN_ID:
+    if str(update.effective_user.id) not in ADMIN_IDS:
         return
         
     key = context.user_data.pop('ivr_timing_key', None)
