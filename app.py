@@ -705,43 +705,7 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     
     sent_ids = []
 
-    if not chunk:
-        text = "Aucun produit trouvé."
-        kb = _build_filter_menu(context, page_info=None) if from_filter else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
-        m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-        if from_filter: context.user_data['filter_msgs'] = [m.message_id]
-        else: CATALOG_MSGS[chat_id] = [m.message_id]
-        return CATALOG_FILTER_MAIN if from_filter else None
-
-    # Fonction d'affichage SÉCURISÉE (Gère les erreurs de contenu vide)
-    def fmt_simple(p):
-        try:
-            import re
-            c = p.get('content') or "" # Force une chaine vide si None
-            
-            # Recherche sécurisée
-            def safe_search(pattern, text):
-                m = re.search(pattern, text)
-                return m.group(1).strip() if m else "N/A"
-
-            first = safe_search(r'FIRST NAME: (.+)', c)
-            if first == "N/A": first = p.get('title', 'Produit').split('•')[0]
-            
-            dob = safe_search(r'DOB.*: (.+)', c)
-            city = safe_search(r'CITY: (.+)', c)
-            
-            return f"FIRST NAME: {first}\nDOB: {dob}\nCITY: {city}\nBASE: {p.get('tier')}\nPRICE: {p.get('price'):.2f} CAD"
-        except Exception:
-            return f"Produit #{p.get('id')} (Erreur affichage)\nPRICE: {p.get('price')} CAD"
-
-    for p in chunk:
-        txt = fmt_simple(p)
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"),
-            InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}")
-        ]])
-        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
-        sent_ids.append(m.message_id)
+    
 
     # Navigation
     if from_filter:
@@ -762,31 +726,6 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         m = await context.bot.send_message(chat_id=chat_id, text=f"Catalogue ({total_items} produits)", reply_markup=kb)
         sent_ids.append(m.message_id)
         CATALOG_MSGS[chat_id] = sent_ids
-
-# --- CORRECTION : Nettoyage amélioré ---
-    # Nettoie TOUS les anciens messages du catalogue OU du filtre
-    try:
-        if from_filter:
-            # Si on vient du filtre, nettoie les fiches ET LE MENU DE FILTRE
-            prev_filter_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
-            prev_filter_menu = context.user_data.pop("filter_msgs", []) # <-- LIGNE MODIFIÉE
-            all_to_delete = list(set(prev_filter_fiches + prev_filter_menu)) # <-- LIGNE MODIFIÉE
-            
-            for mid in all_to_delete: # <-- LIGNE MODIFIÉE
-                 try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-                 except: pass
-        else:
-            # Sinon (menu Pro's), nettoie tout (catalogue ET filtre)
-            prev_catalog = CATALOG_MSGS.pop(chat_id, [])
-            prev_filter = context.user_data.pop("filter_msgs", [])
-            prev_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
-            all_to_delete = list(set(prev_catalog + prev_filter + prev_fiches))
-            for mid in all_to_delete:
-                try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-                except: pass
-    except Exception as e:
-        logger.warning(f"Erreur pendant le nettoyage de show_products: {e}")
-    # --- FIN CORRECTION ---
 
 
 # AJOUTEZ CETTE FONCTION (après la fin de show_products, ligne 821)
