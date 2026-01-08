@@ -2878,6 +2878,167 @@ async def admin_prod_csv_start(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     return ADMIN_WAIT_CSV
 
+# ================= IMPORT LOCAL (SSH) =================
+async def admin_local_import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1. Vérification Admin
+    user_id_str = str(update.effective_user.id)
+    if user_id_str not in ADMIN_IDS:
+        return
+
+    # 2. Vérification du fichier sur le serveur
+    file_path = '/home/johnmsaaq/bot-nomen/import.csv'  # Chemin confirmé
+    if not os.path.exists(file_path):
+        # Fallback au cas où
+        file_path = 'import.csv' 
+        if not os.path.exists(file_path):
+            await update.message.reply_text(f"❌ Fichier introuvable. Assurez-vous d'avoir envoyé 'import.csv' via SCP.")
+            return
+
+    await update.message.reply_text(f"📂 Fichier trouvé ! Analyse en cours...")
+
+    # 3. Connexion DB
+    db = _get_db_from_context(context)
+    c = db.cursor()
+    
+    # 4. Lecture du fichier
+    try:
+        # On tente utf-8, sinon latin-1 (pour les accents Québec)
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            with open(file_path, 'r', encoding='latin-1') as f:
+                text = f.read()
+
+        import csv, re
+        from io import StringIO
+        
+        # Détection du délimiteur
+        try:
+            sample = "\n".join(text.splitlines()[:5])
+            dialect = csv.Sniffer().sniff(sample)
+            delimiter = dialect.delimiter
+        except:
+            delimiter = ','
+
+        rdr = csv.DictReader(StringIO(text), delimiter=delimiter)
+        
+        # Nettoyage des en-têtes (minuscules + sans espaces)
+        if rdr.fieldnames:
+            rdr.fieldnames = [h.lower().strip() for h in rdr.fieldnames if h]
+
+        # Paramètres
+        inserted = 0
+        cols = _guess_columns(c)
+        category = context.user_data.get('admin_product_category', 'propro')
+
+        # Colonnes qu'on ne veut pas voir en doublon dans la description
+        known_keys = {
+            'sin', 'sin_nas', 'dob', 'datenais', 'phone', 'telephone', 
+            'address', 'adr', 'unit', 'city', 'muni', 'prov', 'prn_nom', 
+            'first', 'last', 'email', 'dl', 'postal', 'password', 'price', 
+            'base', 'stock', 'cc', 'exp', 'cvc', 'nom', 'prenom', 
+            'langue', 'id'
+        }
+
+        # 5. Boucle ligne par ligne
+        line_num = 1
+        for row in rdr:
+            line_num += 1
+            try:
+                # Nettoyage des données de la ligne
+                r = {k.lower().strip(): v.strip() for k, v in row.items() if k}
+
+                # --- LOGIQUE SPÉCIFIQUE À TON FICHIER ---
+                
+                # A. Nom/Prénom inversé (PRN_NOM: "LAROCHE LAURENCE")
+                full_raw = r.get('prn_nom', '')
+                last, first = "", ""
+                if full_raw:
+                    parts = full_raw.split(maxsplit=1)
+                    if len(parts) >= 1: last = parts[0]   # 1er mot = NOM
+                    if len(parts) == 2: first = parts[1]  # Reste = PRÉNOM
+                
+                # B. Adresse avec unité
+                raw_adr = r.get('adr') or r.get('address') or ""
+                unit = r.get('unit', '')
+                address = f"{unit}-{raw_adr}" if unit else raw_adr
+
+                # C. Ville et Province
+                city = r.get('muni') or r.get('city') or ""
+                prov = r.get('prov') or ""
+                if prov and city: city = f"{city} ({prov})"
+
+                # D. Prix et Base (depuis ton fichier)
+                price = _parse_price(r.get('price') or '0')
+                base = (r.get('base') or 'Import Local').strip()
+
+                # E. Autres champs
+                sin = r.get('sin_nas') or r.get('sin') or ""
+                phone = r.get('telephone') or r.get('phone') or ""
+                dob = r.get('datenais') or r.get('dob') or ""
+                
+                # Nettoyage date (enlève les guillemets '1982-10-05')
+                dob = dob.replace("'", "").replace('"', "")
+                
+                # Extraction année
+                year = ''
+                m = re.search(r'(\d{4})', dob)
+                if m: year = m.group(1)
+
+                # F. Construction du contenu
+                content_lines = [
+                    f"SIN: {sin}",
+                    f"FIRST NAME: {first}",
+                    f"LAST NAME: {last}",
+                    f"DOB: {dob}",
+                    f"ADRESSE: {address}",
+                    f"CITY: {city}",
+                    f"PHONE NUMBER: {phone}",
+                    f"BASE: {base}",
+                    f"PRICE: {price:.2f} CAD"
+                ]
+                
+                # Ajoute l'ID original à la fin
+                orig_id = r.get('id', '')
+                if orig_id: content_lines.append(f"ID: {orig_id}")
+
+                # Ramasse-miettes (ajoute les colonnes inconnues)
+                for k, v in r.items():
+                    if k not in known_keys and v:
+                        content_lines.append(f"{k.upper()}: {v}")
+                
+                content = "\n".join(content_lines)
+
+                # G. Titre
+                title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
+
+                # H. Insertion SQL
+                fields, values = [], []
+                if 'title'    in cols: fields.append('title');    values.append(title)
+                if 'content'  in cols: fields.append('content');  values.append(content)
+                if 'price'    in cols: fields.append('price');    values.append(price)
+                if 'tier'     in cols: fields.append('tier');     values.append(base)
+                if 'city'     in cols: fields.append('city');     values.append(city)
+                if 'year'     in cols: fields.append('year');     values.append(year)
+                if 'stock'    in cols: fields.append('stock');    values.append(1)
+                if 'category' in cols: fields.append('category'); values.append(category)
+                if 'currency' in cols: fields.append('currency'); values.append('CAD')
+                if 'is_active' in cols: fields.append('is_active'); values.append(1)
+
+                q_sql = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
+                c.execute(q_sql, values)
+                inserted += 1
+
+            except Exception as e:
+                print(f"Erreur ligne {line_num}: {e}")
+                continue
+
+        db.commit()
+        await update.message.reply_text(f"✅ Import terminé ! {inserted} produits ajoutés.")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Erreur critique : {e}")
 
 async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_str = str(update.effective_user.id)
@@ -4143,6 +4304,7 @@ app_telegram.bot_data['create_transaction'] = create_transaction
 app_telegram.add_handler(CommandHandler("start", start_cmd))
 app_telegram.add_handler(CommandHandler("historique", shop_helpers.cmd_historique))
 app_telegram.add_handler(CommandHandler("panier",     shop_helpers.cmd_panier))
+app_telegram.add_handler(CommandHandler("local_import", admin_local_import_command))
 
 # === Conversation principale ===
 conv_handler = ConversationHandler(
