@@ -1709,6 +1709,63 @@ async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "New functionalities coming soon (automation, statistics, advanced tools)."
         )
     await replace_view(q, txt, reply_markup=kb_back_to_menu(), parse_mode="Markdown")
+
+# ================= CHANNEL PRIVÉ (FINAL) =================
+async def acces_channel_prive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    
+    # TON ID (Celui qui est correct)
+    ID_DU_CANAL = -1003536878473
+
+    try:
+        # 1. On vérifie si tu es membre
+        is_member = False
+        try:
+            member = await context.bot.get_chat_member(chat_id=ID_DU_CANAL, user_id=q.from_user.id)
+            if member.status in ['member', 'creator', 'administrator', 'restricted']:
+                is_member = True
+        except Exception:
+            pass # Si on arrive pas à vérifier, on assume que non
+
+        # 2. SI TU ES DÉJÀ MEMBRE
+        if is_member:
+            # On construit le lien d'accès direct (t.me/c/...)
+            clean_id = str(ID_DU_CANAL).replace("-100", "")
+            direct_link = f"https://t.me/c/{clean_id}/1"
+            
+            await replace_view(
+                q,
+                "👋 **Tu es déjà membre !**\n\n"
+                "Tu as déjà accès au canal VIP. Clique sur le bouton ci-dessous pour y entrer directement.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🚀 Ouvrir le Canal", url=direct_link)],
+                    [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+                ]),
+                parse_mode="Markdown"
+            )
+            return
+
+        # 3. SI TU N'ES PAS MEMBRE (On génère l'invitation)
+        await q.answer() # Stop le chargement
+        invite_link = await context.bot.create_chat_invite_link(
+            chat_id=ID_DU_CANAL,
+            member_limit=1, 
+            name=f"Invite pour {q.from_user.first_name}"
+        )
+
+        await replace_view(
+            q,
+            f"🕵️ **Accès VIP Autorisé**\n\n"
+            f"Voici ton lien d'accès unique.\n"
+            f"⚠️ Attention : Ce lien ne fonctionne qu'une seule fois.\n\n"
+            f"👉 {invite_link.invite_link}",
+            reply_markup=kb_back_to_menu(),
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Erreur channel: {e}")
+        await q.message.reply_text("🔴 Une erreur est survenue (vérifie que le bot est Admin du canal).")
     
     # ========================== HISTORIQUE (helpers communs) ==========================
 def _table_exists(con, name: str) -> bool:
@@ -4209,7 +4266,7 @@ app_telegram.add_handler(CallbackQueryHandler(set_lang_en,            pattern="^
 app_telegram.add_handler(CallbackQueryHandler(callback_check_balance, pattern="^check_balance$"))
 app_telegram.add_handler(CallbackQueryHandler(callback_support,       pattern="^support$"))
 app_telegram.add_handler(CallbackQueryHandler(callback_faq,           pattern="^faq$"))
-
+app_telegram.add_handler(CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$"))
 # === Admin ===
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm,   pattern="^admin_prod_del_\d+$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_del,           pattern="^admin_prod_del$"))
