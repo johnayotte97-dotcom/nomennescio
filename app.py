@@ -843,173 +843,6 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         logger.warning(f"Erreur pendant le nettoyage de show_products: {e}")
     # --- FIN CORRECTION ---
 
-    # --- NOUVEAU : Applique les filtres s'ils existent ---
-    active_filters = context.user_data.get('active_filters', {})
-    prods_all = _get_products(category="propro", tier=tier)
-    
-    prods = prods_all
-    if active_filters:
-        # Applique chaque filtre sauvegardé l'un après l'autre
-        for f_key, f_val in active_filters.items():
-            prods = _filter_products(prods, f_key, f_val)
-    # --- FIN ---
-
-    # --- pagination ---
-    PER_PAGE = 2
-    total_pages = max(1, (len(prods) + PER_PAGE - 1) // PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
-    start = page * PER_PAGE
-    chunk = prods[start:start + PER_PAGE]
-
-    sent_ids = [] # Liste pour les nouveaux messages
-
-    # Rien à afficher
-    if not prods or not chunk:
-        text_to_send = "Aucun produit SSN/DOB pour le moment."
-        if active_filters:
-            text_to_send = "Aucun produit ne correspond à vos filtres."
-        
-        # Si on vient du filtre, on modifie le menu de filtre existant
-        if from_filter:
-            m = await context.bot.send_message(
-              chat_id=chat_id,
-              text=text_to_send,
-              reply_markup=kb # kb a été défini juste au-dessus
-    )
-            context.user_data['filter_msgs'] = [m.message_id]
-            return CATALOG_FILTER_MAIN # Maintient la conversation de filtre active
-
-        # Sinon, on affiche le menu de pagination normal
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
-            [
-                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0,page-1)}"),
-                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
-                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1,page+1)}"),
-            ],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")],
-        ])
-        m = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text_to_send,
-            reply_markup=kb
-        )
-        sent_ids.append(m.message_id) # Ajoute le message "Aucun produit"
-        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste
-        return
-
-    # ========== 1) formatter une fiche produit ==========
-    def fmt_product(p):
-        raw = (p.get("content") or "").strip()
-
-        # Définit la fonction grab au niveau supérieur pour qu'elle soit toujours disponible
-        import re
-        def grab(keys):
-            for key in keys:
-                # Modifié pour être insensible à la casse (flag re.IGNORECASE)
-                m = re.search(rf"^{re.escape(key)}\s*:\s*(.+)$",
-                              raw, flags=re.IGNORECASE | re.MULTILINE)
-                if m:
-                    return m.group(1).strip()
-            return ""
-
-        if not raw:
-            # fallback depuis 'title'
-            t = (p.get("title") or "").strip()
-            parts = [x.strip() for x in t.split("•")]
-            name  = parts[0] if parts else "John Doe"
-            first = name.split()[0].upper() if name else "JOHN"
-            year     = parts[1] if len(parts) > 1 else ""
-            city     = parts[2] if len(parts) > 2 else ""
-            dob_full = ""
-            base = p.get("tier") or "FAKEPERSON" # Lit depuis la colonne 'tier'
-        else:
-            first    = (grab(["FIRST NAME"]) or "JOHN").split()[0].upper()
-            dob_full = grab(["DOB(DD/MM/YYYY)", "DOB"]) or ""
-            
-            # 1) essaie de lire l’année dans DOB
-            m = re.search(r'(19|20)\d{2}', dob_full or "")
-            year = m.group(0) if m else ""
-
-            # 2) fallback sur la colonne 'year' si vide
-            if not year:
-                year = (p.get("year") or "").strip()
-
-            # 3) dernier recours: tente de lire 4 chiffres dans le title
-            if not year:
-                t = (p.get("title") or "")
-                m2 = re.search(r'(19|20)\d{2}', t)
-                year = m2.group(0) if m2 else ""
-
-            # Lit la ville depuis le 'content' OU la colonne 'city'
-            city = grab(["CITY"]) or (p.get("city") or "")
-            # Lit la base/tier depuis la colonne 'tier' OU le 'content'
-            base = p.get("tier") or grab(["BASE"]) or "FAKEPERSON"
-
-        try:
-            price = float(p.get("price", 10.0) or 10.0)
-        except Exception:
-            price = 10.0
-        curr  = p.get("currency") or "CAD"
-
-        # Année en priorité, sinon date complète, sinon N/A
-        return "\n".join([
-            f"FIRST NAME: {first}",
-            f"DOB: {year or dob_full or 'N/A'}",
-            f"CITY: {city or '—'}",
-            f"BASE: {base}",
-            f"PRICE: {price:.2f} {curr}",
-        ])
-
-    # ========== 2) envoi des cartes produits ==========
-    
-    for idx, p in enumerate(chunk, start=1):
-        txt = fmt_product(p)
-        pid = p.get("id")
-
-        kb_rows = [[
-            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"),
-            InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cart:add:{pid}"),
-        ]]
-
-        kb = InlineKeyboardMarkup(kb_rows)
-        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
-        sent_ids.append(m.message_id) # Ajoute la fiche à la liste
-
-
-    if from_filter:
-        # Si on vient du filtre, on sauvegarde les fiches dans une liste séparée
-        context.user_data['filter_fiches_msg_ids'] = sent_ids
-        
-        # Construit le menu de filtre AVEC la pagination
-        page_info = {'page': page, 'total_pages': total_pages}
-        kb_with_nav = _build_filter_menu(context, page_info=page_info)
-        
-        # --- MODIFICATION : Envoie le NOUVEAU menu de filtre en bas ---
-        m_nav = await context.bot.send_message(
-            chat_id=chat_id, 
-            text=f"Filtre actif - Page {page+1}/{total_pages}", 
-            reply_markup=kb_with_nav
-        )
-        
-        # Sauvegarde l'ID du nouveau menu pour le prochain nettoyage
-        context.user_data['filter_msgs'] = [m_nav.message_id]
-
-    else:
-        # Si on est en mode catalogue normal, on affiche la pagination
-        kb_nav = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
-            [
-                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"),
-                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
-                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}"),
-            ],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
-        ])
-        m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
-        sent_ids.append(m_nav.message_id)
-        CATALOG_MSGS[chat_id] = sent_ids # Sauvegarde la nouvelle liste de messages
- 
 
 # AJOUTEZ CETTE FONCTION (après la fin de show_products, ligne 821)
 def _filter_products(products: list, key: str, value: str) -> list:
@@ -1270,13 +1103,7 @@ async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 CCS_CATALOG_MSGS = {} # Variable globale SÉPARÉE pour les messages CCS
 
-async def ccs_catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Point d'entrée pour le catalogue CCS depuis le menu principal."""
-    # Appelle la fonction d'affichage principale
-    # from_filter=False nettoiera le menu principal
-    return await show_products_ccs(update, context, page=0, tier=None, from_filter=False)
-
-# Ajoute ceci pour que les CCs fonctionnent
+# --- AJOUTE CECI POUR QUE LE MENU CCS FONCTIONNE ---
 def _get_products(category, tier=None):
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
@@ -1286,11 +1113,17 @@ def _get_products(category, tier=None):
         sql += " AND tier=?"
         args.append(tier)
     cur.execute(sql, args)
-    # Convertit en liste de dicts
     cols = [d[0] for d in cur.description]
     rows = cur.fetchall()
     con.close()
     return [dict(zip(cols, row)) for row in rows]
+
+async def ccs_catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Point d'entrée pour le catalogue CCS depuis le menu principal."""
+    # Appelle la fonction d'affichage principale
+    # from_filter=False nettoiera le menu principal
+    return await show_products_ccs(update, context, page=0, tier=None, from_filter=False)
+
 
 
 async def show_products_ccs(update, context, page=0, tier=None, from_filter=False):
