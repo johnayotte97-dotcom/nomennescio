@@ -680,7 +680,7 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     else:
         chat_id = update.effective_chat.id
 
-    # Nettoyage
+    # 1. Nettoyage des anciens messages pour éviter les doublons
     try:
         msgs_to_del = []
         if from_filter:
@@ -690,12 +690,13 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             msgs_to_del += CATALOG_MSGS.pop(chat_id, [])
             msgs_to_del += context.user_data.pop("filter_msgs", [])
             msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
+            
         for mid in set(msgs_to_del):
             try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             except: pass
     except: pass
 
-    # Récupération (Version optimisée)
+    # 2. Récupération optimisée (LIMIT/OFFSET SQL)
     filters = context.user_data.get('active_filters', {})
     PER_PAGE = 2
     chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
@@ -705,30 +706,58 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     
     sent_ids = []
 
-    
+    # 3. Si aucun produit n'est trouvé
+    if not chunk:
+        text = "❌ Aucun produit trouvé."
+        kb = _build_filter_menu(context, page_info=None) if from_filter else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
+        m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        if from_filter: context.user_data['filter_msgs'] = [m.message_id]
+        else: CATALOG_MSGS[chat_id] = [m.message_id]
+        return
 
-    # Navigation
+    # 4. Affichage des fiches produits (Boucle sur les 2 produits de la page)
+    for p in chunk:
+        # Extraction simplifiée des infos pour l'affichage
+        title = p.get('title', 'Produit sans nom')
+        price = p.get('price', 0.0)
+        base = p.get('tier', 'N/A')
+        
+        txt = f"📦 *PROPRO*\n━━━━━━━━━━━━━━━\n👤 **NOM** : `{title}`\n📂 **BASE** : `{base}`\n💰 **PRIX** : `{price:.2f} CAD`"
+        
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"),
+            InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}")
+        ]])
+        
+        try:
+            m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
+            sent_ids.append(m.message_id)
+        except:
+            # Fallback si le Markdown pose problème
+            m = await context.bot.send_message(chat_id=chat_id, text=txt.replace('*',''), reply_markup=kb)
+            sent_ids.append(m.message_id)
+
+    # 5. Affichage du menu de navigation (Bas de page)
     if from_filter:
         context.user_data['filter_fiches_msg_ids'] = sent_ids
         kb = _build_filter_menu(context, page_info={'page': page, 'total_pages': total_pages})
-        m = await context.bot.send_message(chat_id=chat_id, text=f"Filtres actifs ({total_items} résultats)", reply_markup=kb)
+        m = await context.bot.send_message(chat_id=chat_id, text=f"🔎 Filtres actifs ({total_items} résultats)", reply_markup=kb)
         context.user_data['filter_msgs'] = [m.message_id]
     else:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
             [
                 InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"),
-                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+                InlineKeyboardButton(f"{page+1} / {total_pages}", callback_data="noop"),
                 InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}"),
             ],
             [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
         ])
-        m = await context.bot.send_message(chat_id=chat_id, text=f"Catalogue ({total_items} produits)", reply_markup=kb)
+        m = await context.bot.send_message(chat_id=chat_id, text=f"📊 Catalogue ({total_items} produits)", reply_markup=kb)
         sent_ids.append(m.message_id)
         CATALOG_MSGS[chat_id] = sent_ids
 
 
-# AJOUTEZ CETTE FONCTION (après la fin de show_products, ligne 821)
 def _filter_products(products: list, key: str, value: str) -> list:
     """Fonction de filtrage manquante. Utilise le parser de shop_helpers."""
     if not value:
@@ -780,10 +809,6 @@ def _filter_products(products: list, key: str, value: str) -> list:
                 pass # Ignore le filtre si la valeur n'est pas un nombre
     
     return filtered
-# FIN DE LA NOUVELLE FONCTION
-# REMPLACE les 3 fonctions filter_open, filter_select, on_filter_text (lignes 718-862) par TOUT CE BLOC :
-
-# REMPLACEZ la fonction _build_filter_menu (lignes 865-888) par ceci :
 
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
     """Construit le menu de filtre dynamique, AVEC pagination optionnelle."""
