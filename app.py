@@ -2880,8 +2880,8 @@ async def admin_prod_csv_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id_str = str(update.effective_user.id) # Pour les logs
-    if user_id_str != ADMIN_ID:
+    user_id_str = str(update.effective_user.id)
+    if user_id_str not in ADMIN_IDS:
         return
 
     doc = update.message.document
@@ -2889,7 +2889,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("Aucun fichier. Réessaie.")
         return ADMIN_WAIT_CSV
 
-    print(f"[CSV Import - User {user_id_str}] Fichier reçu: {doc.file_name}") # DEBUG LOG 1
+    print(f"[CSV Import] Fichier reçu: {doc.file_name}")
 
     db = _get_db_from_context(context)
     if not db:
@@ -2899,153 +2899,147 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
     c = db.cursor()
     inserted = 0
     
-    try: # --- Début du bloc try ---
+    try:
         from io import BytesIO, StringIO
         f = await context.bot.get_file(doc.file_id)
         bio = BytesIO()
-        await f.download_to_memory(out=bio) # CORRECTION : download_to_memory
+        await f.download_to_memory(out=bio)
         bio.seek(0)
         
         try:
             text = bio.read().decode('utf-8')
-            print(f"[CSV Import - User {user_id_str}] Fichier décodé en UTF-8 avec succès.") # DEBUG LOG 2
         except UnicodeDecodeError:
             try:
-                # Essayer avec un autre encodage commun si UTF-8 échoue
                 bio.seek(0)
                 text = bio.read().decode('latin-1')
-                print(f"[CSV Import - User {user_id_str}] ATTENTION: Fichier décodé en latin-1 (pas UTF-8).") # DEBUG LOG 2bis
             except Exception as decode_err:
-                 print(f"[CSV Import - User {user_id_str}] ERREUR: Impossible de décoder le fichier. Erreur: {decode_err}") # DEBUG LOG ERROR
-                 await update.message.reply_text(f"❌ Erreur: Impossible de lire l'encodage du fichier ({decode_err}). Assurez-vous qu'il est en UTF-8.")
+                 await update.message.reply_text(f"❌ Erreur encodage : {decode_err}")
                  return ConversationHandler.END
 
         import csv, re
-        # Sniffer pour deviner le délimiteur (virgule ou point-virgule)
         try:
-            # Prend les 5 premières lignes pour deviner
             sample_text = "\n".join(text.splitlines()[:5])
             dialect = csv.Sniffer().sniff(sample_text)
             delimiter = dialect.delimiter
-            print(f"[CSV Import - User {user_id_str}] Délimiteur détecté: '{delimiter}'") # DEBUG LOG 3
         except csv.Error:
-             print(f"[CSV Import - User {user_id_str}] ATTENTION: Impossible de détecter le délimiteur, utilisation de ',' par défaut.") # DEBUG LOG 3bis
-             delimiter = ',' # Fallback sur la virgule
+             delimiter = ','
 
         rdr = csv.DictReader(StringIO(text), delimiter=delimiter)
         
         try:
-            # CORRECTION : Convertit tous les en-têtes en minuscules
             if rdr.fieldnames:
-                rdr.fieldnames = [h.lower().strip() for h in rdr.fieldnames if h] # Met en minuscule et enlève les espaces
+                rdr.fieldnames = [h.lower().strip() for h in rdr.fieldnames if h]
             
-            headers = rdr.fieldnames
-            if not headers:
-                raise ValueError("L'en-tête CSV est vide ou illisible.")
-            print(f"[CSV Import - User {user_id_str}] En-têtes lues (en minuscule): {headers}") # DEBUG LOG 4
+            headers = rdr.fieldnames or []
+            if not headers: raise ValueError("En-têtes vides")
+
+            # Validation minimale (Vérifie si on a Date et Nom)
+            headers_set = set(headers)
+            has_dob = 'dob' in headers_set or 'datenais' in headers_set
+            has_name = 'first' in headers_set or 'prn_nom' in headers_set or 'nom' in headers_set
             
-            required_headers = {'first', 'last', 'dob', 'price'} # Minimum requis
-            if not required_headers.issubset(set(headers)): # Vérifie si tous sont présents
-                 print(f"[CSV Import - User {user_id_str}] ERREUR: En-têtes manquantes. Requis au minimum: {required_headers}. Trouvé: {headers}") # DEBUG LOG ERROR
-                 await update.message.reply_text(f"❌ Erreur: En-têtes manquantes dans le CSV. Il faut au moins: first, last, dob, price.")
+            if not (has_dob and has_name):
+                 await update.message.reply_text(f"❌ Erreur colonnes: Je ne trouve pas 'DateNais' ou 'PRN_NOM'.")
                  return ConversationHandler.END
+
         except Exception as header_err:
-             print(f"[CSV Import - User {user_id_str}] ERREUR lecture en-têtes: {header_err}") # DEBUG LOG ERROR
-             await update.message.reply_text(f"❌ Erreur: Impossible de lire les en-têtes du CSV ({header_err}).")
+             await update.message.reply_text(f"❌ Erreur lecture en-têtes : {header_err}")
              return ConversationHandler.END
 
         cols = _guess_columns(c)
-        category = context.user_data.get('admin_product_category', 'propro') # Récupère la catégorie
+        category = context.user_data.get('admin_product_category', 'propro')
         
-        print(f"[CSV Import - User {user_id_str}] Début de l'itération des lignes...") # DEBUG LOG 5
-        line_num = 1 # Pour le logging d'erreur
+        # LISTE DES COLONNES À IGNORER DANS LE "RAMASSE-MIETTES"
+        # On ignore 'price' et 'base' car on les traite manuellement.
+        # On ignore 'langue' car tu ne veux pas l'afficher.
+        # On laisse 'id' libre pour qu'il soit ajouté automatiquement.
+        known_keys = {
+            'sin', 'sin_nas', 'dob', 'datenais', 'phone', 'telephone', 
+            'address', 'adr', 'unit', 'city', 'muni', 'prov', 'prn_nom', 
+            'first', 'last', 'email', 'dl', 'postal', 'password', 'price', 
+            'base', 'stock', 'cc', 'exp', 'cvc', 'nom', 'prenom', 
+            'langue' 
+        }
+
+        line_num = 1
         for row in rdr:
             line_num += 1
             try:
-                # --- MODIFICATION CLÉ ---
-                # Lit TOUTES les valeurs en premier
-                password = (row.get('password') or '').strip()
-                cc       = (row.get('cc') or '').strip()
-                exp      = (row.get('exp') or '').strip()
-                cvc      = (row.get('cvc') or '').strip()
-                sin      = (row.get('sin') or '').strip()
-                dl       = (row.get('dl') or '').strip()
-                first    = (row.get('first') or '').strip()
-                last     = (row.get('last') or '').strip()
-                dob      = (row.get('dob') or '').strip()
-                address  = (row.get('address') or '').strip()
-                city     = (row.get('city') or '').strip()
-                postal   = (row.get('postal') or '').strip()
-                base     = (row.get('base') or 'FAKEPERSON').strip()
-                email    = (row.get('email') or '').strip()
-                phone    = (row.get('phone') or '').strip()
-                price    = _parse_price(row.get('price') or '0')
+                r_clean = {k.lower().strip(): v.strip() for k, v in row.items() if k}
 
-     
-                # Vérification minimale que des données essentielles existent
-                if not first or not last or not dob:
-                    print(f"[CSV Import - User {user_id_str}] Ligne {line_num} ignorée: first ou last manquant.")
-                    continue # Ignore cette ligne
-                if category == 'propro' and not dob:
-                    print(f"[CSV Import - User {user_id_str}] Ligne {line_num} ignorée: dob manquant (requis pour propro).")
-                    continue # Ignore la ligne si 'propro' et 'dob' est vide
-                try:
-                    stock = int((row.get('stock') or '1').strip() or 1)
-                except Exception:
-                    stock = 1
+                # --- 1. SÉPARATION DU NOM (INVERSÉE) ---
+                full_name_raw = r_clean.get('prn_nom') or ''
+                first = r_clean.get('first') or r_clean.get('prenom') or ''
+                last = r_clean.get('last') or r_clean.get('nom') or ''
+
+                if not first and full_name_raw:
+                    parts = full_name_raw.split(maxsplit=1)
+                    # INVERSION : 1er mot = NOM, Reste = PRÉNOM
+                    if len(parts) >= 1: last = parts[0] 
+                    if len(parts) == 2: first = parts[1] 
+
+                # --- 2. LECTURE DES CHAMPS ---
+                sin = r_clean.get('sin') or r_clean.get('sin_nas') or ''
+                dob = r_clean.get('dob') or r_clean.get('datenais') or ''
+                phone = r_clean.get('phone') or r_clean.get('telephone') or ''
+                
+                # Adresse (gestion de l'unité/appartement)
+                raw_addr = r_clean.get('address') or r_clean.get('adr') or ''
+                unit = r_clean.get('unit') or ''
+                address = f"{unit}-{raw_addr}" if unit else raw_addr
+                
+                # Ville
+                city = r_clean.get('city') or r_clean.get('muni') or ''
+                prov = r_clean.get('prov') or ''
+                if prov and city: city = f"{city} ({prov})"
+
+                email = r_clean.get('email') or ''
+                dl = r_clean.get('dl') or ''
+                postal = r_clean.get('postal') or ''
+                password = r_clean.get('password') or ''
+                
+                # --- NOUVEAU : GESTION PRIX ET BASE ---
+                # Lit le prix depuis ton fichier (ex: 2)
+                price = _parse_price(r_clean.get('price') or '0')
+                # Lit la base depuis ton fichier (ex: DEJ)
+                base = (r_clean.get('base') or 'Import Excel').strip()
+                
+                # --- 3. CRÉATION DE LA FICHE PRODUIT ---
+                content_lines = [
+                    f"SIN: {sin}", f"DL: {dl}",
+                    f"FIRST NAME: {first}", f"LAST NAME: {last}",
+                    f"DOB(DD/MM/YYYY): {dob}", 
+                    f"ADRESSE: {address}", f"CITY: {city}", f"CODE POSTAL: {postal}",
+                    f"EMAIL: {email}", f"PHONE NUMBER: {phone}",
+                    f"PASSWORD: {password}",
+                    f"BASE: {base}",            # Affiche ta base (ex: BASE: DEJ)
+                    f"PRICE: {price:.2f} CAD",  # Affiche ton prix (ex: PRICE: 2.00 CAD)
+                ]
+
+                # --- 4. LE RAMASSE-MIETTES (Ajoute ID, ignore LANGUE) ---
+                for key, val in r_clean.items():
+                    if key not in known_keys and val:
+                        content_lines.append(f"{key.upper()}: {val}")
+
+                content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip())
+
+                if not first and not full_name_raw: 
+                    continue 
+
+                try: stock = int((r_clean.get('stock') or '1').strip() or 1)
+                except: stock = 1
 
                 year = ''
-                m = re.search(r'(\d{4})', dob) # Cherche 4 chiffres pour l'année
+                m = re.search(r'(\d{4})', dob)
                 if m: year = m.group(1)
-
+                
                 title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
-                
-                # Maintenant, la logique 'if category == ccs' fonctionnera
-                if category == 'ccs':
-                  content_lines = [
-                    f"CC: {cc}",     # <--- Ne plantera plus
-                    f"EXP: {exp}",   # <--- Ne plantera plus
-                    f"CVC: {cvc}",   # <--- Ne plantera plus
-                    f"SIN: {sin}",
-                    f"DL: {dl}",
-                    f"FIRST NAME: {first}",
-                    f"LAST NAME: {last}",
-                    f"DOB(DD/MM/YYYY): {dob}", 
-                    f"ADRESSE: {address}",
-                    f"CITY: {city}",
-                    f"CODE POSTAL: {postal}",
-                    f"EMAIL: {email}",
-                    f"PHONE NUMBER: {phone}",
-                    f"PASSWORD: {password}",
-                    f"BASE: {base}",
-                    f"PRICE: {price:.2f} CAD",
-                ]
-                else: # 'propro' ou default
-                  content_lines = [
-                    f"SIN: {sin}",
-                    f"DL: {dl}",
-                    f"FIRST NAME: {first}",
-                    f"LAST NAME: {last}",
-                    f"DOB(DD/MM/YYYY): {dob}", 
-                    f"ADRESSE: {address}",
-                    f"CITY: {city}",
-                    f"CODE POSTAL: {postal}",
-                    f"EMAIL: {email}",
-                    f"PHONE NUMBER: {phone}",
-                    f"PASSWORD: {password}",
-                    f"BASE: {base}",
-                    f"PRICE: {price:.2f} CAD",
-                ]
-                
-                # Ne garde que les lignes qui ont une valeur APRÈS le ":"
-                content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip()) 
 
                 fields, values = [], []
-                # Ton code existant pour remplir fields et values
                 if 'title'    in cols: fields.append('title');    values.append(title)
                 if 'content'  in cols: fields.append('content');  values.append(content)
                 if 'price'    in cols: fields.append('price');    values.append(price)
-                if 'tier'     in cols: fields.append('tier');     values.append(base) # Utilise 'base' pour 'tier'
+                if 'tier'     in cols: fields.append('tier');     values.append(base)
                 if 'city'     in cols: fields.append('city');     values.append(city)
                 if 'year'     in cols: fields.append('year');     values.append(year)
                 if 'stock'    in cols: fields.append('stock');    values.append(stock)
@@ -3053,35 +3047,23 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                 if 'currency' in cols: fields.append('currency'); values.append('CAD')
                 if 'is_active' in cols: fields.append('is_active'); values.append(1)
 
-                if not fields: # Sécurité
-                    print(f"[CSV Import - User {user_id_str}] ERREUR Ligne {line_num}: Aucun champ à insérer ?!")
-                    continue
-
                 q = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
                 c.execute(q, values)
                 inserted += 1
             
             except Exception as row_err:
-                 # Log l'erreur pour cette ligne spécifique mais continue avec les autres
-                 print(f"[CSV Import - User {user_id_str}] ERREUR Ligne {line_num}: {row_err}. Ligne ignorée. Données: {row}") # DEBUG LOG ERROR LIGNE
-
-        print(f"[CSV Import - User {user_id_str}] Fin de l'itération. {inserted} lignes traitées.") # DEBUG LOG 6
+                 print(f"Erreur Ligne {line_num}: {row_err}")
 
         if inserted > 0:
             db.commit()
-            print(f"[CSV Import - User {user_id_str}] Commit effectué.") # DEBUG LOG 7
             await update.message.reply_text(f"✅ Import terminé. {inserted} produit(s) ajouté(s).")
         else:
-             print(f"[CSV Import - User {user_id_str}] Aucune ligne valide trouvée ou insérée.") # DEBUG LOG 7bis
-             await update.message.reply_text("⚠️ Fichier traité, mais aucun produit valide n'a pu être ajouté. Vérifiez les en-têtes et les données.")
+             await update.message.reply_text("⚠️ Aucune ligne valide trouvée.")
 
     except Exception as e:
-         # Erreur générale pendant le traitement
-         print(f"[CSV Import - User {user_id_str}] ERREUR GLOBALE: {e}") # DEBUG LOG ERREUR GLOBALE
-         try:
-             db.rollback() # Annule les changements si erreur
+         try: db.rollback()
          except: pass
-         await update.message.reply_text(f"❌ Erreur critique lors de l'import : {e}")
+         await update.message.reply_text(f"❌ Erreur critique : {e}")
     
     return ConversationHandler.END
 
