@@ -12,6 +12,8 @@ import asyncio
 import logging
 logger = logging.getLogger("SYSTEM")
 import threading
+import time
+import requests
 import sqlite3
 import subprocess
 from datetime import datetime
@@ -28,6 +30,23 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
     ConversationHandler, ContextTypes, CallbackQueryHandler
 )
+# ================= SECURITY HEARTBEAT =================
+# Ton lien Healthchecks personnel
+HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
+
+def start_heartbeat():
+    while True:
+        try:
+            # Envoie le signal au site
+            requests.get(HEARTBEAT_URL, timeout=10)
+        except Exception:
+            pass
+        time.sleep(60)
+
+# Démarrer la surveillance en arrière-plan
+threading.Thread(target=start_heartbeat, daemon=True).start()
+# ======================================================
+
 # === Helpers pour éditer la bulle + bouton Retour ===
 def kb_back_to_menu():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
@@ -516,6 +535,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚗 Vérifier mon permis" if lang == "fr" else "🚗 Check my license", callback_data="start_verifier_main")],
         [InlineKeyboardButton("💳 Recharger" if lang == "fr" else "💳 Top up", callback_data="add_balance")],
         [InlineKeyboardButton("🌐 Langue/Language", callback_data="choose_lang")],
+        [InlineKeyboardButton("📣 Channel", callback_data="join_private_channel")],
         [InlineKeyboardButton("📞 Support", callback_data="support")],
         [InlineKeyboardButton("📚 FAQ", callback_data="faq")],
     ]
