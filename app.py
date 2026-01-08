@@ -1276,6 +1276,22 @@ async def ccs_catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # from_filter=False nettoiera le menu principal
     return await show_products_ccs(update, context, page=0, tier=None, from_filter=False)
 
+# Ajoute ceci pour que les CCs fonctionnent
+def _get_products(category, tier=None):
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    sql = "SELECT * FROM products WHERE category=? AND is_active=1 AND stock>0"
+    args = [category]
+    if tier:
+        sql += " AND tier=?"
+        args.append(tier)
+    cur.execute(sql, args)
+    # Convertit en liste de dicts
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    con.close()
+    return [dict(zip(cols, row)) for row in rows]
+
 
 async def show_products_ccs(update, context, page=0, tier=None, from_filter=False):
     chat_id = None
