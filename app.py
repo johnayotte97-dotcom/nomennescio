@@ -1403,7 +1403,6 @@ def ensure_payment_table():
     con.commit()
     con.close()
 
-# On s'assure que la table existe
 ensure_payment_table()
 
 def get_btc_price_cad():
@@ -1411,41 +1410,43 @@ def get_btc_price_cad():
         r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=cad", timeout=5)
         return float(r.json()['bitcoin']['cad'])
     except:
-        return 130000.0 # Fallback de sécurité
+        return 135000.0 
 
 def generate_address(user_id: int, order_id: int) -> str:
-    """Génère une adresse avec nettoyage de clé et débogage."""
-    if not ADMIN_XPUB:
-        return "ERREUR_NO_XPUB"
+    if not ADMIN_XPUB: return "ERREUR_NO_XPUB"
     try:
-        # 1. Nettoyage de la clé (enlève espaces et guillemets éventuels du .env)
         clean_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
-        
         hdwallet = HDWallet(symbol=BTC)
         hdwallet.from_xpublic_key(clean_key)
-        
-        # 2. Chemin simplifié (basé sur l'ID de commande seulement)
+        # CORRECTION : On utilise seulement order_id pour éviter le crash
         hdwallet.from_path(f"m/0/{order_id}")
-        
         return hdwallet.p2wpkh_address()
     except Exception as e:
-        # 3. Retourne l'erreur exacte pour qu'on puisse la lire
         logger.error(f"Erreur adresse: {e}")
-        return f"ERR: {str(e)}"
+        return f"ERR_GEN: {str(e)}"
+
+def check_payment_status(address: str):
+    try:
+        r = requests.get(f"https://mempool.space/api/address/{address}", timeout=10)
+        data = r.json()
+        satoshis = data['chain_stats']['funded_txo_sum'] + data['mempool_stats']['funded_txo_sum']
+        return satoshis / 100_000_000
+    except:
+        return 0.0
 
 async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
     if not ADMIN_XPUB:
-        await q.message.reply_text("⚠️ Système de paiement non configuré (XPUB manquant).")
+        await q.message.reply_text("⚠️ Erreur config: XPUB manquant dans .env")
         return ConversationHandler.END
 
     await replace_view(
         q,
-        "💸 **Recharge Crypto **\n\n"
-        "Combien voulez-vous ajouter à votre solde ?\n"
-        "_(Entrez un montant en CAD, ex: 50)_",
+        "💸 **Recharge Crypto (Automatique)**\n\n"
+        "Combien voulez-vous ajouter ? (en CAD)\n"
+        "_(Exemple: tapez 50)_",
         reply_markup=kb_back_to_menu(),
         parse_mode="Markdown"
     )
@@ -1453,30 +1454,26 @@ async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.replace(',', '.').strip()
-    
     try:
-        amount_cad = float(text)
+        amount_cad = float(update.message.text.replace(',', '.').strip())
         if amount_cad < 5: 
-            await update.message.reply_text("❌ Minimum 5$ CAD.")
+            await update.message.reply_text("❌ Minimum 5$.")
             return WAIT_AMOUNT_CRYPTO
     except:
-        await update.message.reply_text("❌ Montant invalide. Entrez juste un chiffre (ex: 50).")
+        await update.message.reply_text("❌ Montant invalide.")
         return WAIT_AMOUNT_CRYPTO
 
-    # Calcul conversion
-    msg_wait = await update.message.reply_text("⏳ Calcul du taux de change...")
+    msg_wait = await update.message.reply_text("⏳ Génération de l'adresse...")
+    
     btc_price = get_btc_price_cad()
     amount_btc = amount_cad / btc_price
     
-    # Enregistrement DB
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     cur.execute("INSERT INTO crypto_payments (user_id, amount_cad, amount_btc_expected) VALUES (?,?,?)", 
                 (str(user_id), amount_cad, amount_btc))
     order_id = cur.lastrowid
     
-    # Génération Adresse
     address = generate_address(user_id, order_id)
     
     cur.execute("UPDATE crypto_payments SET address=? WHERE id=?", (address, order_id))
@@ -1486,14 +1483,12 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
     try: await msg_wait.delete()
     except: pass
 
-    # Affichage Facture
     txt = (
         f"🧾 **Facture #{order_id}**\n"
         f"💰 Montant : `{amount_cad:.2f} CAD`\n"
-        f"💎 En BTC : `{amount_btc:.8f} BTC`\n\n"
-        f"👉 **Envoyez à cette adresse :**\n"
-        f"`{address}`\n\n"
-        f"_(Cliquez pour copier. Le solde s'ajoute automatiquement après 1 confirmation.)_"
+        f"💎 BTC : `{amount_btc:.8f} BTC`\n\n"
+        f"👉 **Envoyez à :**\n`{address}`\n\n"
+        f"_(Cliquez l'adresse pour copier)_"
     )
     
     kb = InlineKeyboardMarkup([
@@ -1507,63 +1502,31 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
 async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     order_id = int(q.data.split("_")[-1])
-    await q.answer("🔍 Vérification blockchain...")
+    await q.answer("🔍 Vérification...")
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     cur.execute("SELECT address, amount_btc_expected, status, amount_cad FROM crypto_payments WHERE id=?", (order_id,))
     row = cur.fetchone()
     
-    if not row:
+    if not row or row[2] == 'paid':
         con.close()
-        await q.edit_message_text("❌ Commande introuvable.")
+        await q.message.reply_text("✅ Déjà payé ou introuvable.")
         return
 
     address, expected, status, cad_val = row
-    
-    if status == 'paid':
-        con.close()
-        await q.message.reply_text("✅ Déjà payé !")
-        return
-
-    # Vérification réelle
     received = check_payment_status(address)
     
-    # On accepte si 98% du montant est là (tolérance frais mineurs)
-    if received >= (expected * 0.98):
-        # SUCCÈS
+    if received >= (expected * 0.95):
         cur.execute("UPDATE crypto_payments SET status='paid' WHERE id=?", (order_id,))
         con.commit()
         con.close()
-        
-        # Créditer l'user (utilise ta fonction existante)
         new_bal, _ = credit_and_upgrade(str(q.from_user.id), cad_val)
-        
-        await q.message.reply_text(
-            f"✅ **Paiement Reçu !**\n\n"
-            f"Votre compte a été crédité de {cad_val:.2f}$.\n"
-            f"💰 Nouveau solde : {new_bal:.2f}$",
-            parse_mode="Markdown"
-        )
+        await q.message.reply_text(f"✅ **Reçu !**\nNouveau solde : {new_bal:.2f}$", parse_mode="Markdown")
         await show_main_menu(q.from_user.id)
-        
-        # Notif Admin
-        for admin in ADMIN_IDS:
-            try: await context.bot.send_message(admin, f"💰 RECHARGE AUTO: {cad_val}$ (User {q.from_user.id})")
-            except: pass
-            
     else:
         con.close()
-        diff = expected - received
-        await q.message.reply_text(
-            f"⏳ **En attente...**\n"
-            f"Reçu : {received:.8f} BTC\n"
-            f"Attendu : {expected:.8f} BTC\n\n"
-            f"Manque : {diff:.8f} BTC\n"
-            f"Si vous venez d'envoyer, attendez 1-2 minutes et recliquez.",
-            quote=True
-        )
-
+        await q.message.reply_text(f"⏳ **En attente...**\nReçu: {received:.8f} BTC\nAttendu: {expected:.8f} BTC", quote=True)
 async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
