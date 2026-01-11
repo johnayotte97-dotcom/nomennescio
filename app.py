@@ -2881,6 +2881,11 @@ async def admin_prod_add_start(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- modify admin_prod_add_receive with guards ---
 async def admin_prod_add_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # --- SECURITÉ AJOUTÉE ---
+    if not update.effective_user:
+        return # Ignore si pas d'utilisateur (ex: channel post)
+    # ------------------------
+
     # Guard 1: only admin
     if str(update.effective_user.id) not in ADMIN_IDS:
         return
@@ -3480,6 +3485,11 @@ async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT
 
 # --- admin_customamount_receive (message handler, pas de callback -> pas de q.answer) ---
 async def admin_customamount_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # --- SECURITÉ AJOUTÉE ---
+    if not update.effective_user:
+        return # Ignore si pas d'utilisateur
+    # ------------------------
+
     # Guard 1: only admin
     if str(update.effective_user.id) not in ADMIN_IDS:
         return
