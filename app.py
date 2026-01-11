@@ -1,7 +1,7 @@
 import re
 import sqlite3
 from hdwallet import HDWallet
-from hdwallet.symbols import BTC
+from hdwallet.cryptocurrencies import Bitcoin as BTC
 import shop_helpers
 from telegram.ext import CallbackQueryHandler, CommandHandler
 import os
@@ -23,15 +23,9 @@ from dotenv import load_dotenv
 from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup)
+from telegram.ext import (Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes, CallbackQueryHandler)
 
-
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    ConversationHandler, ContextTypes, CallbackQueryHandler
-)
 # ================= SECURITY HEARTBEAT =================
 # Ton lien Healthchecks personnel
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
@@ -1413,17 +1407,28 @@ def get_btc_price_cad():
         return 135000.0 
 
 def generate_address(user_id: int, order_id: int) -> str:
-    if not ADMIN_XPUB: return "ERREUR_NO_XPUB"
+    """Génère une adresse BTC (Segwit) unique pour la commande."""
+    if not ADMIN_XPUB:
+        return "ERREUR_NO_XPUB"
+    
     try:
+        # 1. Nettoyage de la clé
         clean_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
-        hdwallet = HDWallet(symbol=BTC)
+        
+        # 2. Initialisation (Version corrigée pour la nouvelle librairie)
+        hdwallet = HDWallet(cryptocurrency=BTC)
         hdwallet.from_xpublic_key(clean_key)
-        # CORRECTION : On utilise seulement order_id pour éviter le crash
-        hdwallet.from_path(f"m/0/{order_id}")
+        
+        # 3. Chemin de dérivation (SANS 'm/')
+        # "m/" est interdit avec une xpub/zpub. On utilise un chemin relatif.
+        hdwallet.from_path(f"0/{order_id}")
+        
+        # 4. Retourne l'adresse
         return hdwallet.p2wpkh_address()
+        
     except Exception as e:
-        logger.error(f"Erreur adresse: {e}")
-        return f"ERR_GEN: {str(e)}"
+        logger.error(f"CRASH ADRESSE: {e}")
+        return f"ERR: {str(e)}"
 
 def check_payment_status(address: str):
     try:
