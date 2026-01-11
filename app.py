@@ -23,6 +23,7 @@ from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
 
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
@@ -193,6 +194,8 @@ ADMIN_IVR_AWAIT_VALUE = 400 # Nouvelle constante
 IVR_TIMINGS_FILE = "ivr_timings.json"
 CATALOG_FILTER_MAIN, CATALOG_FILTER_AWAIT_VALUE = range(500, 502)
 CCS_FILTER_MAIN, CCS_FILTER_AWAIT_VALUE = range(600, 602)
+WAIT_AMOUNT_CRYPTO = 800
+ADMIN_XPUB = os.environ.get("ADMIN_XPUB")
 
 # Paliers
 FORFAITS = {
@@ -1380,20 +1383,191 @@ async def callback_show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode="HTML"
     )
 
+# ================= PAIEMENT CRYPTO (ELECTRUM / NO KYC) =================
+
+def ensure_payment_table():
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS crypto_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            address TEXT,
+            amount_cad REAL,
+            amount_btc_expected REAL,
+            status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    con.close()
+
+# On s'assure que la table existe
+ensure_payment_table()
+
+def get_btc_price_cad():
+    try:
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=cad", timeout=5)
+        return float(r.json()['bitcoin']['cad'])
+    except:
+        return 130000.0 # Fallback de sécurité
+
+def generate_address(user_id: int, order_id: int) -> str:
+    """Génère une adresse unique dérivée de la XPUB."""
+    if not ADMIN_XPUB:
+        return "ERREUR_NO_XPUB"
+    try:
+        hdwallet = HDWallet(symbol=BTC)
+        hdwallet.from_xpublic_key(ADMIN_XPUB)
+        # Chemin de dérivation unique pour chaque commande
+        hdwallet.from_path(f"m/0/{user_id}/{order_id}")
+        return hdwallet.p2wpkh_address() # Adresse Segwit (bc1q...)
+    except Exception as e:
+        logger.error(f"Erreur adresse: {e}")
+        return "ERREUR_GEN"
+
+def check_payment_status(address: str):
+    """Vérifie via Mempool.space (API publique sans clé)."""
+    try:
+        r = requests.get(f"https://mempool.space/api/address/{address}", timeout=10)
+        if r.status_code != 200: return 0.0
+        data = r.json()
+        # Somme des montants confirmés et non-confirmés (mempool)
+        satoshis = data['chain_stats']['funded_txo_sum'] + data['mempool_stats']['funded_txo_sum']
+        return satoshis / 100_000_000
+    except:
+        return 0.0
+
 async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    wallet_btc = "bitcoin:bc1q4dzyt56lpv2524sq3lpm69fl57523780r846xt"
+    
+    if not ADMIN_XPUB:
+        await q.message.reply_text("⚠️ Système de paiement non configuré (XPUB manquant).")
+        return ConversationHandler.END
+
     await replace_view(
         q,
-        "💵 Pour recharger votre solde, envoyez le montant désiré à cette adresse Bitcoin :\n"
-        f"<code>{wallet_btc}</code>\n\n"
-        "Après paiement, envoyez une preuve (capture ou TXID) au support ou directement ici.\n"
-        "Un admin créditera manuellement votre compte.",
+        "💸 **Recharge Crypto (Automatique)**\n\n"
+        "Combien voulez-vous ajouter à votre solde ?\n"
+        "_(Entrez un montant en CAD, ex: 50)_",
         reply_markup=kb_back_to_menu(),
-        parse_mode="HTML"
+        parse_mode="Markdown"
     )
+    return WAIT_AMOUNT_CRYPTO
+
+async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.replace(',', '.').strip()
+    
+    try:
+        amount_cad = float(text)
+        if amount_cad < 5: 
+            await update.message.reply_text("❌ Minimum 5$ CAD.")
+            return WAIT_AMOUNT_CRYPTO
+    except:
+        await update.message.reply_text("❌ Montant invalide. Entrez juste un chiffre (ex: 50).")
+        return WAIT_AMOUNT_CRYPTO
+
+    # Calcul conversion
+    msg_wait = await update.message.reply_text("⏳ Calcul du taux de change...")
+    btc_price = get_btc_price_cad()
+    amount_btc = amount_cad / btc_price
+    
+    # Enregistrement DB
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("INSERT INTO crypto_payments (user_id, amount_cad, amount_btc_expected) VALUES (?,?,?)", 
+                (str(user_id), amount_cad, amount_btc))
+    order_id = cur.lastrowid
+    
+    # Génération Adresse
+    address = generate_address(user_id, order_id)
+    
+    cur.execute("UPDATE crypto_payments SET address=? WHERE id=?", (address, order_id))
+    con.commit()
+    con.close()
+    
+    try: await msg_wait.delete()
+    except: pass
+
+    # Affichage Facture
+    txt = (
+        f"🧾 **Facture #{order_id}**\n"
+        f"💰 Montant : `{amount_cad:.2f} CAD`\n"
+        f"💎 En BTC : `{amount_btc:.8f} BTC`\n\n"
+        f"👉 **Envoyez à cette adresse :**\n"
+        f"`{address}`\n\n"
+        f"_(Cliquez pour copier. Le solde s'ajoute automatiquement après 1 confirmation.)_"
+    )
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ J'ai payé (Vérifier)", callback_data=f"check_pay_{order_id}")],
+        [InlineKeyboardButton("❌ Annuler", callback_data="menu_accueil")]
+    ])
+    
+    await update.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
     return ConversationHandler.END
+
+async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    order_id = int(q.data.split("_")[-1])
+    await q.answer("🔍 Vérification blockchain...")
+    
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT address, amount_btc_expected, status, amount_cad FROM crypto_payments WHERE id=?", (order_id,))
+    row = cur.fetchone()
+    
+    if not row:
+        con.close()
+        await q.edit_message_text("❌ Commande introuvable.")
+        return
+
+    address, expected, status, cad_val = row
+    
+    if status == 'paid':
+        con.close()
+        await q.message.reply_text("✅ Déjà payé !")
+        return
+
+    # Vérification réelle
+    received = check_payment_status(address)
+    
+    # On accepte si 98% du montant est là (tolérance frais mineurs)
+    if received >= (expected * 0.98):
+        # SUCCÈS
+        cur.execute("UPDATE crypto_payments SET status='paid' WHERE id=?", (order_id,))
+        con.commit()
+        con.close()
+        
+        # Créditer l'user (utilise ta fonction existante)
+        new_bal, _ = credit_and_upgrade(str(q.from_user.id), cad_val)
+        
+        await q.message.reply_text(
+            f"✅ **Paiement Reçu !**\n\n"
+            f"Votre compte a été crédité de {cad_val:.2f}$.\n"
+            f"💰 Nouveau solde : {new_bal:.2f}$",
+            parse_mode="Markdown"
+        )
+        await show_main_menu(q.from_user.id)
+        
+        # Notif Admin
+        for admin in ADMIN_IDS:
+            try: await context.bot.send_message(admin, f"💰 RECHARGE AUTO: {cad_val}$ (User {q.from_user.id})")
+            except: pass
+            
+    else:
+        con.close()
+        diff = expected - received
+        await q.message.reply_text(
+            f"⏳ **En attente...**\n"
+            f"Reçu : {received:.8f} BTC\n"
+            f"Attendu : {expected:.8f} BTC\n\n"
+            f"Manque : {diff:.8f} BTC\n"
+            f"Si vous venez d'envoyer, attendez 1-2 minutes et recliquez.",
+            quote=True
+        )
 
 async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4326,9 +4500,20 @@ app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback,  
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback,    pattern=r"^cart:clear$"),   group=-1)
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"),group=-1)
 
+
+# --- NOUVEAUX HANDLERS PAIEMENT ---
+payment_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(add_balance_start, pattern="^add_balance$")],
+    states={
+        WAIT_AMOUNT_CRYPTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount_crypto)],
+    },
+    fallbacks=[CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")]
+)
+app_telegram.add_handler(payment_conv, group=15)
+app_telegram.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_\d+$"), group=15)
+
 # === Boutons simples ===
 app_telegram.add_handler(CallbackQueryHandler(callback_show_my_id,    pattern="^show_my_id$"))
-app_telegram.add_handler(CallbackQueryHandler(add_balance_start,      pattern="^add_balance$"))
 app_telegram.add_handler(CallbackQueryHandler(choose_lang,            pattern="^choose_lang$"))
 app_telegram.add_handler(CallbackQueryHandler(set_lang_fr,            pattern="^set_lang_fr$"))
 app_telegram.add_handler(CallbackQueryHandler(set_lang_en,            pattern="^set_lang_en$"))
