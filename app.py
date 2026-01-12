@@ -1,4 +1,6 @@
 import re
+import base58
+from bip_utils import Bip32Secp256k1, P2WPKHAddr
 import sqlite3
 from hdwallet import HDWallet
 from hdwallet.cryptocurrencies import Bitcoin as BTC
@@ -23,9 +25,15 @@ from dotenv import load_dotenv
 from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
-from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup)
-from telegram.ext import (Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes, CallbackQueryHandler)
 
+
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters,
+    ConversationHandler, ContextTypes, CallbackQueryHandler
+)
 # ================= SECURITY HEARTBEAT =================
 # Ton lien Healthchecks personnel
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
@@ -1406,35 +1414,59 @@ def get_btc_price_cad():
     except:
         return 135000.0 
 
-def generate_address(user_id: int, order_id: int) -> str:
-    """Génère une adresse BTC (Segwit) unique pour la commande."""
-    if not ADMIN_XPUB:
-        return "ERREUR_NO_XPUB"
-    
+def zpub_to_xpub(zpub: str) -> str:
+    """Convertit une clé zpub (Electrum) en xpub (Standard) pour compatibilité."""
     try:
-        # 1. Nettoyage de la clé
-        clean_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
+        if not zpub.startswith("zpub"):
+            return zpub
+        data = base58.b58decode_check(zpub)
+        # Remplace le préfixe zpub (04b24746) par xpub (0488b21e)
+        prefix_xpub = b'\x04\x88\xB2\x1E'
+        data = prefix_xpub + data[4:]
+        return base58.b58encode_check(data).decode()
+    except Exception as e:
+        logger.error(f"Erreur conversion zpub: {e}")
+        return zpub
+
+def generate_address(user_id: int, order_id: int) -> str:
+    """Génère une adresse BTC via Bip32Secp256k1 (Force Brute)."""
+    if not ADMIN_XPUB: return "ERREUR_NO_XPUB"
+    try:
+        # 1. Nettoyage et Conversion ZPUB -> XPUB
+        raw_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
+        if raw_key.startswith("zpub"):
+            try:
+                data = base58.b58decode_check(raw_key)
+                data = b'\x04\x88\xB2\x1E' + data[4:]
+                raw_key = base58.b58encode_check(data).decode()
+            except: pass 
+            
+        # 2. Dérivation Bas Niveau (Bip32 pur)
+        # On contourne les vérifications de profondeur qui bloquaient avant
+        ctx = Bip32Secp256k1.FromExtendedKey(raw_key)
         
-        # 2. Initialisation (Version corrigée pour la nouvelle librairie)
-        hdwallet = HDWallet(cryptocurrency=BTC)
-        hdwallet.from_xpublic_key(clean_key)
+        # Chemin : /0 (Chaîne externe) / order_id (Index commande)
+        addr_ctx = ctx.ChildKey(0).ChildKey(order_id)
         
-        # 3. Chemin de dérivation (SANS 'm/')
-        # "m/" est interdit avec une xpub/zpub. On utilise un chemin relatif.
-        hdwallet.from_path(f"0/{order_id}")
-        
-        # 4. Retourne l'adresse
-        return hdwallet.p2wpkh_address()
+        # 3. Encodage Segwit (bc1q)
+        # C'est ici qu'on applique le correctif "hrp='bc'" qui a sauvé la mise
+        pub_key_bytes = addr_ctx.PublicKey().RawCompressed().ToBytes()
+        return P2WPKHAddr.EncodeKey(pub_key_bytes, hrp="bc")
         
     except Exception as e:
-        logger.error(f"CRASH ADRESSE: {e}")
+        logger.error(f"CRASH FORCE: {e}")
         return f"ERR: {str(e)}"
 
 def check_payment_status(address: str):
     try:
         r = requests.get(f"https://mempool.space/api/address/{address}", timeout=10)
         data = r.json()
-        satoshis = data['chain_stats']['funded_txo_sum'] + data['mempool_stats']['funded_txo_sum']
+        
+        # --- SÉCURITÉ : 1 CONFIRMATION MINIMUM ---
+        # chain_stats = L'argent est gravé dans un bloc (Confirmé)
+        # On ignore mempool_stats (Non confirmé / Risque d'arnaque RBF)
+        satoshis = data['chain_stats']['funded_txo_sum']
+        
         return satoshis / 100_000_000
     except:
         return 0.0
@@ -1531,7 +1563,16 @@ async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
         await show_main_menu(q.from_user.id)
     else:
         con.close()
-        await q.message.reply_text(f"⏳ **En attente...**\nReçu: {received:.8f} BTC\nAttendu: {expected:.8f} BTC", quote=True)
+        # Message rassurant
+        await q.message.reply_text(
+            f"⏳ **Paiement détecté, en attente de validation...**\n"
+            f"Reçu: {received:.8f} BTC\n"
+            f"Attendu: {expected:.8f} BTC\n\n"
+            f"⚠️ **Note :** La Blockchain Bitcoin nécessite environ ~10 minutes pour confirmer une transaction. Réessayez ce bouton dans quelques minutes.",
+            quote=True,
+            parse_mode="Markdown"
+        )
+        
 async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
