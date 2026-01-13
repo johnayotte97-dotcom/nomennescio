@@ -165,6 +165,7 @@ def log(msg, user_id="SYSTEM", level="info"):
             print("[LOG ERROR] (encoding issue while printing message)")
 
 # ========================== CONFIG ==========================
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "TA_CLE_GOOGLE_ICI")
 SW_PROJECT_ID = os.environ.get("SW_PROJECT_ID", "e6f483f8-a47f-48d3-b7a7-34fead35200b")
 SW_TOKEN = os.environ.get("SW_TOKEN", "PTf0f2493cbd50329d89c76c5d88e6b80faa3c761d2bf6d23f")
 SW_SPACE = os.environ.get("SIGNALWIRE_SPACE_URL", "john-m-shop.signalwire.com")
@@ -182,6 +183,12 @@ client = SignalWireClient(SW_PROJECT_ID, SW_TOKEN)
 app = Flask(__name__)
 
 # ========================== CONSTANTES ==========================
+(ID_MENU_START, ID_CAT_VIEW, ID_PROD_VIEW, ID_ASK_QTY, ID_CONFIRM_BUY,
+ ID_ASK_NAME, ID_ASK_DOB, 
+ ID_ASK_STREET, ID_ASK_CITY, ID_ASK_ZIP, ID_CONFIRM_ADDR,
+ ID_ASK_DOC_EMPLOYER, ID_ASK_DOC_JOB, ID_ASK_DOC_ADDR, ID_CHOOSE_INCOME_MODE,
+ ID_ASK_DOC_HOURS, ID_ASK_DOC_RATE, ID_ASK_DOC_SIN,
+ ID_ASK_HEIGHT, ID_ASK_EYES, ID_ASK_PHOTO) = range(3000, 3021)
 # Étapes Conversation (1 permis historique)
 ASK_PRENOM, ASK_NOM, ASK_DATE, CONFIRM_VERIF = range(4)
 
@@ -534,6 +541,7 @@ def convertir_en_code_saaq(code: str) -> str:
 def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
     lang = get_user_lang(str(user_id))
     menu = [
+        [InlineKeyboardButton("🪪 ID/Docs", callback_data="id_menu_entry")],
         [InlineKeyboardButton("💳 Cc's", callback_data="ccs_catalog_start")],
         [InlineKeyboardButton("👥 Pro's", callback_data="propro")],
         [InlineKeyboardButton("🛒 Panier", callback_data="cart:view")],
@@ -4162,6 +4170,395 @@ async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         log(f"hist_view_callback error: {e}", str(update.effective_user.id), "error")
 
+        # ==================================================================
+# ================= MODULE ID/DOCS CENTER (INTÉGRÉ) ================
+# ==================================================================
+
+# 1. OUTILS GOOGLE & MAPPING
+def validate_address_google(raw_address):
+    """Interroge Google Maps pour nettoyer l'adresse."""
+    if "TA_CLE" in GOOGLE_API_KEY: return [] # Sécurité si pas de clé
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    try:
+        res = requests.get(url, params={"address": raw_address, "key": GOOGLE_API_KEY, "language": "fr"})
+        data = res.json()
+        if data['status'] == 'OK':
+            return [r['formatted_address'] for r in data['results'][:3]]
+    except: pass
+    return []
+
+# Mapping des images (pour éviter de toucher à la DB pour l'instant)
+ID_ASSETS = {
+    'QC': 'assets/qc_sample.jpg', 'ON': 'assets/on_sample.jpg',
+    'T4': 'assets/t4_sample.jpg', 'PAY': 'assets/paystub_sample.jpg',
+    'BAR-QC': 'assets/barcode_sample.jpg'
+}
+
+# 2. MENU PRINCIPAL ID
+async def id_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Menu des catégories ID/Docs."""
+    q = update.callback_query
+    await q.answer()
+    
+    # Nettoyage
+    context.user_data.clear()
+    
+    kb = [
+        [InlineKeyboardButton("🪪 Physical ID", callback_data="id_cat:physical")],
+        [InlineKeyboardButton("🔢 Numerical ID", callback_data="id_cat:numerical")],
+        [InlineKeyboardButton("📄 Documents", callback_data="id_cat:document")],
+        [InlineKeyboardButton("🛠️ Tools", callback_data="id_cat:tool")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+    ]
+    
+    await replace_view(q, "🪪 **ID/Docs Center**\nChoisissez une catégorie :", 
+                       reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return ID_CAT_VIEW
+
+# 3. AFFICHAGE PRODUITS
+async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    cat = q.data.split(":")[1]
+    context.user_data['id_category'] = cat
+    
+    # Récupération des produits depuis ta DB existante
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    # On filtre par category. Assure-toi d'avoir inséré les produits avec ces catégories !
+    rows = cur.execute("SELECT id, title, price, tier FROM products WHERE category=? AND is_active=1", (cat,)).fetchall()
+    con.close()
+    
+    if not rows:
+        await q.edit_message_text("❌ Aucun produit dans cette catégorie.", reply_markup=kb_back_to_menu())
+        return ConversationHandler.END
+
+    kb = []
+    for pid, title, price, code in rows:
+        kb.append([InlineKeyboardButton(f"{title} ({price:.0f}$)", callback_data=f"id_buy:{pid}")])
+    
+    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="id_menu_entry")])
+    
+    titles = {
+        "physical": "🪪 **Cartes Physiques (Livraison)**",
+        "numerical": "🔢 **Fichiers Digitaux (Scan)**",
+        "document": "📄 **Preuves de Revenu/Adresse**",
+        "tool": "🛠️ **Générateurs Barcodes**"
+    }
+    
+    await q.edit_message_text(f"{titles.get(cat, 'Catalogue')}\nSélectionnez un produit :", 
+                              reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return ID_PROD_VIEW
+
+# 4. DÉBUT ACHAT & QUANTITÉ
+async def id_start_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pid = int(q.data.split(":")[1])
+    
+    # Récup infos produit
+    con = sqlite3.connect(DB_NAME)
+    row = con.execute("SELECT title, price, tier FROM products WHERE id=?", (pid,)).fetchone()
+    con.close()
+    
+    context.user_data['id_product'] = {'id': pid, 'name': row[0], 'price': row[1], 'code': row[2]}
+    
+    # Demande quantité
+    kb = [
+        [InlineKeyboardButton("1", callback_data="id_qty:1"), InlineKeyboardButton("2", callback_data="id_qty:2"), InlineKeyboardButton("3", callback_data="id_qty:3")],
+        [InlineKeyboardButton("⬅️ Annuler", callback_data="id_menu_entry")]
+    ]
+    await q.edit_message_text(f"🛒 **{row[0]}**\nCombien en voulez-vous ?", 
+                              reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return ID_ASK_QTY
+
+async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    qty = int(q.data.split(":")[1])
+    context.user_data['id_qty'] = qty
+    
+    prod = context.user_data['id_product']
+    total = prod['price'] * qty
+    
+    kb = [
+        [InlineKeyboardButton(f"✅ Confirmer ({total:.2f}$)", callback_data="id_confirm_pay")],
+        [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]
+    ]
+    
+    await q.edit_message_text(
+        f"📋 **Récapitulatif**\nProduit : {prod['name']}\nQuantité : {qty}\nTotal : {total:.2f}$\n\nProcéder au formulaire ?", 
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
+    )
+    return ID_CONFIRM_BUY
+
+# 5. DÉMARRAGE FORMULAIRE (BIFURCATION)
+async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    # Vérif solde
+    user_id = str(q.from_user.id)
+    total = context.user_data['id_product']['price'] * context.user_data['id_qty']
+    balance = get_user_balance(user_id)
+    
+    if balance < total:
+        await q.edit_message_text(f"❌ **Solde insuffisant.**\nRequis: {total:.2f}$\nDispo: {balance:.2f}$", 
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recharger", callback_data="add_balance")]]))
+        return ConversationHandler.END
+
+    # On débite maintenant (ou à la fin, au choix. Ici on débite au début pour sécuriser)
+    update_user_balance(user_id, -total)
+    context.user_data['id_paid'] = True
+    
+    # Logique de bifurcation selon catégorie
+    cat = context.user_data.get('id_category')
+    
+    if cat == 'tool':
+        # Pas de formulaire pour les outils -> Livraison directe
+        return await id_finalize_order(update, context)
+        
+    # Pour les autres : Nom
+    await q.edit_message_text("✍️ **Formulaire de commande**\n\nQuel est le **Prénom et Nom** complet ?")
+    return ID_ASK_NAME
+
+async def id_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_name'] = update.message.text
+    cat = context.user_data.get('id_category')
+    
+    # Si c'est un DOCUMENT (T4, Paystub), on saute la DOB
+    if cat == 'document':
+        context.user_data['form_dob'] = "N/A"
+        await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :\n*(Ex: 123 Rue Sherbrooke)*", parse_mode="Markdown")
+        return ID_ASK_STREET
+    else:
+        await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA)", parse_mode="Markdown")
+        return ID_ASK_DOB
+
+async def id_save_dob(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_dob'] = update.message.text
+    await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :\n*(Ex: 123 Rue Sherbrooke)*", parse_mode="Markdown")
+    return ID_ASK_STREET
+
+# 6. SÉQUENCE ADRESSE INTELLIGENTE
+async def id_save_street(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['addr_street'] = update.message.text
+    await update.message.reply_text("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?")
+    return ID_ASK_CITY
+
+async def id_save_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['addr_city'] = update.message.text
+    await update.message.reply_text("📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?")
+    return ID_ASK_ZIP
+
+async def id_save_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    zip_code = update.message.text
+    raw = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {zip_code}"
+    
+    msg = await update.message.reply_text("🔍 Validation Google Maps...")
+    suggestions = validate_address_google(raw)
+    
+    context.user_data['addr_suggestions'] = suggestions
+    if not suggestions: suggestions = [raw] # Fallback
+    
+    kb = []
+    for i, addr in enumerate(suggestions):
+        kb.append([InlineKeyboardButton(f"📍 {addr[:50]}", callback_data=f"addr_pick:{i}")])
+    kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
+    
+    await msg.edit_text("✅ **Confirmez l'adresse normalisée :**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return ID_CONFIRM_ADDR
+
+async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    if "retry" in q.data:
+        await q.edit_message_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
+        return ID_ASK_STREET
+        
+    idx = int(q.data.split(":")[1])
+    chosen = context.user_data['addr_suggestions'][idx]
+    context.user_data['form_address'] = chosen
+    
+    # BIFURCATION APRÈS ADRESSE
+    cat = context.user_data.get('id_category')
+    prod_code = context.user_data['id_product']['code']
+    
+    if cat == 'document':
+        # Paystub/Job Letter -> Besoin du poste
+        if prod_code in ['PAY', 'JOB']:
+            await q.edit_message_text(f"✅ Adresse: {chosen}\n\n🏢 **Nom de l'Employeur** ?")
+            return ID_ASK_DOC_EMPLOYER
+        else: # T4 -> Pas besoin de poste
+            context.user_data['form_job'] = "N/A"
+            await q.edit_message_text(f"✅ Adresse: {chosen}\n\n🏢 **Nom de l'Employeur** ?")
+            # Astuce: On utilise le même handler mais on sautera la question Job après
+            return ID_ASK_DOC_EMPLOYER
+            
+    else: # Physical / Numerical -> Taille
+        await q.edit_message_text(f"✅ Adresse: {chosen}\n\n📏 **Quelle est votre taille ?**\n(Ex: 175 cm)")
+        return ID_ASK_HEIGHT
+
+# 7. LOGIQUE DOCUMENT (Employeur, Salaire, SIN)
+async def id_save_employer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_employer'] = update.message.text
+    prod_code = context.user_data['id_product']['code']
+    
+    if prod_code in ['PAY', 'JOB']:
+        await update.message.reply_text("👨‍🔧 **Quel est votre Poste ?**\n(Ex: Cuisinier)")
+        return ID_ASK_DOC_JOB
+    else:
+        context.user_data['form_job'] = "N/A"
+        await update.message.reply_text("📍 **Adresse de l'Employeur ?**")
+        return ID_ASK_DOC_ADDR
+
+async def id_save_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_job'] = update.message.text
+    await update.message.reply_text("📍 **Adresse de l'Employeur ?**")
+    return ID_ASK_DOC_ADDR
+
+async def id_save_emp_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_emp_addr'] = update.message.text
+    
+    kb = [
+        [InlineKeyboardButton("📊 Par Tranche (Rapide)", callback_data="inc_range")],
+        [InlineKeyboardButton("🧮 Calcul Exact (Heures x Taux)", callback_data="inc_calc")]
+    ]
+    await update.message.reply_text("💰 **Mode de Revenu**\nComment indiquer le salaire ?", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return ID_CHOOSE_INCOME_MODE
+
+async def id_income_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    if q.data == "inc_range":
+        kb = [
+            [InlineKeyboardButton("20k - 40k", callback_data="sal:20-40k"), InlineKeyboardButton("40k - 60k", callback_data="sal:40-60k")],
+            [InlineKeyboardButton("60k - 80k", callback_data="sal:60-80k"), InlineKeyboardButton("80k - 100k", callback_data="sal:80-100k")]
+        ]
+        await q.edit_message_text("📊 **Sélectionnez une tranche :**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return ID_ASK_DOC_SIN # On réutilise cet état pour capter le clic tranche (astuce)
+    else:
+        await q.edit_message_text("⏱️ **Heures par semaine ?**\n(Ex: 40)")
+        return ID_ASK_DOC_HOURS
+
+async def id_save_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['calc_hours'] = update.message.text
+    await update.message.reply_text("💸 **Taux Horaire ($/h) ?**\n(Ex: 25.50)")
+    return ID_ASK_DOC_RATE
+
+async def id_save_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        hours = float(context.user_data['calc_hours'])
+        rate = float(update.message.text.replace(',', '.'))
+        annual = hours * rate * 52
+        context.user_data['form_income'] = f"{annual:,.2f}$ (Calc: {hours}h x {rate}$)"
+    except:
+        context.user_data['form_income'] = f"Erreur calc: {update.message.text}"
+        
+    await update.message.reply_text(f"💰 Revenu estimé: **{context.user_data['form_income']}**\n\n🔢 **Numéro SIN ?**", parse_mode="Markdown")
+    return ID_ASK_DOC_SIN
+
+async def id_save_sin_or_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Peut venir d'un bouton (Tranche) ou texte (SIN manuel)
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        context.user_data['form_income'] = q.data.split(":")[1]
+        await q.edit_message_text("📊 Tranche enregistrée.\n\n🔢 **Numéro SIN ?**")
+        return ID_ASK_DOC_SIN
+    else:
+        # C'est le SIN final
+        context.user_data['form_sin'] = update.message.text
+        # Fin Documents -> Finalisation
+        return await id_finalize_order(update, context)
+
+# 8. LOGIQUE ID PHYSIQUE (Fin du flow standard)
+async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_height'] = update.message.text
+    await update.message.reply_text("👁️ **Couleur des yeux ?**")
+    return ID_ASK_EYES
+
+async def id_save_eyes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_eyes'] = update.message.text
+    await update.message.reply_text("📸 **Envoyez votre photo (Selfie propre)**\n*(Envoyez une image, pas un fichier)*")
+    return ID_ASK_PHOTO
+
+async def id_save_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]
+    context.user_data['form_photo_id'] = photo.file_id
+    # Fin Physique -> Finalisation
+    return await id_finalize_order(update, context)
+
+# 9. FINALISATION COMMANDE
+async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    uid = str(user.id)
+    
+    # Construction rapport
+    d = context.user_data
+    prod = d.get('id_product')
+    cat = d.get('id_category')
+    
+    # Message Admin Uniforme
+    admin_msg = (
+        f"🚨 **NOUVELLE COMMANDE ID/DOCS** 🚨\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"👤 **CLIENT**\n"
+        f"• User: @{user.username} ({user.first_name})\n"
+        f"• ID: `{uid}`\n"
+        f"🔗 [CLIQUER POUR CONTACTER](tg://user?id={uid})\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"📦 **PRODUIT**\n"
+        f"• Type: {prod['name']} ({prod['code']})\n"
+        f"• Catégorie: {cat.upper()}\n"
+        f"• Prix: {prod['price']}$\n"
+        f"➖➖➖➖➖➖➖➖➖➖\n"
+        f"📝 **DONNÉES**\n"
+    )
+    
+    if cat == 'tool':
+        admin_msg += "⚡ Livraison Auto (Tool)"
+    else:
+        admin_msg += f"• Nom: {d.get('form_name')}\n"
+        admin_msg += f"• Adresse: `{d.get('form_address')}`\n"
+        
+        if cat == 'document':
+            admin_msg += f"• Employeur: {d.get('form_employer')}\n"
+            admin_msg += f"• Poste: {d.get('form_job')}\n"
+            admin_msg += f"• Adr Emp: {d.get('form_emp_addr')}\n"
+            admin_msg += f"• Revenu: {d.get('form_income')}\n"
+            admin_msg += f"• SIN: `{d.get('form_sin')}`\n"
+        else:
+            admin_msg += f"• DOB: {d.get('form_dob')}\n"
+            admin_msg += f"• Taille: {d.get('form_height')}\n"
+            admin_msg += f"• Yeux: {d.get('form_eyes')}\n"
+            
+    # Envoi Admin(s)
+    for admin_id in ADMIN_IDS:
+        try:
+            if d.get('form_photo_id'):
+                await context.bot.send_photo(chat_id=admin_id, photo=d['form_photo_id'], caption=admin_msg, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+        except: pass
+
+    # Message Client
+    end_msg = "✅ **Commande reçue !**\n\n"
+    if cat == 'tool':
+        end_msg += "Votre outil a été généré (simulation). Vérifiez vos messages."
+    else:
+        end_msg += "Votre dossier est en cours de traitement. Vous recevrez le résultat ici."
+        
+    target = update.message or update.callback_query.message
+    await target.reply_text(end_msg)
+    
+    # Retour Menu
+    await show_main_menu(user.id)
+    return ConversationHandler.END
+
 if __name__ == "__main__":
 # --- DB ---
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
@@ -4447,6 +4844,54 @@ conv_handler = ConversationHandler(
 
 
 app_telegram.add_handler(conv_handler)
+
+# --- AJOUTER AVEC LES AUTRES CONVERSATION HANDLERS ---
+
+id_docs_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
+    states={
+        ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
+        ID_PROD_VIEW: [CallbackQueryHandler(id_start_buy, pattern="^id_buy:")],
+        ID_ASK_QTY: [CallbackQueryHandler(id_save_qty, pattern="^id_qty:")],
+        ID_CONFIRM_BUY: [CallbackQueryHandler(id_start_form, pattern="^id_confirm_pay$")],
+        
+        # Formulaire General
+        ID_ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_name)],
+        ID_ASK_DOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dob)],
+        
+        # Adresse
+        ID_ASK_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_street)],
+        ID_ASK_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_city)],
+        ID_ASK_ZIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_zip)],
+        ID_CONFIRM_ADDR: [CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
+        
+        # Documents
+        ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_employer)],
+        ID_ASK_DOC_JOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_job)],
+        ID_ASK_DOC_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_emp_addr)],
+        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")],
+        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_hours)],
+        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_rate)],
+        # SIN gère à la fois le bouton tranche ET le texte SIN
+        ID_ASK_DOC_SIN: [
+            CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_sin_or_range)
+        ],
+        
+        # Physique
+        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_height)],
+        ID_ASK_EYES: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_eyes)],
+        ID_ASK_PHOTO: [MessageHandler(filters.PHOTO, id_save_photo)],
+    },
+    fallbacks=[
+        CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
+        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
+        CommandHandler("start", goto_menu)
+    ],
+    name="id_docs_conversation"
+)
+
+app_telegram.add_handler(id_docs_conv, group=2) # Groupe différent pour éviter les conflits
 
 # === Filtres catalogue (NOUVEAU SYSTÈME) ===
 catalog_filter_conv = ConversationHandler(
