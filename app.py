@@ -165,7 +165,8 @@ def log(msg, user_id="SYSTEM", level="info"):
             print("[LOG ERROR] (encoding issue while printing message)")
 
 # ========================== CONFIG ==========================
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "TA_CLE_GOOGLE_ICI")
+FAKEID_API_KEY = os.environ.get("FAKEID_API_KEY", "7a460685-7635-499d-90e1-8c859d04ba55")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyDcCG1bOF6d5kHOJce1__zFfNux-dAKoVI")
 SW_PROJECT_ID = os.environ.get("SW_PROJECT_ID", "e6f483f8-a47f-48d3-b7a7-34fead35200b")
 SW_TOKEN = os.environ.get("SW_TOKEN", "PTf0f2493cbd50329d89c76c5d88e6b80faa3c761d2bf6d23f")
 SW_SPACE = os.environ.get("SIGNALWIRE_SPACE_URL", "john-m-shop.signalwire.com")
@@ -176,6 +177,7 @@ DESTINATION_NUMBER = os.environ.get("DESTINATION_NUMBER", "+18003617620")
 SIGNALWIRE_NUMBER = os.environ.get("SIGNALWIRE_NUMBER", "+12029928463")
 SERVER_URL = os.environ.get("SERVER_URL", "http://37.228.129.82:5001")
 ADMIN_IDS = ["7573645008", "8409831904"]
+CHANNEL_LOGS = "-1003589564052"
 
 DB_NAME = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
 
@@ -188,7 +190,11 @@ app = Flask(__name__)
  ID_ASK_STREET, ID_ASK_CITY, ID_ASK_ZIP, ID_CONFIRM_ADDR,
  ID_ASK_DOC_EMPLOYER, ID_ASK_DOC_JOB, ID_ASK_DOC_ADDR, ID_CHOOSE_INCOME_MODE,
  ID_ASK_DOC_HOURS, ID_ASK_DOC_RATE, ID_ASK_DOC_SIN,
- ID_ASK_HEIGHT, ID_ASK_EYES, ID_ASK_PHOTO) = range(3000, 3021)
+ ID_ASK_HEIGHT, ID_ASK_EYES, ID_ASK_PHOTO,
+ # --- NOUVELLES ÉTAPES AJOUTÉES ---
+ ID_ASK_LASTNAME, ID_ASK_ISSUE, ID_ASK_EXPIRY, 
+ ID_ASK_DL_NUM, ID_ASK_REF_NUM, ID_ASK_SEX, ID_CONFIRM_SUMMARY
+ ) = range(3000, 3028) # On augmente le range à 3028
 # Étapes Conversation (1 permis historique)
 ASK_PRENOM, ASK_NOM, ASK_DATE, CONFIRM_VERIF = range(4)
 
@@ -199,6 +205,7 @@ ASK_QTY, ASK_MODE, MANUAL_PRENOM, MANUAL_NOM, MANUAL_DATE, CSV_WAIT, BULK_CONFIR
 ADMIN_AWAIT_AMOUNT = 200
 ADMIN_WAIT_PRODUCT_TEXT = 201
 ADMIN_WAIT_CSV = 202
+ADMIN_WAIT_SEARCH_ID = 203
 HISTORY_FILTER_CHOICE, HISTORY_FILTER_INPUT = range(300, 302)
 ADMIN_IVR_AWAIT_VALUE = 400 # Nouvelle constante
 IVR_TIMINGS_FILE = "ivr_timings.json"
@@ -606,7 +613,7 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     
-    # 1. Construction des conditions (WHERE)
+    # 1. Construction des conditions
     conditions = ["category=?", "is_active=1", "stock>0"]
     params = [category]
     
@@ -616,50 +623,66 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
         
     if filters:
         if filters.get('name'):
-            conditions.append("title LIKE ?")
+            conditions.append("(title LIKE ? OR content LIKE ?)")
             params.append(f"%{filters['name']}%")
+            params.append(f"%{filters['name']}%")
+            
         if filters.get('city'):
-            conditions.append("title LIKE ?")
+            conditions.append("(title LIKE ? OR content LIKE ?)")
             params.append(f"%{filters['city']}%")
+            params.append(f"%{filters['city']}%")
+            
         if filters.get('year'):
-            conditions.append("title LIKE ?")
-            params.append(f"%{filters['year']}%")
+            # CORRECTION : On cherche dans le titre OU le contenu
+            conditions.append("(title LIKE ? OR content LIKE ?)")
+            params.append(f"%{filters['year']}%") # Pour le titre
+            params.append(f"%{filters['year']}%") # Pour le contenu
+            
         if filters.get('price'):
             try:
                 conditions.append("price <= ?")
                 params.append(float(filters['price']))
             except: pass
+            
         if filters.get('base'):
             conditions.append("tier LIKE ?")
             params.append(f"%{filters['base']}%")
+            
         if filters.get('bins'):
              conditions.append("content LIKE ?")
              params.append(f"%CC: {filters['bins']}%")
 
     where_sql = " AND ".join(conditions)
 
-    # 2. COMPTAGE RAPIDE (Ne lit PAS le contenu lourd, juste les lignes)
-    count_query = f"SELECT COUNT(*) FROM products WHERE {where_sql}"
-    cur.execute(count_query, params)
-    total_count = cur.fetchone()[0]
+    try:
+        # 2. Comptage
+        count_query = f"SELECT COUNT(*) FROM products WHERE {where_sql}"
+        cur.execute(count_query, params)
+        total_count = cur.fetchone()[0]
 
-    # 3. RÉCUPÉRATION LÉGÈRE (Seulement les 2 produits demandés)
-    data_query = f"SELECT id, title, price, currency, stock, tier, content FROM products WHERE {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
-    data_params = params + [per_page, page * per_page]
-    
-    rows = cur.execute(data_query, data_params).fetchall()
-    con.close()
-
-    # 4. Formatage
-    prods = []
-    for (pid, title, price, currency, stock, ptier, content) in rows:
-        prods.append({
-            "id": pid, "title": title, "price": float(price or 0),
-            "currency": currency or "CAD", "stock": stock, 
-            "tier": ptier, "category": category, "content": content
-        })
+        # 3. Récupération
+        data_query = f"SELECT id, title, price, currency, stock, tier, content FROM products WHERE {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
+        data_params = params + [per_page, page * per_page]
         
-    return prods, total_count
+        rows = cur.execute(data_query, data_params).fetchall()
+        con.close()
+
+        # 4. Formatage
+        prods = []
+        for (pid, title, price, currency, stock, ptier, content) in rows:
+            prods.append({
+                "id": pid, "title": title, "price": float(price or 0),
+                "currency": currency or "CAD", "stock": stock, 
+                "tier": ptier, "category": category, "content": content
+            })
+            
+        return prods, total_count
+
+    except Exception as e:
+        print(f"Erreur SQL Search: {e}")
+        try: con.close()
+        except: pass
+        return [], 0
 
 def _fmt_price(p):
     try:
@@ -688,13 +711,14 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         chat_id = query.message.chat_id
         try: await query.answer()
         except: pass
+        # On supprime l'ancien menu proprement
         if not from_filter:
             try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
             except: pass
     else:
         chat_id = update.effective_chat.id
 
-    # 1. Nettoyage des anciens messages pour éviter les doublons
+    # Nettoyage des vieux messages
     try:
         msgs_to_del = []
         if from_filter:
@@ -703,22 +727,86 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         else:
             msgs_to_del += CATALOG_MSGS.pop(chat_id, [])
             msgs_to_del += context.user_data.pop("filter_msgs", [])
-            msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
             
         for mid in set(msgs_to_del):
             try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             except: pass
     except: pass
 
-    # 2. Récupération optimisée (LIMIT/OFFSET SQL)
-    filters = context.user_data.get('active_filters', {})
-    PER_PAGE = 2
-    chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
-    
+    # Récupération sécurisée
+    try:
+        filters = context.user_data.get('active_filters', {})
+        PER_PAGE = 2
+        chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Erreur de recherche: {e}")
+        return
+
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     
     sent_ids = []
+
+    # Si vide
+    if not chunk:
+        text = "❌ Aucun produit trouvé."
+        if from_filter:
+            kb = _build_filter_menu(context, page_info=None)
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
+            
+        m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        if from_filter: context.user_data['filter_msgs'] = [m.message_id]
+        else: CATALOG_MSGS[chat_id] = [m.message_id]
+        return
+
+    # Affichage des produits (SÉCURISÉ)
+    for p in chunk:
+        title = p.get('title', 'Produit')
+        price = p.get('price', 0.0)
+        base = p.get('tier', 'N/A')
+        
+        # On nettoie les caractères Markdown qui font planter
+        safe_title = title.replace("*", "").replace("_", "").replace("`", "")
+        safe_base = base.replace("*", "").replace("_", "")
+        
+        txt = f"📦 *PROPRO*\n━━━━━━━━━━━━━━━\n👤 **NOM** : `{safe_title}`\n📂 **BASE** : `{safe_base}`\n💰 **PRIX** : `{price:.2f} CAD`"
+        
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"),
+            InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}")
+        ]])
+        
+        try:
+            m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
+            sent_ids.append(m.message_id)
+        except Exception as e:
+            # Si Markdown plante, on envoie en texte brut (Plan B)
+            clean_txt = txt.replace("*", "").replace("`", "")
+            try:
+                m = await context.bot.send_message(chat_id=chat_id, text=clean_txt, reply_markup=kb)
+                sent_ids.append(m.message_id)
+            except: pass
+
+    # Menu de navigation
+    if from_filter:
+        context.user_data['filter_fiches_msg_ids'] = sent_ids
+        kb = _build_filter_menu(context, page_info={'page': page, 'total_pages': total_pages})
+        m = await context.bot.send_message(chat_id=chat_id, text=f"🔎 Filtres actifs ({total_items} résultats)", reply_markup=kb)
+        context.user_data['filter_msgs'] = [m.message_id]
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
+            [
+                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"),
+                InlineKeyboardButton(f"{page+1} / {total_pages}", callback_data="noop"),
+                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}"),
+            ],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+        ])
+        m = await context.bot.send_message(chat_id=chat_id, text=f"📊 Catalogue ({total_items} produits)", reply_markup=kb)
+        sent_ids.append(m.message_id)
+        CATALOG_MSGS[chat_id] = sent_ids
 
     # 3. Si aucun produit n'est trouvé
     if not chunk:
@@ -3401,61 +3489,120 @@ async def admin_prod_del_confirm(update: Update, context: ContextTypes.DEFAULT_T
 
 # REMPLACE la fonction admin_users (ligne 1618) par CELLE-CI :
 
+def get_users_paginated(page=0, per_page=10):
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # Compte total
+    cur.execute("SELECT COUNT(*) FROM users")
+    total = cur.fetchone()[0]
+    
+    # Récupération de la page
+    offset = page * per_page
+    cur.execute("""
+        SELECT telegram_id, balance, forfait, total_recharge 
+        FROM users 
+        ORDER BY rowid DESC 
+        LIMIT ? OFFSET ?
+    """, (per_page, offset))
+    rows = cur.fetchall()
+    con.close()
+    return rows, total
+
+
+
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Guard admin
     if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
+        await update.callback_query.answer("Accès refusé.")
         return
+    
     q = update.callback_query
-    try:
-        await q.answer()
-
-        users = get_users()
-        kb_back_admin = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
-
-        if not users:
-            # CORRIGÉ: Utilise replace_view et ajoute un bouton Retour
-            await replace_view(q, "Aucun utilisateur trouvé / No user found.", reply_markup=kb_back_admin)
-            return
-
-        keyboard = []
-        for u in users:
-            tid   = str(u[0])
-            bal   = float(u[1] or 0.0)
-            trec  = float(u[3] or 0.0)
-            tier  = (u[4] or 'bronze')
-            label_tier = FORFAITS.get(tier, {}).get('label', tier)
-            label = f"ID:{tid[-5:]} | {label_tier} | {bal:.2f}$ | Ajouté: {trec:.2f}$"
-            keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_adjust_{tid}")])
-
-        # Évite les messages trop gros
-        if not keyboard:
-            await replace_view(q, "Aucun utilisateur trouvé / No user found.", reply_markup=kb_back_admin)
-            return
-        if len(keyboard) > 80:
-            keyboard = keyboard[:80]
-        
-        # CORRIGÉ: Ajoute le bouton Retour au clavier
-        keyboard.append([InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")])
-
-        # CORRIGÉ: Utilise replace_view au lieu de reply_text
-        await replace_view(
-            q,
-            "Clique un utilisateur pour ajuster son solde :",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    except Exception as e:
-        log(f"admin_users error: {e}", str(update.effective_user.id), "error")
+    await q.answer()
+    
+    # Récupération de la page depuis le bouton (ex: "admin_users:page:2")
+    page = 0
+    data = q.data
+    if ":page:" in data:
         try:
-            # CORRIGÉ: Utilise replace_view pour le message d'erreur
-            await replace_view(
-                q, 
-                "⚠️ Erreur lors du chargement des utilisateurs.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
-            )
-        except: pass
+            page = int(data.split(":page:")[1])
+        except:
+            page = 0
+            
+    # Récupération des données (10 par page)
+    users, total_count = get_users_paginated(page, 10)
+    total_pages = max(1, (total_count + 9) // 10)
+    
+    if not users:
+        await replace_view(q, "Aucun utilisateur trouvé.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]]))
+        return
 
+    # Construction de la liste
+    keyboard = []
+    for u in users:
+        tid = str(u[0])
+        bal = float(u[1] or 0.0)
+        tier = (u[2] or 'bronze')
+        # --- ICI : ON AFFICHE L'ID COMPLET ---
+        label = f"🆔 {tid} | {tier.upper()} | {bal:.2f}$"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_adjust_{tid}")])
 
-# REMPLACE la fonction admin_adjust_user (ligne 1654) par CELLE-CI :
+    # Barre de Navigation
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Préc.", callback_data=f"admin_users:page:{page-1}"))
+    
+    nav_row.append(InlineKeyboardButton(f"{page+1} / {total_pages}", callback_data="noop"))
+    
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Suiv. ➡️", callback_data=f"admin_users:page:{page+1}"))
+        
+    if nav_row: keyboard.append(nav_row)
+    
+    # Boutons d'actions
+    keyboard.append([InlineKeyboardButton("🔍 Chercher un ID", callback_data="admin_search_user_start")])
+    keyboard.append([InlineKeyboardButton("🔙 Menu Admin", callback_data="admin_menu")])
+
+    await replace_view(
+        q, 
+        f"👥 **Gestion des Utilisateurs** ({total_count} total)\nPage {page+1}", 
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+# --- AJOUTE AUSSI CES DEUX FONCTIONS POUR LA RECHERCHE (JUSTE APRÈS) ---
+
+async def admin_search_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.message.reply_text("🔍 **Recherche**\nEntrez l'ID Telegram complet :")
+    return ADMIN_WAIT_SEARCH_ID
+
+async def admin_search_user_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    search_term = update.message.text.strip()
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT telegram_id FROM users WHERE telegram_id=?", (search_term,))
+    row = cur.fetchone()
+    con.close()
+    
+    if row:
+        # On simule l'ouverture du menu d'ajustement pour cet ID
+        telegram_id = row[0]
+        context.user_data["target_user"] = telegram_id
+        
+        # On affiche directement le menu d'ajustement (copie simplifiée de admin_adjust_user)
+        keyboard = [
+            [InlineKeyboardButton("+10$", callback_data=f"admin_adjval_{telegram_id}_10"), InlineKeyboardButton("+100$", callback_data=f"admin_adjval_{telegram_id}_100")],
+            [InlineKeyboardButton("-10$", callback_data=f"admin_adjval_{telegram_id}_-10"), InlineKeyboardButton("-100$", callback_data=f"admin_adjval_{telegram_id}_-100")],
+            [InlineKeyboardButton("Montant personnalisé", callback_data=f"admin_customamount_{telegram_id}")],
+            [InlineKeyboardButton("🔙 Liste", callback_data="admin_users")]
+        ]
+        await update.message.reply_text(f"✅ **Utilisateur {telegram_id}** trouvé.", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text("❌ ID introuvable. Réessayez ou /cancel.")
+        return ADMIN_WAIT_SEARCH_ID
 
 async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
@@ -4172,12 +4319,11 @@ async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # ==================================================================
 # ================= MODULE ID/DOCS CENTER (INTÉGRÉ) ================
-# ==================================================================
 
-# 1. OUTILS GOOGLE & MAPPING
+# 1. OUTILS GOOGLE & MAPPING & DATES
 def validate_address_google(raw_address):
     """Interroge Google Maps pour nettoyer l'adresse."""
-    if "TA_CLE" in GOOGLE_API_KEY: return [] # Sécurité si pas de clé
+    if "AIzaSyDcCG1bOF6d5kHOJce1__zFfNux-dAKoVI" in GOOGLE_API_KEY: return [] 
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     try:
         res = requests.get(url, params={"address": raw_address, "key": GOOGLE_API_KEY, "language": "fr"})
@@ -4187,22 +4333,86 @@ def validate_address_google(raw_address):
     except: pass
     return []
 
-# Mapping des images (pour éviter de toucher à la DB pour l'instant)
-ID_ASSETS = {
-    'QC': 'assets/qc_sample.jpg', 'ON': 'assets/on_sample.jpg',
-    'T4': 'assets/t4_sample.jpg', 'PAY': 'assets/paystub_sample.jpg',
-    'BAR-QC': 'assets/barcode_sample.jpg'
-}
+def parse_date_smart(text):
+    """Transforme '15 decembre 1990' ou '15/12/90' en '1990-12-15'."""
+    text = text.lower().strip()
+    mois = {
+        'janvier': '01', 'fevrier': '02', 'février': '02', 'mars': '03', 'avril': '04',
+        'mai': '05', 'juin': '06', 'juillet': '07', 'aout': '08', 'août': '08',
+        'septembre': '09', 'octobre': '10', 'novembre': '11', 'decembre': '12', 'décembre': '12',
+        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'may': '05', 'jun': '06',
+        'jul': '07', 'aug': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
+    }
+    for m_nom, m_chiffre in mois.items():
+        if m_nom in text:
+            text = text.replace(m_nom, m_chiffre)
+            break
+            
+    text = text.replace('/', '-').replace(' ', '-').replace('.', '-')
+    
+    try:
+        parts = text.split('-')
+        if len(parts[0]) == 4: # YYYY-MM-DD
+            dt = datetime.strptime(text, "%Y-%m-%d")
+        else: # DD-MM-YYYY
+            dt = datetime.strptime(text, "%d-%m-%Y")
+        return dt.strftime("%Y-%m-%d")
+    except:
+        return None
 
-# 2. MENU PRINCIPAL ID
+def generate_barcode_via_api(data_dict, province_code):
+    """Appelle FakeIdSolutions pour générer PDF417 et Code 128."""
+    base_url = "https://barcodes.fakeidsolutions.com/api/v2"
+    clean_code = province_code.replace('-D', '').replace('BAR-', '')
+    jurisdiction = f"CAN-{clean_code}" 
+    
+    # Payload optimisé avec champs séparés
+    payload = {
+        "jurisdiction": jurisdiction,
+        "revision": "", 
+        "save": "true",
+        "data[DAC]": data_dict.get('form_firstname', 'UNKNOWN'),
+        "data[DCS]": data_dict.get('form_lastname', 'UNKNOWN'),       
+        "data[DAQ]": data_dict.get('form_dl_number', 'N/A'),
+        "data[DCF]": data_dict.get('form_ref_number', 'N/A'),
+        "data[DBB]": data_dict.get('form_dob', '2000-01-01'),
+        "data[DBD]": data_dict.get('form_issue', '2023-01-01'),
+        "data[DBA]": data_dict.get('form_expiry', '2028-01-01'),
+        "data[DAG]": data_dict.get('form_street', '123 Rue Exemple'), 
+        "data[DAI]": data_dict.get('form_city', 'Montreal'),
+        "data[DAK]": data_dict.get('form_zip', 'H1A1A1'),
+        "data[DAJ]": "QC" if "QC" in jurisdiction else "ON",
+        "data[DBC]": data_dict.get('form_sex', '1'), 
+        "data[DAU]": data_dict.get('form_height', '175 cm').replace('cm', '').strip(),
+        "data[DAY]": data_dict.get('form_eyes', 'BRO')
+    }
+
+    headers = {"Authorization": f"Bearer {FAKEID_API_KEY}", "Accept": "image/png"}
+
+    try:
+        r1 = requests.post(f"{base_url}/barcode", data=payload, headers=headers, timeout=15)
+        if r1.status_code == 200:
+            pdf417_img = r1.content
+            barcode_id = r1.headers.get("X-Barcode-ID")
+            linear_img = None
+            if barcode_id:
+                try:
+                    r2 = requests.get(f"{base_url}/linear", params={"barcode_id": barcode_id}, headers=headers, timeout=15)
+                    if r2.status_code == 200: linear_img = r2.content
+                except: pass
+            return pdf417_img, linear_img
+        else:
+            print(f"Erreur API ({r1.status_code}): {r1.text}")
+            return None, None
+    except Exception as e:
+        print(f"Exception API: {e}")
+        return None, None
+
+# 2. HANDLERS DU MENU
 async def id_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Menu des catégories ID/Docs."""
     q = update.callback_query
     await q.answer()
-    
-    # Nettoyage
     context.user_data.clear()
-    
     kb = [
         [InlineKeyboardButton("🪪 Physical ID", callback_data="id_cat:physical")],
         [InlineKeyboardButton("🔢 Numerical ID", callback_data="id_cat:numerical")],
@@ -4210,12 +4420,9 @@ async def id_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛠️ Tools", callback_data="id_cat:tool")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     ]
-    
-    await replace_view(q, "🪪 **ID/Docs Center**\nChoisissez une catégorie :", 
-                       reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    await replace_view(q, "🪪 **ID/Docs Center**\nChoisissez une catégorie :", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     return ID_CAT_VIEW
 
-# 3. AFFICHAGE PRODUITS
 async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -4223,125 +4430,325 @@ async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = q.data.split(":")[1]
     context.user_data['id_category'] = cat
     
-    # Récupération des produits depuis ta DB existante
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    # On filtre par category. Assure-toi d'avoir inséré les produits avec ces catégories !
     rows = cur.execute("SELECT id, title, price, tier FROM products WHERE category=? AND is_active=1", (cat,)).fetchall()
     con.close()
     
     if not rows:
-        await q.edit_message_text("❌ Aucun produit dans cette catégorie.", reply_markup=kb_back_to_menu())
+        await q.edit_message_text("❌ Aucun produit.", reply_markup=kb_back_to_menu())
         return ConversationHandler.END
+
+    # Dictionnaire de traduction (Noms Longs -> Noms Courts)
+    short_names = {
+        "Quebec Driver License (Full)": "QC DL",
+        "Ontario Driver License": "ON DL",
+        "Quebec RESIDENCE": "CA PR",
+        "SIN Card (Plastic)": "CA SIN",
+        "Barcode Generator QC": "Gen QC",
+        "Barcode Generator ON": "Gen ON"
+    }
 
     kb = []
     for pid, title, price, code in rows:
-        kb.append([InlineKeyboardButton(f"{title} ({price:.0f}$)", callback_data=f"id_buy:{pid}")])
+        # On utilise le nom court si dispo, sinon le titre normal
+        display_name = short_names.get(title, title)
+        
+        # On n'affiche PAS le prix ici, et on pointe vers 'id_view'
+        kb.append([InlineKeyboardButton(f"🪪 {display_name}", callback_data=f"id_view:{pid}")])
     
     kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="id_menu_entry")])
     
     titles = {
-        "physical": "🪪 **Cartes Physiques (Livraison)**",
-        "numerical": "🔢 **Fichiers Digitaux (Scan)**",
-        "document": "📄 **Preuves de Revenu/Adresse**",
-        "tool": "🛠️ **Générateurs Barcodes**"
+        "physical": "🪪 **Physical ID**",
+        "numerical": "🔢 **Numerical ID**",
+        "document": "📄 **Documents**",
+        "tool": "🛠️ **Tools**"
     }
     
-    await q.edit_message_text(f"{titles.get(cat, 'Catalogue')}\nSélectionnez un produit :", 
-                              reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    await q.edit_message_text(
+        f"{titles.get(cat, 'Catalogue')}\nSélectionnez un produit :", 
+        reply_markup=InlineKeyboardMarkup(kb), 
+        parse_mode="Markdown"
+    )
     return ID_PROD_VIEW
 
-# 4. DÉBUT ACHAT & QUANTITÉ
+async def id_view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    # On supprime le menu précédent pour afficher la photo proprement
+    try: await q.message.delete()
+    except: pass
+    
+    pid = int(q.data.split(":")[1])
+    
+    con = sqlite3.connect(DB_NAME)
+    row = con.execute("SELECT title, price, tier, content FROM products WHERE id=?", (pid,)).fetchone()
+    con.close()
+    
+    title, price, tier, desc = row
+    
+    # Mapping des images (Assure-toi d'avoir ces fichiers dans le dossier assets/)
+    # Si tu n'as pas les images, le bot enverra juste le texte.
+    assets = {
+        'QC': 'assets/qc_sample.jpg', # Pour QC DL
+        'ON': 'assets/on_sample.jpg', # Pour ON DL
+        'Physical': 'assets/physical_sample.jpg', # Défaut physique
+        'T4': 'assets/t4_sample.jpg',
+        'PAY': 'assets/paystub_sample.jpg',
+        'BAR-QC': 'assets/barcode_sample.jpg'
+    }
+    
+    # On essaie de trouver une image basée sur le titre ou le tier
+    photo_path = None
+    if "Quebec" in title or "QC" in title: photo_path = assets.get('QC')
+    elif "Ontario" in title or "ON" in title: photo_path = assets.get('ON')
+    elif "SIN" in title: photo_path = assets.get('Physical')
+    elif "Generator" in title: photo_path = assets.get('BAR-QC')
+    
+    # Texte de description
+    caption = (
+        f"🏷️ **{title}**\n\n"
+        f"💰 Prix : **{price:.2f}$**\n"
+        f"📦 Type : {tier}\n\n"
+        f"ℹ️ _Qualité supérieure, scanne parfaitement. Inclut recto/verso et hologrammes._"
+    )
+    
+    # Bouton Acheter qui redirige vers id_buy (la fonction qui demande la quantité)
+    kb = [
+        [InlineKeyboardButton("🛒 Commander maintenant", callback_data=f"id_buy:{pid}")],
+        [InlineKeyboardButton("⬅️ Retour au menu", callback_data="id_menu_entry")]
+    ]
+    
+    # Envoi Photo + Texte ou Texte seul
+    if photo_path and os.path.exists(photo_path):
+        await context.bot.send_photo(
+            chat_id=q.message.chat_id,
+            photo=open(photo_path, 'rb'),
+            caption=caption,
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+    else:
+        # Fallback si pas d'image
+        await context.bot.send_message(
+            chat_id=q.message.chat_id,
+            text=caption,
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        
+    return ID_PROD_VIEW
+
+
+# --- DÉBUT DU BLOC QUANTITÉ INTERACTIVE ---
+
+# --- DÉBUT DU BLOC QUANTITÉ INTERACTIVE CORRIGÉ ---
+
 async def id_start_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    
+    # 1. On récupère l'ID du produit
     pid = int(q.data.split(":")[1])
     
-    # Récup infos produit
     con = sqlite3.connect(DB_NAME)
     row = con.execute("SELECT title, price, tier FROM products WHERE id=?", (pid,)).fetchone()
     con.close()
     
+    # 2. On initialise les données
     context.user_data['id_product'] = {'id': pid, 'name': row[0], 'price': row[1], 'code': row[2]}
+    context.user_data['current_qty'] = 1 
     
-    # Demande quantité
+    # 3. CRUCIAL : On supprime la photo (Fiche produit) pour faire place au menu texte
+    # Si on ne fait pas ça, le edit_message_text suivant échouera silencieusement
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+
+    # 4. On affiche le menu de quantité (comme un NOUVEAU message)
+    await update_qty_display(update, context, new_message=True)
+    
+    return ID_ASK_QTY
+
+async def update_qty_display(update: Update, context: ContextTypes.DEFAULT_TYPE, new_message=False):
+    # Récupération des données
+    qty = context.user_data.get('current_qty', 1)
+    prod = context.user_data['id_product']
+    total_price = prod['price'] * qty
+    
+    # Clavier Interactif [-] 1 [+]
     kb = [
-        [InlineKeyboardButton("1", callback_data="id_qty:1"), InlineKeyboardButton("2", callback_data="id_qty:2"), InlineKeyboardButton("3", callback_data="id_qty:3")],
+        [
+            InlineKeyboardButton("➖", callback_data="qty_sub"),
+            InlineKeyboardButton(f"📦 {qty}", callback_data="noop"), 
+            InlineKeyboardButton("➕", callback_data="qty_add")
+        ],
+        [
+            InlineKeyboardButton("+5", callback_data="qty_add_5"),
+            InlineKeyboardButton("+10", callback_data="qty_add_10")
+        ],
+        [InlineKeyboardButton(f"✅ Confirmer ({total_price:.2f}$)", callback_data="qty_confirm")],
         [InlineKeyboardButton("⬅️ Annuler", callback_data="id_menu_entry")]
     ]
-    await q.edit_message_text(f"🛒 **{row[0]}**\nCombien en voulez-vous ?", 
-                              reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    
+    txt = (
+        f"🛒 **{prod['name']}**\n"
+        f"Prix unitaire : {prod['price']:.2f}$\n\n"
+        f"🔢 **Quantité : {qty}**\n"
+        f"💰 **Total : {total_price:.2f}$**\n\n"
+        f"👇 Utilisez les boutons ou écrivez un chiffre."
+    )
+    
+    # Si on demande explicitement un nouveau message (cas du démarrage après la photo)
+    if new_message:
+        chat_id = update.effective_chat.id
+        await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return
+
+    # Sinon, on essaie de modifier le message existant
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        except Exception:
+            # Si l'edit échoue (ex: message trop vieux), on renvoie un neuf
+            pass
+    else:
+        # Cas message texte manuel
+        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def id_handle_qty_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    
+    current = context.user_data.get('current_qty', 1)
+    
+    if data == "qty_add":
+        current += 1
+        await q.answer("Ajouté (+1)")
+    elif data == "qty_sub":
+        current = max(1, current - 1)
+        await q.answer("Retiré (-1)")
+    elif data == "qty_add_5":
+        current += 5
+        await q.answer("Ajouté (+5)")
+    elif data == "qty_add_10":
+        current += 10
+        await q.answer("Ajouté (+10)")
+        
+    context.user_data['current_qty'] = current
+    await update_qty_display(update, context, new_message=False)
     return ID_ASK_QTY
 
 async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    qty = int(q.data.split(":")[1])
-    context.user_data['id_qty'] = qty
-    
-    prod = context.user_data['id_product']
-    total = prod['price'] * qty
-    
-    kb = [
-        [InlineKeyboardButton(f"✅ Confirmer ({total:.2f}$)", callback_data="id_confirm_pay")],
-        [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]
-    ]
-    
-    await q.edit_message_text(
-        f"📋 **Récapitulatif**\nProduit : {prod['name']}\nQuantité : {qty}\nTotal : {total:.2f}$\n\nProcéder au formulaire ?", 
-        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown"
-    )
-    return ID_CONFIRM_BUY
+    # Cas A : Clic sur "✅ Confirmer"
+    if update.callback_query and update.callback_query.data == "qty_confirm":
+        context.user_data['id_qty'] = context.user_data['current_qty']
+        return await id_start_form(update, context) 
+        
+    # Cas B : Texte écrit (ex: "50")
+    if update.message and update.message.text:
+        text = update.message.text.strip()
+        if text.isdigit() and int(text) > 0:
+            context.user_data['current_qty'] = int(text)
+            await update_qty_display(update, context, new_message=True) # On renvoie le menu mis à jour
+            return ID_ASK_QTY
+        else:
+            await update.message.reply_text("⚠️ Chiffre invalide.")
+            return ID_ASK_QTY
+            
+    return ID_ASK_QTY
 
-# 5. DÉMARRAGE FORMULAIRE (BIFURCATION)
-async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- FIN DU BLOC QUANTITÉ CORRIGÉ ---
+
+async def id_handle_qty_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    data = q.data
     
-    # Vérif solde
+    # Récupère la quantité actuelle
+    current = context.user_data.get('current_qty', 1)
+    
+    # Calcul
+    if data == "qty_add":
+        current += 1
+        await q.answer("Ajouté (+1)") # Petite notif toast
+    elif data == "qty_sub":
+        current = max(1, current - 1) # On ne descend pas sous 1
+        await q.answer("Retiré (-1)")
+    elif data == "qty_add_5":
+        current += 5
+        await q.answer("Ajouté (+5)")
+    elif data == "qty_add_10":
+        current += 10
+        await q.answer("Ajouté (+10)")
+        
+    # Sauvegarde et mise à jour visuelle
+    context.user_data['current_qty'] = current
+    await update_qty_display(update, context)
+    return ID_ASK_QTY
+        
+
+async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Cas A : Clic sur "✅ Confirmer"
+    if update.callback_query and update.callback_query.data == "qty_confirm":
+        # La quantité est déjà dans 'current_qty'
+        context.user_data['id_qty'] = context.user_data['current_qty']
+        return await id_start_form(update, context) # On passe à la suite
+        
+    # Cas B : Texte écrit (ex: "50")
+    if update.message and update.message.text:
+        text = update.message.text.strip()
+        if text.isdigit() and int(text) > 0:
+            context.user_data['current_qty'] = int(text)
+            # On réaffiche le menu avec le nouveau chiffre pour validation
+            await update_qty_display(update, context)
+            return ID_ASK_QTY
+        else:
+            await update.message.reply_text("⚠️ Chiffre invalide.")
+            return ID_ASK_QTY
+            
+    return ID_ASK_QTY
+
+# 3. DÉMARRAGE FORMULAIRE (MODIFIÉ)
+async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
     user_id = str(q.from_user.id)
     total = context.user_data['id_product']['price'] * context.user_data['id_qty']
-    balance = get_user_balance(user_id)
-    
-    if balance < total:
-        await q.edit_message_text(f"❌ **Solde insuffisant.**\nRequis: {total:.2f}$\nDispo: {balance:.2f}$", 
-                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recharger", callback_data="add_balance")]]))
+    if get_user_balance(user_id) < total:
+        await q.edit_message_text("❌ Solde insuffisant.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recharger", callback_data="add_balance")]]))
         return ConversationHandler.END
-
-    # On débite maintenant (ou à la fin, au choix. Ici on débite au début pour sécuriser)
     update_user_balance(user_id, -total)
-    context.user_data['id_paid'] = True
     
-    # Logique de bifurcation selon catégorie
-    cat = context.user_data.get('id_category')
-    
-    if cat == 'tool':
-        # Pas de formulaire pour les outils -> Livraison directe
-        return await id_finalize_order(update, context)
-        
-    # Pour les autres : Nom
-    await q.edit_message_text("✍️ **Formulaire de commande**\n\nQuel est le **Prénom et Nom** complet ?")
+    # Demande Prénom (Séparé)
+    await q.edit_message_text("✍️ **Formulaire (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?")
     return ID_ASK_NAME
 
-async def id_save_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['form_name'] = update.message.text
-    cat = context.user_data.get('id_category')
+async def id_save_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_firstname'] = update.message.text.strip()
+    await update.message.reply_text("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?")
+    return ID_ASK_LASTNAME
+
+async def id_save_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_lastname'] = update.message.text.strip()
+    context.user_data['form_name'] = f"{context.user_data['form_firstname']} {context.user_data['form_lastname']}"
     
-    # Si c'est un DOCUMENT (T4, Paystub), on saute la DOB
-    if cat == 'document':
+    if context.user_data.get('id_category') == 'document':
         context.user_data['form_dob'] = "N/A"
-        await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :\n*(Ex: 123 Rue Sherbrooke)*", parse_mode="Markdown")
+        await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
         return ID_ASK_STREET
     else:
-        await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA)", parse_mode="Markdown")
+        await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)")
         return ID_ASK_DOB
 
 async def id_save_dob(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['form_dob'] = update.message.text
-    await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :\n*(Ex: 123 Rue Sherbrooke)*", parse_mode="Markdown")
+    clean_date = parse_date_smart(update.message.text)
+    if not clean_date:
+        await update.message.reply_text("⚠️ Format invalide. Réessayez (ex: 15/05/1995).")
+        return ID_ASK_DOB
+    context.user_data['form_dob'] = clean_date
+    await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
     return ID_ASK_STREET
 
-# 6. SÉQUENCE ADRESSE INTELLIGENTE
 async def id_save_street(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_street'] = update.message.text
     await update.message.reply_text("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?")
@@ -4353,211 +4760,261 @@ async def id_save_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ID_ASK_ZIP
 
 async def id_save_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    zip_code = update.message.text
+    zip_code = update.message.text.upper().strip()
+    context.user_data['addr_zip'] = zip_code
     raw = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {zip_code}"
     
     msg = await update.message.reply_text("🔍 Validation Google Maps...")
     suggestions = validate_address_google(raw)
+    context.user_data['addr_suggestions'] = suggestions or [raw]
     
-    context.user_data['addr_suggestions'] = suggestions
-    if not suggestions: suggestions = [raw] # Fallback
-    
-    kb = []
-    for i, addr in enumerate(suggestions):
-        kb.append([InlineKeyboardButton(f"📍 {addr[:50]}", callback_data=f"addr_pick:{i}")])
+    kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(context.user_data['addr_suggestions'])]
     kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
-    
-    await msg.edit_text("✅ **Confirmez l'adresse normalisée :**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    await msg.edit_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
     return ID_CONFIRM_ADDR
 
 async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    
+    q = update.callback_query; await q.answer()
     if "retry" in q.data:
-        await q.edit_message_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
-        return ID_ASK_STREET
-        
+        await q.edit_message_text("📍 Entrez le **Numéro et la Rue** :"); return ID_ASK_STREET
+    
     idx = int(q.data.split(":")[1])
-    chosen = context.user_data['addr_suggestions'][idx]
-    context.user_data['form_address'] = chosen
+    context.user_data['form_address'] = context.user_data['addr_suggestions'][idx]
     
-    # BIFURCATION APRÈS ADRESSE
-    cat = context.user_data.get('id_category')
-    prod_code = context.user_data['id_product']['code']
-    
-    if cat == 'document':
-        # Paystub/Job Letter -> Besoin du poste
-        if prod_code in ['PAY', 'JOB']:
-            await q.edit_message_text(f"✅ Adresse: {chosen}\n\n🏢 **Nom de l'Employeur** ?")
-            return ID_ASK_DOC_EMPLOYER
-        else: # T4 -> Pas besoin de poste
-            context.user_data['form_job'] = "N/A"
-            await q.edit_message_text(f"✅ Adresse: {chosen}\n\n🏢 **Nom de l'Employeur** ?")
-            # Astuce: On utilise le même handler mais on sautera la question Job après
-            return ID_ASK_DOC_EMPLOYER
-            
-    else: # Physical / Numerical -> Taille
-        await q.edit_message_text(f"✅ Adresse: {chosen}\n\n📏 **Quelle est votre taille ?**\n(Ex: 175 cm)")
-        return ID_ASK_HEIGHT
-
-# 7. LOGIQUE DOCUMENT (Employeur, Salaire, SIN)
-async def id_save_employer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['form_employer'] = update.message.text
-    prod_code = context.user_data['id_product']['code']
-    
-    if prod_code in ['PAY', 'JOB']:
-        await update.message.reply_text("👨‍🔧 **Quel est votre Poste ?**\n(Ex: Cuisinier)")
-        return ID_ASK_DOC_JOB
+    if context.user_data.get('id_category') == 'document':
+        await q.edit_message_text("🏢 **Nom de l'Employeur** ?")
+        return ID_ASK_DOC_EMPLOYER
     else:
-        context.user_data['form_job'] = "N/A"
-        await update.message.reply_text("📍 **Adresse de l'Employeur ?**")
-        return ID_ASK_DOC_ADDR
+        # Vers les dates
+        await q.edit_message_text("📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)")
+        return ID_ASK_ISSUE
 
-async def id_save_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['form_job'] = update.message.text
-    await update.message.reply_text("📍 **Adresse de l'Employeur ?**")
-    return ID_ASK_DOC_ADDR
+# --- NOUVELLES FONCTIONS LOGIQUES ---
 
-async def id_save_emp_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['form_emp_addr'] = update.message.text
+async def id_save_issue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text
+    if txt.lower() in ['today', "aujourd'hui", 'now']:
+        clean_date = datetime.now().strftime("%Y-%m-%d")
+    else:
+        clean_date = parse_date_smart(txt)
     
+    if not clean_date:
+        await update.message.reply_text("⚠️ Date invalide.")
+        return ID_ASK_ISSUE
+    context.user_data['form_issue'] = clean_date
+    await update.message.reply_text("📅 **Quelle est l'Année d'Expiration ?**\n(Le jour/mois seront ceux de la naissance)\nEx: **2028**")
+    return ID_ASK_EXPIRY
+
+async def id_save_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    year = update.message.text.strip()
+    if not year.isdigit() or len(year) != 4:
+        await update.message.reply_text("⚠️ Entrez juste l'année (ex: 2029).")
+        return ID_ASK_EXPIRY
+    
+    dob = context.user_data.get('form_dob', '2000-01-01')
+    context.user_data['form_expiry'] = f"{year}-{dob[5:]}"
+    await update.message.reply_text("🆔 **Numéro de Permis (DAQ) ?**\n(Ex: T1234-123456-12)")
+    return ID_ASK_DL_NUM
+
+async def id_save_dl_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_dl_number'] = update.message.text.upper().strip()
+    await update.message.reply_text("🔢 **Numéro de Référence (DCF/DD) ?**\n(Le petit numéro, ex: 12345678)")
+    return ID_ASK_REF_NUM
+
+async def id_save_ref_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_ref_number'] = update.message.text.upper().strip()
     kb = [
-        [InlineKeyboardButton("📊 Par Tranche (Rapide)", callback_data="inc_range")],
-        [InlineKeyboardButton("🧮 Calcul Exact (Heures x Taux)", callback_data="inc_calc")]
+        [InlineKeyboardButton("Homme (Male)", callback_data="sex:1"), InlineKeyboardButton("Femme (Female)", callback_data="sex:2")],
+        [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")]
     ]
-    await update.message.reply_text("💰 **Mode de Revenu**\nComment indiquer le salaire ?", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    return ID_CHOOSE_INCOME_MODE
+    await update.message.reply_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb))
+    return ID_ASK_SEX
 
-async def id_income_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    
-    if q.data == "inc_range":
-        kb = [
-            [InlineKeyboardButton("20k - 40k", callback_data="sal:20-40k"), InlineKeyboardButton("40k - 60k", callback_data="sal:40-60k")],
-            [InlineKeyboardButton("60k - 80k", callback_data="sal:60-80k"), InlineKeyboardButton("80k - 100k", callback_data="sal:80-100k")]
-        ]
-        await q.edit_message_text("📊 **Sélectionnez une tranche :**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        return ID_ASK_DOC_SIN # On réutilise cet état pour capter le clic tranche (astuce)
-    else:
-        await q.edit_message_text("⏱️ **Heures par semaine ?**\n(Ex: 40)")
-        return ID_ASK_DOC_HOURS
+async def id_save_sex(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    sex = q.data.split(":")[1]
+    context.user_data['form_sex'] = sex
+    try: await q.edit_message_text(f"👤 Sexe: {'Homme' if sex=='1' else 'Femme'}")
+    except: pass
+    await q.message.reply_text("📏 **Quelle est votre taille ?**\n(Ex: 175 cm)")
+    return ID_ASK_HEIGHT
 
-async def id_save_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['calc_hours'] = update.message.text
-    await update.message.reply_text("💸 **Taux Horaire ($/h) ?**\n(Ex: 25.50)")
-    return ID_ASK_DOC_RATE
-
-async def id_save_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        hours = float(context.user_data['calc_hours'])
-        rate = float(update.message.text.replace(',', '.'))
-        annual = hours * rate * 52
-        context.user_data['form_income'] = f"{annual:,.2f}$ (Calc: {hours}h x {rate}$)"
-    except:
-        context.user_data['form_income'] = f"Erreur calc: {update.message.text}"
-        
-    await update.message.reply_text(f"💰 Revenu estimé: **{context.user_data['form_income']}**\n\n🔢 **Numéro SIN ?**", parse_mode="Markdown")
-    return ID_ASK_DOC_SIN
-
-async def id_save_sin_or_range(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Peut venir d'un bouton (Tranche) ou texte (SIN manuel)
-    if update.callback_query:
-        q = update.callback_query
-        await q.answer()
-        context.user_data['form_income'] = q.data.split(":")[1]
-        await q.edit_message_text("📊 Tranche enregistrée.\n\n🔢 **Numéro SIN ?**")
-        return ID_ASK_DOC_SIN
-    else:
-        # C'est le SIN final
-        context.user_data['form_sin'] = update.message.text
-        # Fin Documents -> Finalisation
-        return await id_finalize_order(update, context)
-
-# 8. LOGIQUE ID PHYSIQUE (Fin du flow standard)
 async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_height'] = update.message.text
-    await update.message.reply_text("👁️ **Couleur des yeux ?**")
+    kb = [
+        [InlineKeyboardButton("Marron (Brown)", callback_data="eye:BRO"), InlineKeyboardButton("Bleu (Blue)", callback_data="eye:BLU")],
+        [InlineKeyboardButton("Vert (Green)", callback_data="eye:GRN"), InlineKeyboardButton("Noisette (Hazel)", callback_data="eye:HZL")],
+        [InlineKeyboardButton("Gris (Grey)", callback_data="eye:GRY"), InlineKeyboardButton("Noir (Black)", callback_data="eye:BLK")]
+    ]
+    await update.message.reply_text("👁️ **Couleur des yeux ?**", reply_markup=InlineKeyboardMarkup(kb))
     return ID_ASK_EYES
 
 async def id_save_eyes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['form_eyes'] = update.message.text
-    await update.message.reply_text("📸 **Envoyez votre photo (Selfie propre)**\n*(Envoyez une image, pas un fichier)*")
+    if update.callback_query:
+        q = update.callback_query; await q.answer()
+        context.user_data['form_eyes'] = q.data.split(":")[1]
+        try: await q.edit_message_text(f"👁️ Yeux: {context.user_data['form_eyes']}")
+        except: pass
+    else:
+        context.user_data['form_eyes'] = update.message.text
+
+    # Si c'est un Tool, on montre le résumé avant de générer
+    if context.user_data.get('id_category') == 'tool':
+        return await id_show_summary(update, context)
+
+    await (update.message or update.callback_query.message).reply_text("📸 **Envoyez votre photo (Selfie)**")
     return ID_ASK_PHOTO
 
 async def id_save_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo = update.message.photo[-1]
-    context.user_data['form_photo_id'] = photo.file_id
-    # Fin Physique -> Finalisation
+    context.user_data['form_photo_id'] = update.message.photo[-1].file_id
     return await id_finalize_order(update, context)
 
-# 9. FINALISATION COMMANDE
-async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    uid = str(user.id)
-    
-    # Construction rapport
+# --- RÉSUMÉ & FIN ---
+
+async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
-    prod = d.get('id_product')
-    cat = d.get('id_category')
+    sex_map = {'1': 'Homme', '2': 'Femme', '9': 'X'}
     
-    # Message Admin Uniforme
-    admin_msg = (
-        f"🚨 **NOUVELLE COMMANDE ID/DOCS** 🚨\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"👤 **CLIENT**\n"
-        f"• User: @{user.username} ({user.first_name})\n"
-        f"• ID: `{uid}`\n"
-        f"🔗 [CLIQUER POUR CONTACTER](tg://user?id={uid})\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"📦 **PRODUIT**\n"
-        f"• Type: {prod['name']} ({prod['code']})\n"
-        f"• Catégorie: {cat.upper()}\n"
-        f"• Prix: {prod['price']}$\n"
-        f"➖➖➖➖➖➖➖➖➖➖\n"
-        f"📝 **DONNÉES**\n"
+    txt = (
+        f"📝 **RÉSUMÉ DES DONNÉES**\n\n"
+        f"👤 **Identité**\n"
+        f"• Prénom (DAC) : `{d.get('form_firstname')}`\n"
+        f"• Nom (DCS) : `{d.get('form_lastname')}`\n"
+        f"• Sexe : `{sex_map.get(d.get('form_sex'), '?')}`\n"
+        f"• Taille : `{d.get('form_height')}`\n"
+        f"• Yeux : `{d.get('form_eyes')}`\n\n"
+        f"📅 **Dates**\n"
+        f"• Naissance : `{d.get('form_dob')}`\n"
+        f"• Émission : `{d.get('form_issue')}`\n"
+        f"• Expiration : `{d.get('form_expiry')}`\n\n"
+        f"📍 **Adresse**\n"
+        f"• Rue : `{d.get('addr_street')}`\n"
+        f"• Ville : `{d.get('addr_city')}`\n"
+        f"• Zip : `{d.get('addr_zip')}`\n\n"
+        f"🆔 **Numéros**\n"
+        f"• Permis (DAQ) : `{d.get('form_dl_number')}`\n"
+        f"• Référence (DCF) : `{d.get('form_ref_number')}`"
     )
+    kb = [[InlineKeyboardButton("✅ CONFIRMER & GÉNÉRER", callback_data="confirm_gen")],
+          [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]]
     
+    target = update.message or update.callback_query.message
+    await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return ID_CONFIRM_SUMMARY
+
+async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q: await q.answer()
+    
+    user = update.effective_user
+    d = context.user_data
+    cat = d.get('id_category')
+    prod = d.get('id_product')
+    target = update.message or update.callback_query.message
+
+    # 0. TRANSFORMATION EN MAJUSCULES (Correction demandée)
+    fn = str(d.get('form_firstname', '')).upper()
+    ln = str(d.get('form_lastname', '')).upper()
+    dob = str(d.get('form_dob', '')).upper()
+    issue = str(d.get('form_issue', '')).upper()
+    expiry = str(d.get('form_expiry', '')).upper()
+    street = str(d.get('addr_street', '')).upper()
+    city = str(d.get('addr_city', '')).upper()
+    zip_code = str(d.get('addr_zip', '')).upper()
+    dl_num = str(d.get('form_dl_number', '')).upper()
+    ref_num = str(d.get('form_ref_number', '')).upper()
+    sex = str(d.get('form_sex', '')).upper()
+    height = str(d.get('form_height', '')).upper()
+    eyes = str(d.get('form_eyes', '')).upper()
+
+    # 1. Préparation des données pour l'API
+    api_data = {
+        "form_firstname": fn, "form_lastname": ln,
+        "form_dob": dob, "form_issue": issue,
+        "form_expiry": expiry, "form_street": street,
+        "form_city": city, "form_zip": zip_code,
+        "form_dl_number": dl_num, "form_ref_number": ref_num,
+        "form_sex": sex, "form_height": height, "form_eyes": eyes
+    }
+
+    # Cas 1 : TOOL (Achat de code-barre seul) -> Envoi au CLIENT
     if cat == 'tool':
-        admin_msg += "⚡ Livraison Auto (Tool)"
-    else:
-        admin_msg += f"• Nom: {d.get('form_name')}\n"
-        admin_msg += f"• Adresse: `{d.get('form_address')}`\n"
-        
-        if cat == 'document':
-            admin_msg += f"• Employeur: {d.get('form_employer')}\n"
-            admin_msg += f"• Poste: {d.get('form_job')}\n"
-            admin_msg += f"• Adr Emp: {d.get('form_emp_addr')}\n"
-            admin_msg += f"• Revenu: {d.get('form_income')}\n"
-            admin_msg += f"• SIN: `{d.get('form_sin')}`\n"
-        else:
-            admin_msg += f"• DOB: {d.get('form_dob')}\n"
-            admin_msg += f"• Taille: {d.get('form_height')}\n"
-            admin_msg += f"• Yeux: {d.get('form_eyes')}\n"
-            
-    # Envoi Admin(s)
-    for admin_id in ADMIN_IDS:
-        try:
-            if d.get('form_photo_id'):
-                await context.bot.send_photo(chat_id=admin_id, photo=d['form_photo_id'], caption=admin_msg, parse_mode="Markdown")
-            else:
-                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="Markdown")
+        msg = await target.reply_text("⚙️ Génération des codes-barres...")
+        pdf417, linear = generate_barcode_via_api(api_data, prod['code'])
+        try: await msg.delete()
         except: pass
 
-    # Message Client
-    end_msg = "✅ **Commande reçue !**\n\n"
-    if cat == 'tool':
-        end_msg += "Votre outil a été généré (simulation). Vérifiez vos messages."
-    else:
-        end_msg += "Votre dossier est en cours de traitement. Vous recevrez le résultat ici."
-        
-    target = update.message or update.callback_query.message
-    await target.reply_text(end_msg)
+        if pdf417:
+            await target.reply_document(document=pdf417, filename=f"pdf417_{ln}.png", caption="✅ **PDF417 (Scan)**")
+            if linear:
+                await target.reply_document(document=linear, filename=f"code128_{ln}.png", caption="✅ **Code 128**")
+            await target.reply_text("✅ **Génération terminée.** Merci !")
+        else:
+            await target.reply_text("⚠️ Erreur technique API.")
     
-    # Retour Menu
+    # Cas 2 : PHYSIQUE / DOCS -> Envoi au CANAL ADMIN
+    else:
+        wait_msg = await target.reply_text("⏳ Traitement de la commande...")
+        
+        pdf417, linear = generate_barcode_via_api(api_data, prod['code'])
+        
+        # B. Construction du message (Mise en forme finale : MAJ + 3 lignes adresse + 3 lignes physique)
+        admin_msg = (
+            f"🚨 **NOUVELLE COMMANDE : {cat.upper()}** 🚨\n\n"
+            f"👤 **Client** : @{user.username} (ID: {user.id})\n"
+            f"🛒 **Produit** : {prod['name']} (x{d.get('id_qty')})\n\n"
+            f"📋 **DONNÉES DU FORMULAIRE :**\n"
+            f"--------------------------------\n"
+            f"📛 Nom : {fn} {ln}\n"
+            f"🎂 DDN : {dob}\n"
+            f"📍 Adresse : {street}\n"
+            f"🏙️ Ville : {city}\n"
+            f"📮 CP : {zip_code}\n"
+            f"--------------------------------\n"
+            f"🆔 Permis : {dl_num}\n"
+            f"🔢 Réf : {ref_num}\n"
+            f"📅 Émission : {issue}\n"
+            f"📅 Expiration : {expiry}\n"
+            f"--------------------------------\n"
+            f"📏 Taille : {height}\n"
+            f"👁️ Yeux : {eyes}\n"
+            f"👤 Sexe : {sex}"
+        )
+        
+        try:
+            target_id = "-1003589564052" 
+            
+            # Envoi Infos au Canal
+            if d.get('form_photo_id'):
+                await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_msg)
+            else:
+                await context.bot.send_message(chat_id=target_id, text=admin_msg)
+            
+            # Envoi Barcodes (PNG Document) au Canal
+            if pdf417:
+                await context.bot.send_document(chat_id=target_id, document=pdf417, filename=f"pdf417_{ln}.png", caption="🖨️ **PDF417 (PNG HQ)**")
+            if linear:
+                await context.bot.send_document(chat_id=target_id, document=linear, filename=f"code128_{ln}.png", caption="🖨️ **Code 128 (PNG HQ)**")
+
+            try: await wait_msg.delete()
+            except: pass
+            await target.reply_text("✅ Commande envoyée avec succès !")
+            
+        except Exception as e:
+            print(f"Erreur envoi canal: {e}")
+            await target.reply_text(f"⚠️ Erreur lors de l'envoi : {e}")
+
     await show_main_menu(user.id)
     return ConversationHandler.END
+
+# Handlers Document (Placeholder pour éviter erreurs d'import)
+async def id_save_employer(u,c): c.user_data['form_employer']=u.message.text; await u.message.reply_text("Poste ?"); return ID_ASK_DOC_JOB
+async def id_save_job(u,c): c.user_data['form_job']=u.message.text; await u.message.reply_text("Adresse Emp ?"); return ID_ASK_DOC_ADDR
+async def id_save_emp_addr(u,c): c.user_data['form_emp_addr']=u.message.text; await u.message.reply_text("Revenu ?"); return ID_ASK_DOC_SIN
+async def id_income_mode(u,c): pass 
+async def id_save_hours(u,c): pass
+async def id_save_rate(u,c): pass
+async def id_save_sin_or_range(u,c): c.user_data['form_sin']=(u.message.text if u.message else "Range"); return await id_finalize_order(u,c)
 
 if __name__ == "__main__":
 # --- DB ---
@@ -4787,8 +5244,7 @@ app_telegram.add_handler(CallbackQueryHandler(admin_menu,               pattern=
 app_telegram.add_handler(CallbackQueryHandler(admin_category_menu,    pattern="^admin_cat_menu:.*$"))
 # --- FIN DE L'AJOUT ---
 
-app_telegram.add_handler(CallbackQueryHandler(admin_users,              pattern="^admin_users$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user,        pattern="^admin_adjust_.*$"))
+
 # ... reste des handlers admin ...
 
 
@@ -4850,38 +5306,68 @@ app_telegram.add_handler(conv_handler)
 id_docs_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
     states={
+        # 1. Navigation Catalogue
         ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
-        ID_PROD_VIEW: [CallbackQueryHandler(id_start_buy, pattern="^id_buy:")],
-        ID_ASK_QTY: [CallbackQueryHandler(id_save_qty, pattern="^id_qty:")],
+        ID_PROD_VIEW: [
+            CallbackQueryHandler(id_view_product, pattern="^id_view:"),
+            CallbackQueryHandler(id_start_buy, pattern="^id_buy:")
+        ],
+
+        # 2. Gestion Quantité (Interactive)
+        ID_ASK_QTY: [
+            # Écoute les boutons +, -, +5, +10 (Mise à jour visuelle)
+            CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_(add|sub|add_5|add_10)"),
+            
+            # Écoute le bouton "Confirmer" (Passe à la suite)
+            CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
+            
+            # Écoute la saisie texte (ex: "50")
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
+        ],
+
+        # (Optionnel : Ancien état de confirmation, gardé par sécurité)
         ID_CONFIRM_BUY: [CallbackQueryHandler(id_start_form, pattern="^id_confirm_pay$")],
         
-        # Formulaire General
-        ID_ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_name)],
+        # 3. Identité
+        ID_ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_firstname)],
+        ID_ASK_LASTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_lastname)],
         ID_ASK_DOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dob)],
         
-        # Adresse
+        # 4. Adresse
         ID_ASK_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_street)],
         ID_ASK_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_city)],
         ID_ASK_ZIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_zip)],
         ID_CONFIRM_ADDR: [CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
         
-        # Documents
-        ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_employer)],
-        ID_ASK_DOC_JOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_job)],
-        ID_ASK_DOC_ADDR: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_emp_addr)],
-        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")],
-        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_hours)],
-        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_rate)],
-        # SIN gère à la fois le bouton tranche ET le texte SIN
-        ID_ASK_DOC_SIN: [
-            CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_sin_or_range)
+        # 5. Dates & Numéros
+        ID_ASK_ISSUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_issue)],
+        ID_ASK_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_expiry)],
+        ID_ASK_DL_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_num)],
+        ID_ASK_REF_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)],
+        
+        # 6. Physique
+        ID_ASK_SEX: [CallbackQueryHandler(id_save_sex, pattern="^sex:")],
+        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_height)],
+        ID_ASK_EYES: [
+            CallbackQueryHandler(id_save_eyes, pattern="^eye:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_eyes)
         ],
         
-        # Physique
-        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_height)],
-        ID_ASK_EYES: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_eyes)],
+        # 7. Résumé & Photo
+        ID_CONFIRM_SUMMARY: [CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$")],
         ID_ASK_PHOTO: [MessageHandler(filters.PHOTO, id_save_photo)],
+
+        # 8. Documents (Support Legacy pour T4/Paystub)
+        ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT, id_save_employer)],
+        ID_ASK_DOC_JOB: [MessageHandler(filters.TEXT, id_save_job)],
+        ID_ASK_DOC_ADDR: [MessageHandler(filters.TEXT, id_save_emp_addr)],
+        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")], # Ajouté pour le mode revenu
+        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT, id_save_hours)], # Ajouté
+        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT, id_save_rate)],   # Ajouté
+        ID_ASK_DOC_SIN: [
+            CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"),
+            MessageHandler(filters.TEXT, id_save_sin_or_range)
+        ],
     },
     fallbacks=[
         CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
@@ -4891,7 +5377,7 @@ id_docs_conv = ConversationHandler(
     name="id_docs_conversation"
 )
 
-app_telegram.add_handler(id_docs_conv, group=2) # Groupe différent pour éviter les conflits
+app_telegram.add_handler(id_docs_conv) # Remis dans le groupe par défaut (0)
 
 # === Filtres catalogue (NOUVEAU SYSTÈME) ===
 catalog_filter_conv = ConversationHandler(
@@ -4986,7 +5472,13 @@ app_telegram.add_handler(CallbackQueryHandler(admin_prod_del,           pattern=
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start,     pattern="^admin_prod_add$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_list,          pattern="^admin_prod_list$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_menu,               pattern="^admin_menu$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_users,              pattern="^admin_users$"))
+admin_search_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(admin_search_user_start, pattern="^admin_search_user_start$")],
+    states={ ADMIN_WAIT_SEARCH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_receive)] },
+    fallbacks=[CommandHandler("start", goto_menu), CallbackQueryHandler(admin_users, pattern="^admin_users")]
+)
+app_telegram.add_handler(admin_search_conv, group=8)
+app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern=r"^admin_users(:page:\d+)?$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user,        pattern="^admin_adjust_.*$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_adjust_value,       pattern="^admin_adjval_.*$"))
 app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_.*$"))
