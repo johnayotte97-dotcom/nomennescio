@@ -1019,13 +1019,14 @@ async def ccs_catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_products_ccs(update, context, page=0, tier=None, from_filter=False):
-    # Logs espion
+    # Logs espion pour le débogage
     import os; pid = os.getpid()
     print(f"[ESPION] 💳 EXECUTION show_products_ccs | Page: {page} | PID: {pid}", flush=True)
 
     query = getattr(update, "callback_query", None)
     chat_id = query.message.chat_id if query else update.effective_chat.id
     
+    # Gestion propre du spinner et suppression ancien message
     if query:
         try: await query.answer()
         except: pass
@@ -1033,7 +1034,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
             try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
             except: pass
 
-    # 1. Nettoyage vieux messages
+    # 1. Nettoyage des vieux messages (pour éviter l'accumulation)
     try:
         msgs_to_del = []
         if from_filter:
@@ -1048,28 +1049,31 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
             except: pass
     except: pass
 
-    # 2. RECHERCHE SQL DIRECTE (Correction ICI : On utilise le moteur SQL)
+    # 2. RECHERCHE SQL DIRECTE (LE CORRECTIF EST ICI)
+    # On utilise _get_products_optimized au lieu de l'ancien système
     try:
         filters = context.user_data.get('ccs_active_filters', {})
         PER_PAGE = 2
-        # On appelle le moteur SQL avec la catégorie 'ccs'
+        # Appel au moteur SQL rapide
         chunk, total_items = _get_products_optimized(category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
     except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Erreur DB: {e}")
+        # En cas d'erreur SQL, on prévient l'admin au lieu de disparaître
+        print(f"[ERREUR CRITIQUE] {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Erreur technique (DB): {e}")
         return
 
+    # Calcul pagination
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     sent_ids = []
 
-    # 3. Fonction d'affichage locale pour Cc's (BINS, EXP...)
+    # 3. Fonction d'affichage locale pour Cc's
     def fmt_product_ccs(p):
         try:
-            # On essaie d'extraire proprement
             lines = []
             content = p.get('content', '')
             
-            # Extraction simple via regex ou split pour être robuste
+            # Extraction simple
             def get_val(key):
                 import re
                 m = re.search(f"{key}:\\s*(.+)", content, re.IGNORECASE)
@@ -1078,10 +1082,9 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
             cc = get_val("CC") or get_val("BINS")
             exp = get_val("EXP")
             
-            if cc: lines.append(f"BINS: {cc[:6]}") # Affiche juste le BIN
+            if cc: lines.append(f"BINS: {cc[:6]}") 
             if exp: lines.append(f"EXP: {exp}")
             
-            # Récupère le nom sans les décorations s'il y en a
             raw_title = str(p.get('title', '')).split('•')[0].strip()
             lines.append(f"FIRST NAME: {raw_title}")
             lines.append(f"BASE: {p.get('tier', 'N/A')}")
@@ -1091,9 +1094,9 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
         except:
             return f"💳 {p.get('title')}\n{p.get('price')} CAD"
 
-    # 4. GESTION "RIEN TROUVÉ"
+    # 4. GESTION "AUCUN RÉSULTAT"
     if not chunk:
-        text = "❌ Aucun produit Cc's trouvé."
+        text = "❌ Aucun produit Cc's trouvé pour ces critères."
         kb = _build_filter_menu_ccs(context, page_info=None) if from_filter else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
         m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
         
