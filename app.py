@@ -706,92 +706,111 @@ def _build_products_keyboard(page, total_pages, tier=None):
 # REMPLACE la fonction show_products (ligne 607) par CELLE-CI :
 
 async def show_products(update, context, page=0, tier=None, from_filter=False):
-    # --- AIRBAG ACTIVÉ ---
+    # Imports locaux pour garantir le fonctionnement
+    import asyncio 
+    import os
+    
+    query = getattr(update, "callback_query", None)
+    chat_id = query.message.chat_id if query else update.effective_chat.id
+    
+    # 1. UX : ON AFFICHE LE CHARGEMENT TOUT DE SUITE
+    loading_msg = None
     try:
-        query = getattr(update, "callback_query", None)
-        chat_id = query.message.chat_id if query else update.effective_chat.id
+        # On envoie le message AVANT de supprimer l'ancien menu
+        loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Recherche en cours...")
         
-        if query:
-            try: await query.answer()
-            except: pass
-            if not from_filter:
-                try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
-                except: pass
+        # --- ASTUCE UX : PETITE PAUSE ---
+        # On force une pause de 0.5s pour que l'utilisateur voie le message
+        # Sinon c'est trop rapide et ça fait "clignoter" l'écran
+        await asyncio.sleep(0.5) 
+    except: pass
 
-        # 1. Nettoyage mémoire
-        try:
-            msgs_to_del = []
-            if from_filter:
-                msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
-                msgs_to_del += context.user_data.pop("filter_msgs", [])
-            else:
-                msgs_to_del += CATALOG_MSGS.pop(chat_id, [])
-                msgs_to_del += context.user_data.pop("filter_msgs", [])
-            for mid in set(msgs_to_del):
-                try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-                except: pass
+    # 2. Gestion de la suppression de l'ancien message (Menu ou Filtre)
+    if query:
+        try: await query.answer()
+        except: pass
+        if not from_filter:
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
+            except: pass
+
+    # 3. Nettoyage des listes de messages en arrière-plan
+    try:
+        msgs_to_del = []
+        if from_filter:
+            msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
+            msgs_to_del += context.user_data.pop("filter_msgs", [])
+        else:
+            msgs_to_del += CATALOG_MSGS.pop(chat_id, [])
+            msgs_to_del += context.user_data.pop("filter_msgs", [])
+        
+        for mid in set(msgs_to_del):
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            except: pass
+    except: pass
+
+    # 4. Exécution de la Recherche SQL
+    try:
+        filters = context.user_data.get('active_filters', {})
+        PER_PAGE = 2
+        chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
+    except Exception as e:
+        # Si ça plante, on le dit
+        if loading_msg:
+            try: await loading_msg.edit_text(f"⚠️ Erreur: {e}")
+            except: pass
+        return
+
+    # 5. On supprime le message "Recherche..." maintenant que c'est prêt
+    if loading_msg:
+        try: await loading_msg.delete()
         except: pass
 
-        # 2. RECHERCHE SQL (Directe)
-        # ⚠️ ICI: On appelle SEULEMENT _get_products_optimized. 
-        # On n'appelle JAMAIS _filter_products !
-        filters = context.user_data.get('active_filters', {})
-        chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=2, filters=filters, tier=tier)
+    # Calculs de page
+    total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    sent_ids = []
 
-        total_pages = max(1, (total_items + 1) // 2) # Calcul simple
-        page = max(0, min(page, total_pages - 1))
-        sent_ids = []
+    # 6. Si aucun résultat
+    if not chunk:
+        text = "❌ Aucun produit trouvé."
+        kb = _build_filter_menu(context, page_info=None) if from_filter else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
+        m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        if from_filter: context.user_data['filter_msgs'] = [m.message_id]
+        else: CATALOG_MSGS[chat_id] = [m.message_id]
+        return
 
-        # 3. Si vide
-        if not chunk:
-            text = "❌ Aucun produit trouvé."
-            kb = _build_filter_menu(context, page_info=None) if from_filter else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
-            m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-            
-            if from_filter: context.user_data['filter_msgs'] = [m.message_id]
-            else: CATALOG_MSGS[chat_id] = [m.message_id]
-            return
-
-        # 4. Affichage
-        for p in chunk:
-            title = str(p['title']).replace("*", "").replace("`", "")
-            base = str(p['tier']).replace("*", "")
-            price = p['price']
-            
-            txt = f"📦 *PROPRO*\n━━━━━━━━━━━━━━━\n👤 **NOM** : `{title}`\n📂 **BASE** : `{base}`\n💰 **PRIX** : `{price:.2f} CAD`"
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"), InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}") ]])
-            
+    # 7. Affichage des fiches
+    for p in chunk:
+        title = str(p.get('title', 'Unknown')).replace("*", "").replace("`", "")
+        base = str(p.get('tier', 'N/A')).replace("*", "")
+        price = p.get('price', 0.0)
+        
+        txt = f"📦 *PROPRO*\n━━━━━━━━━━━━━━━\n👤 **NOM** : `{title}`\n📂 **BASE** : `{base}`\n💰 **PRIX** : `{price:.2f} CAD`"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"), InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}") ]])
+        try:
+            m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
+            sent_ids.append(m.message_id)
+        except: 
             try:
-                m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
-                sent_ids.append(m.message_id)
-            except:
-                # Fallback Texte Brut
                 m = await context.bot.send_message(chat_id=chat_id, text=txt.replace('*',''), reply_markup=kb)
                 sent_ids.append(m.message_id)
+            except: pass
 
-        # 5. Menu Bas
-        if from_filter:
-            context.user_data['filter_fiches_msg_ids'] = sent_ids
-            kb = _build_filter_menu(context, page_info={'page': page, 'total_pages': total_pages})
-            m = await context.bot.send_message(chat_id=chat_id, text=f"🔎 Résultats : {total_items} (Page {page+1}/{total_pages})", reply_markup=kb)
-            context.user_data['filter_msgs'] = [m.message_id]
-        else:
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
-                [InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")],
-                [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
-            ])
-            m = await context.bot.send_message(chat_id=chat_id, text=f"📊 Catalogue ({total_items} produits)", reply_markup=kb)
-            sent_ids.append(m.message_id)
-            CATALOG_MSGS[chat_id] = sent_ids
-
-    except Exception as e:
-        # L'AIRBAG : Si ça plante, on te le dit !
-        print(f"CRASH DISPLAY: {e}")
-        try: await context.bot.send_message(chat_id=chat_id, text=f"🔥 ERREUR D'AFFICHAGE : {e}")
-        except: pass
-
-
+    # 8. Menu Navigation (Bas de page)
+    if from_filter:
+        context.user_data['filter_fiches_msg_ids'] = sent_ids
+        kb = _build_filter_menu(context, page_info={'page': page, 'total_pages': total_pages})
+        m = await context.bot.send_message(chat_id=chat_id, text=f"🔎 Résultats : {total_items} (Page {page+1}/{total_pages})", reply_markup=kb)
+        context.user_data['filter_msgs'] = [m.message_id]
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
+            [InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+        ])
+        m = await context.bot.send_message(chat_id=chat_id, text=f"📊 Catalogue ({total_items} produits)", reply_markup=kb)
+        sent_ids.append(m.message_id)
+        CATALOG_MSGS[chat_id] = sent_ids
 
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
     """Construit le menu de filtre dynamique, AVEC pagination optionnelle."""
@@ -882,40 +901,60 @@ async def filter_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return CATALOG_FILTER_AWAIT_VALUE
 
 async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """L'utilisateur a envoyé une valeur (ex: "MAUDE")."""
-    key = context.user_data.pop('current_filter_key', None)
-    if not key:
-        return CATALOG_FILTER_MAIN # Sécurité
+    """Réception de la valeur du filtre (Année, Prix, etc.) avec sécurité anti-crash."""
+    try:
+        # 1. Vérification de la clé
+        key = context.user_data.get('current_filter_key')
+        if not key:
+            # Si la clé est perdue (ex: redémarrage), on renvoie au menu principal proprement
+            kb = _build_filter_menu(context)
+            await update.message.reply_text("⚠️ Session expirée. Refaites votre choix.", reply_markup=kb)
+            return CATALOG_FILTER_MAIN
+            
+        # 2. Nettoyage de la valeur
+        value = update.message.text.strip()
+        context.user_data.setdefault('pending_filters', {})[key] = value
         
-    value = update.message.text.strip()
-    
-    # Sauvegarde le filtre
-    context.user_data.setdefault('pending_filters', {})[key] = value
-    
-    # Supprime la question "Type a name..." et la réponse "MAUDE"
-    try:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data['filter_msgs'][0])
-    except: pass
-    try:
-        await update.message.delete()
-    except: pass
+        # 3. Suppression des anciens messages (Prompt + Réponse user)
+        # On le fait DANS un try pour ne pas bloquer si ça échoue
+        try:
+            prev_msg_id = context.user_data.get('filter_msgs', [])[0]
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except: pass
         
-    # Envoie la notification temporaire
-    notif_msg = await update.message.reply_text(f"✅ Filtre '{key}' mis à jour: {value}", quote=False)
-    
-    # Ré-affiche le menu de filtre principal (mis à jour avec la coche ✅)
-    kb = _build_filter_menu(context)
-    m = await update.message.reply_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
-    context.user_data['filter_msgs'] = [m.message_id] # Stocke le nouvel ID de menu
-    
-    # Supprime la notification après 2 secondes
-    await asyncio.sleep(2)
-    try:
-        await notif_msg.delete()
-    except:
-        pass
-    
-    return CATALOG_FILTER_MAIN
+        try:
+            await update.message.delete()
+        except: pass
+            
+        # 4. Confirmation visuelle (Toast)
+        # On utilise try/except au cas où
+        try:
+            notif = await update.message.reply_text(f"✅ Filtre '{key}' = {value}", quote=False)
+            # Suppression différée (non bloquante)
+            asyncio.create_task(delete_later(notif, 2)) 
+        except: pass
+        
+        # 5. Affichage du nouveau menu
+        kb = _build_filter_menu(context)
+        m = await update.message.reply_text("Filtres appliqués. Cliquez sur 'Search' :", reply_markup=kb)
+        context.user_data['filter_msgs'] = [m.message_id] # Mise à jour de l'ID
+        
+        # 6. Nettoyage de la clé temporaire
+        context.user_data.pop('current_filter_key', None)
+        
+        return CATALOG_FILTER_MAIN
+
+    except Exception as e:
+        # AIRBAG : Si ça plante, on te le dit !
+        print(f"[CRASH FILTER] {e}")
+        await update.message.reply_text(f"🔥 Erreur dans le filtre : {e}")
+        return CATALOG_FILTER_MAIN
+
+# Petite fonction utilitaire pour supprimer sans bloquer
+async def delete_later(msg, delay):
+    await asyncio.sleep(delay)
+    try: await msg.delete()
+    except: pass
 
 async def filter_page_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère la navigation de page PENDANT un filtre."""
@@ -1019,14 +1058,19 @@ async def ccs_catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_products_ccs(update, context, page=0, tier=None, from_filter=False):
-    # Logs espion pour le débogage
-    import os; pid = os.getpid()
-    print(f"[ESPION] 💳 EXECUTION show_products_ccs | Page: {page} | PID: {pid}", flush=True)
-
+    import asyncio
+    import os
+    
     query = getattr(update, "callback_query", None)
     chat_id = query.message.chat_id if query else update.effective_chat.id
     
-    # Gestion propre du spinner et suppression ancien message
+    # 1. UX : CHARGEMENT + PAUSE
+    loading_msg = None
+    try:
+        loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Recherche en cours...")
+        await asyncio.sleep(0.5) # Pause UX
+    except: pass
+    
     if query:
         try: await query.answer()
         except: pass
@@ -1034,7 +1078,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
             try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
             except: pass
 
-    # 1. Nettoyage des vieux messages (pour éviter l'accumulation)
+    # 2. Nettoyage
     try:
         msgs_to_del = []
         if from_filter:
@@ -1043,37 +1087,36 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
         else:
             msgs_to_del += CCS_CATALOG_MSGS.pop(chat_id, [])
             msgs_to_del += context.user_data.pop("ccs_filter_msgs", [])
-        
         for mid in set(msgs_to_del):
             try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             except: pass
     except: pass
 
-    # 2. RECHERCHE SQL DIRECTE (LE CORRECTIF EST ICI)
-    # On utilise _get_products_optimized au lieu de l'ancien système
+    # 3. Recherche SQL
     try:
         filters = context.user_data.get('ccs_active_filters', {})
         PER_PAGE = 2
-        # Appel au moteur SQL rapide
         chunk, total_items = _get_products_optimized(category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
     except Exception as e:
-        # En cas d'erreur SQL, on prévient l'admin au lieu de disparaître
-        print(f"[ERREUR CRITIQUE] {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Erreur technique (DB): {e}")
+        if loading_msg:
+            try: await loading_msg.edit_text(f"⚠️ Erreur DB: {e}")
+            except: pass
         return
 
-    # Calcul pagination
+    # 4. Suppression Loading
+    if loading_msg:
+        try: await loading_msg.delete()
+        except: pass
+
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     sent_ids = []
 
-    # 3. Fonction d'affichage locale pour Cc's
+    # Fonction locale d'affichage
     def fmt_product_ccs(p):
         try:
             lines = []
             content = p.get('content', '')
-            
-            # Extraction simple
             def get_val(key):
                 import re
                 m = re.search(f"{key}:\\s*(.+)", content, re.IGNORECASE)
@@ -1081,30 +1124,26 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
 
             cc = get_val("CC") or get_val("BINS")
             exp = get_val("EXP")
-            
-            if cc: lines.append(f"BINS: {cc[:6]}") 
+            if cc: lines.append(f"BINS: {cc[:6]}")
             if exp: lines.append(f"EXP: {exp}")
-            
             raw_title = str(p.get('title', '')).split('•')[0].strip()
             lines.append(f"FIRST NAME: {raw_title}")
             lines.append(f"BASE: {p.get('tier', 'N/A')}")
             lines.append(f"PRICE: {p.get('price', 0.0):.2f} CAD")
-            
             return "\n".join(lines)
         except:
             return f"💳 {p.get('title')}\n{p.get('price')} CAD"
 
-    # 4. GESTION "AUCUN RÉSULTAT"
+    # 5. Gestion vide
     if not chunk:
-        text = "❌ Aucun produit Cc's trouvé pour ces critères."
+        text = "❌ Aucun produit Cc's trouvé."
         kb = _build_filter_menu_ccs(context, page_info=None) if from_filter else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
         m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-        
         if from_filter: context.user_data['ccs_filter_msgs'] = [m.message_id]
         else: CCS_CATALOG_MSGS[chat_id] = [m.message_id]
         return
 
-    # 5. AFFICHAGE DES FICHES
+    # 6. Affichage
     for p in chunk:
         txt = fmt_product_ccs(p)
         pid = p['id']
@@ -1114,7 +1153,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
             sent_ids.append(m.message_id)
         except: pass
 
-    # 6. MENU NAVIGATION
+    # 7. Menu Bas
     if from_filter:
         context.user_data['ccs_filter_fiches_msg_ids'] = sent_ids
         kb = _build_filter_menu_ccs(context, page_info={'page': page, 'total_pages': total_pages})
@@ -5304,7 +5343,7 @@ catalog_filter_conv = ConversationHandler(
     persistent=False, # Ne pas sauvegarder les états de filtre si le bot redémarre
     name="catalog_filter_conversation"
 )
-app_telegram.add_handler(catalog_filter_conv, group=10) # Doit être dans un groupe
+app_telegram.add_handler(catalog_filter_conv) # Doit être dans un groupe
 
 
 # === Filtres catalogue (CLONE POUR CCS) ===
@@ -5333,7 +5372,7 @@ ccs_catalog_filter_conv = ConversationHandler(
     persistent=False,
     name="ccs_catalog_filter_conversation"
 )
-app_telegram.add_handler(ccs_catalog_filter_conv, group=11) # Nouveau groupe (11)
+app_telegram.add_handler(ccs_catalog_filter_conv,) # Nouveau groupe (11)
 # === Produits ===
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_preview_callback, pattern=r"^prod:preview:\d+$"), group=-1)
 app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback,     pattern=r"^buy:\d+$"), group=-1)
