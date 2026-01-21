@@ -25,6 +25,8 @@ from dotenv import load_dotenv
 from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
+from mnemonic import Mnemonic
+import tickets  # Importe notre nouveau fichier
 
 
 from telegram import (
@@ -165,17 +167,16 @@ def log(msg, user_id="SYSTEM", level="info"):
             print("[LOG ERROR] (encoding issue while printing message)")
 
 # ========================== CONFIG ==========================
-FAKEID_API_KEY = os.environ.get("FAKEID_API_KEY", "7a460685-7635-499d-90e1-8c859d04ba55")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyDcCG1bOF6d5kHOJce1__zFfNux-dAKoVI")
-SW_PROJECT_ID = os.environ.get("SW_PROJECT_ID", "e6f483f8-a47f-48d3-b7a7-34fead35200b")
-SW_TOKEN = os.environ.get("SW_TOKEN", "PTf0f2493cbd50329d89c76c5d88e6b80faa3c761d2bf6d23f")
-SW_SPACE = os.environ.get("SIGNALWIRE_SPACE_URL", "john-m-shop.signalwire.com")
+FAKEID_API_KEY = os.environ.get("FAKEID_API_KEY")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+SW_PROJECT_ID = os.environ.get("SW_PROJECT_ID")
+SW_TOKEN = os.environ.get("SW_TOKEN")
+SW_SPACE = os.environ.get("SIGNALWIRE_SPACE_URL")
 os.environ["SIGNALWIRE_SPACE_URL"] = SW_SPACE
-
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-DESTINATION_NUMBER = os.environ.get("DESTINATION_NUMBER", "+18003617620")
-SIGNALWIRE_NUMBER = os.environ.get("SIGNALWIRE_NUMBER", "+12029928463")
-SERVER_URL = os.environ.get("SERVER_URL", "http://37.228.129.82:5001")
+DESTINATION_NUMBER = os.environ.get("DESTINATION_NUMBER")
+SIGNALWIRE_NUMBER = os.environ.get("SIGNALWIRE_NUMBER")
+SERVER_URL = os.environ.get("SERVER_URL")
 ADMIN_IDS = ["7573645008", "8409831904"]
 CHANNEL_LOGS = "-1003589564052"
 
@@ -213,6 +214,9 @@ CATALOG_FILTER_MAIN, CATALOG_FILTER_AWAIT_VALUE = range(500, 502)
 CCS_FILTER_MAIN, CCS_FILTER_AWAIT_VALUE = range(600, 602)
 WAIT_AMOUNT_CRYPTO = 800
 ADMIN_XPUB = os.environ.get("ADMIN_XPUB")
+ID_AUTH_WAIT_PIN_CREATE = 800  # Création du PIN
+ID_AUTH_WAIT_PIN_LOGIN = 801   # Connexion (Entrée du PIN)
+ID_AUTH_WAIT_SEED = 802        # Import d'un wallet existant
 
 # Paliers
 FORFAITS = {
@@ -307,23 +311,63 @@ def msg(user_id, key, **kwargs):
 def init_db():
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
+    
+    # 1. Création des tables si elles n'existent pas
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id TEXT PRIMARY KEY,
-            balance REAL DEFAULT 0,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT UNIQUE,
+            telegram_id TEXT,
+            username TEXT,
+            seed_phrase TEXT,
+            pin_code TEXT,
+            balance REAL DEFAULT 0.0,
+            banned INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             lang TEXT DEFAULT 'fr',
             total_recharge REAL DEFAULT 0,
             forfait TEXT DEFAULT 'bronze'
         )
     """)
+    
+    # --- PATCH AUTOMATIQUE DES COLONNES MANQUANTES ---
+    # On vérifie si les colonnes critiques existent, sinon on les ajoute
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN user_id TEXT")
+        print("✅ PATCH DB: Colonne 'user_id' ajoutée.")
+        # Migration des données pour ne pas perdre les comptes
+        cur.execute("UPDATE users SET user_id = telegram_id WHERE user_id IS NULL")
+    except sqlite3.OperationalError:
+        pass # La colonne existe déjà, on ignore
+
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN seed_phrase TEXT")
+        print("✅ PATCH DB: Colonne 'seed_phrase' ajoutée.")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN pin_code TEXT")
+        print("✅ PATCH DB: Colonne 'pin_code' ajoutée.")
+    except sqlite3.OperationalError:
+        pass
+        
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    except sqlite3.OperationalError:
+        pass
+    # ---------------------------------------------------
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             order_id TEXT PRIMARY KEY,
             telegram_id TEXT,
             amount REAL,
-            status TEXT DEFAULT 'pending'
+            status TEXT DEFAULT 'pending',
+            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -333,12 +377,31 @@ def init_db():
             currency TEXT DEFAULT 'CAD',
             stock INTEGER DEFAULT 0,
             tier TEXT,
-            is_active INTEGER DEFAULT 1
+            is_active INTEGER DEFAULT 1,
+            content TEXT
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            status TEXT DEFAULT 'open',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lottery (
+            user_id TEXT PRIMARY KEY,
+            username TEXT,
+            tickets INTEGER DEFAULT 0
+        )
+    """)
+
     con.commit()
     con.close()
-    log("DB initialized", "SYSTEM")
+    log("DB initialized (V2.2 Auto-Patch Ready)", "SYSTEM")
 
 def user_exists(telegram_id: str) -> bool:
     con = sqlite3.connect(DB_NAME)
@@ -559,6 +622,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📣 Channel", callback_data="join_private_channel")],
         [InlineKeyboardButton("📞 Support", callback_data="support")],
         [InlineKeyboardButton("📚 FAQ", callback_data="faq")],
+        [InlineKeyboardButton("🔒 Log Out", callback_data="auth_logout")],
     ]
     if str(user_id) in ADMIN_IDS:
         menu.append([InlineKeyboardButton("⚙️ Admin", callback_data="admin_menu")])
@@ -1791,7 +1855,7 @@ async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_lang(str(update.effective_user.id))
     await replace_view(
         q,
-        "Support : @johnm7777" if lang == "fr" else "Support: @johnm7777",
+        "Support : @nomennesciosupport" if lang == "fr" else "Support: @nomennesciosupport",
         reply_markup=kb_back_to_menu()
     )
 
@@ -1810,7 +1874,7 @@ async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "➡️ Le passage de palier est automatique selon vos recharges.\n\n"
             "🆘 Support :\n"
             "Après tout paiement, envoyez un *screenshot* de la preuve. Le crédit est ajouté très rapidement.\n"
-            "Support direct : @johnm7777\n\n"
+            "Support direct : @nomennesciosupport\n\n"
             "⚡ Délais :\n"
             "La validation des permis est quasi instantanée. Les paiements sont confirmés en quelques minutes.\n\n"
             "🤝 Partenariats :\n"
@@ -1829,7 +1893,7 @@ async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "➡️ Tier upgrades are automatic based on your recharges.\n\n"
             "🆘 Support:\n"
             "After each payment, please send a *screenshot* as proof. Your balance will be credited very quickly.\n"
-            "Direct support: @johnm7777\n\n"
+            "Direct support: @nomennesciosupport\n\n"
             "⚡ Processing time:\n"
             "License validation is almost instant. Payments are confirmed within minutes.\n\n"
             "🤝 Partnerships:\n"
@@ -2333,18 +2397,299 @@ def reset_session(user_id: int):
     for d in [bot_messages, user_sessions, pending_payments, user_validation_status]:
         list(d.pop(user_id, None) for _ in [0])
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log("START command received", update.effective_user.id)
-    global bot_loop
-    user_id = update.effective_user.id
-    if not user_exists(str(user_id)):
-        update_user_balance(str(user_id), 0.0)
-        upgrade_user_statut_auto(str(user_id))
+# ========================== AUTHENTIFICATION (LEDGER SYSTEM) ==========================
+
+def get_pin_keyboard():
+    """Génère le clavier numérique sécurisé."""
+    keys = [
+        [InlineKeyboardButton("1", callback_data="pin_1"), InlineKeyboardButton("2", callback_data="pin_2"), InlineKeyboardButton("3", callback_data="pin_3")],
+        [InlineKeyboardButton("4", callback_data="pin_4"), InlineKeyboardButton("5", callback_data="pin_5"), InlineKeyboardButton("6", callback_data="pin_6")],
+        [InlineKeyboardButton("7", callback_data="pin_7"), InlineKeyboardButton("8", callback_data="pin_8"), InlineKeyboardButton("9", callback_data="pin_9")],
+        [InlineKeyboardButton("🗑 Effacer", callback_data="pin_del"), InlineKeyboardButton("0", callback_data="pin_0"), InlineKeyboardButton("✅ Valider", callback_data="pin_enter")]
+    ]
+    return InlineKeyboardMarkup(keys)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
     
-    # --- CORRECTION ---
-    # Appelle goto_menu qui va TOUT nettoyer (historique, catalogue, etc.)
+    # Nettoyage préventif
+    context.user_data['temp_pin_input'] = "" 
+    
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT pin_code, username FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+
+    # CAS A : Déjà sécurisé -> LOGIN AVEC CLAVIER
+    if row and row[0]: 
+        # On stocke le message ID pour le supprimer plus tard
+        msg = await update.message.reply_text(
+            f"🔒 **TERMINAL VERROUILLÉ**\n"
+            f"Utilisateur : {row[1] or user.first_name}\n\n"
+            f"PIN : `____`", # 4 underscores pour commencer
+            reply_markup=get_pin_keyboard(),
+            parse_mode="Markdown"
+        )
+        context.user_data['auth_msg_id'] = msg.message_id
+        return ID_AUTH_WAIT_PIN_LOGIN
+
+    # CAS B : Pas de PIN -> SETUP (inchangé)
+    else:
+        kb = [[InlineKeyboardButton("🆕 Créer un Wallet (Sécuriser)", callback_data="auth_create")]]
+        await update.message.reply_text(
+            f"🕵️‍♂️ **BIENVENUE SUR NOMEN NESCIO**\n━━━━━━━━━━━━━━━━━━\nVotre ligne n'est pas sécurisée.\nCréez une Identité Cryptographique.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+# --- ÉTAPE A : GÉNÉRATION DE LA SEED (24 MOTS) ---
+async def auth_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    # Génération BIP39 (Standard Crypto)
+    mnemo = Mnemonic("english")
+    seed_phrase = mnemo.generate(strength=256) # 256 bits = 24 mots
+    
+    # On garde ça en mémoire vive (RAM) le temps qu'il finisse le setup
+    context.user_data['temp_seed'] = seed_phrase
+    
+    # UX : Monospace pour copier facile
+    await q.message.edit_text(
+        f"🔐 **VOTRE CLÉ PRIVÉE (MASTER KEY)**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ _Sauvegardez ces mots. C'est le SEUL moyen de récupérer votre compte si vous perdez ce téléphone._\n\n"
+        f"`{seed_phrase}`\n\n"
+        f"*(Touchez le texte pour copier)*\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👇 **DERNIÈRE ÉTAPE**\n"
+        f"Définissez un **CODE PIN** (4 à 8 chiffres) pour ce terminal :",
+        parse_mode="Markdown"
+    )
+    return ID_AUTH_WAIT_PIN_CREATE
+
+# --- ÉTAPE B : SAUVEGARDE DU PIN ET DU COMPTE ---
+async def auth_create_pin_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pin = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+    username = update.effective_user.username or "Ghost"
+    
+    # 1. Validation PIN
+    if not pin.isdigit() or not (4 <= len(pin) <= 8):
+        await update.message.reply_text("❌ **Erreur :** Le PIN doit faire 4 à 8 chiffres.\nRéessayez :", parse_mode="Markdown")
+        return ID_AUTH_WAIT_PIN_CREATE
+        
+    seed = context.user_data.get('temp_seed')
+    if not seed:
+        await update.message.reply_text("⚠️ Session expirée. Tapez /start.")
+        return ConversationHandler.END
+        
+    # 2. Enregistrement DB (Update si existe, Insert si nouveau)
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # On regarde si l'user existe déjà (pour ne pas écraser son solde)
+    cur.execute("SELECT id FROM users WHERE user_id=?", (user_id,))
+    exists = cur.fetchone()
+    
+    if exists:
+        # Mise à jour ancien user -> User Sécurisé
+        cur.execute("UPDATE users SET seed_phrase=?, pin_code=?, telegram_id=?, username=? WHERE user_id=?", 
+                   (seed, pin, user_id, username, user_id))
+    else:
+        # Création nouveau user
+        cur.execute("INSERT INTO users (user_id, telegram_id, username, seed_phrase, pin_code) VALUES (?, ?, ?, ?, ?)",
+                   (user_id, user_id, username, seed, pin))
+                   
+    con.commit()
+    con.close()
+    
+    # Nettoyage
+    context.user_data.pop('temp_seed', None)
+    
+    await update.message.reply_text(f"✅ **SÉCURITÉ ACTIVÉE**\nCode PIN : `{pin}` enregistré.\n\nConnexion au Mainframe...", parse_mode="Markdown")
+    
+    # Lancement direct du menu
     await goto_menu(update, context)
-    # --- FIN CORRECTION ---
+    return ConversationHandler.END
+
+# --- ÉTAPE C : LOGIN (VÉRIFICATION PIN) ---
+async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    # On répond tout de suite pour éviter que le bouton charge dans le vide
+    try: await q.answer() 
+    except: pass
+    
+    data = q.data
+    user_id = str(update.effective_user.id)
+    
+    # Récupère le PIN en cours de frappe
+    current_input = context.user_data.get('temp_pin_input', "")
+
+    # 1. Gestion des chiffres
+    if data.startswith("pin_") and data[4:].isdigit():
+        digit = data.split("_")[1]
+        if len(current_input) < 8: # Max 8 chiffres
+            current_input += digit
+            context.user_data['temp_pin_input'] = current_input
+            
+            mask = "⚫" * len(current_input) + "_" * (4 - len(current_input)) if len(current_input) < 4 else "⚫" * len(current_input)
+            try:
+                await q.edit_message_text(
+                    f"🔒 **TERMINAL VERROUILLÉ**\nPIN : {mask}",
+                    reply_markup=get_pin_keyboard(),
+                    parse_mode="Markdown"
+                )
+            except: pass
+
+    # 2. Gestion Effacer
+    elif data == "pin_del":
+        current_input = current_input[:-1]
+        context.user_data['temp_pin_input'] = current_input
+        mask = "⚫" * len(current_input) + "_" * (4 - len(current_input)) if len(current_input) < 4 else "⚫" * len(current_input)
+        try:
+            await q.edit_message_text(
+                f"🔒 **TERMINAL VERROUILLÉ**\nPIN : {mask}",
+                reply_markup=get_pin_keyboard(),
+                parse_mode="Markdown"
+            )
+        except: pass
+
+    # 3. Gestion Valider
+    elif data == "pin_enter":
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        cur.execute("SELECT pin_code FROM users WHERE user_id=?", (user_id,))
+        row = cur.fetchone()
+        con.close()
+        
+        if row and row[0] == current_input:
+            # --- SUCCÈS ---
+            
+            # A. On essaie de supprimer le clavier
+            try:
+                await q.message.delete()
+            except:
+                # B. Si on ne peut pas supprimer, on le modifie pour qu'il disparaisse visuellement
+                try:
+                    await q.edit_message_text("✅ **Connexion réussie.**", parse_mode="Markdown")
+                except: pass
+            
+            # C. On lance le menu
+            await show_main_menu(update.effective_user.id, clear=True)
+            return ConversationHandler.END
+        else:
+            # --- ECHEC ---
+            context.user_data['temp_pin_input'] = ""
+            try:
+                await q.edit_message_text(
+                    "⛔ **CODE FAUX !** Réessayez.\nPIN : `____`",
+                    reply_markup=get_pin_keyboard(),
+                    parse_mode="Markdown"
+                )
+            except: pass
+            return ID_AUTH_WAIT_PIN_LOGIN
+            
+    return ID_AUTH_WAIT_PIN_LOGIN
+
+# --- BOUTON LOG OUT ---
+async def auth_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("🔒 Options de session...")
+    
+    # On vide la mémoire vive
+    context.user_data.clear()
+    reset_session(update.effective_user.id)
+    
+    # Menu à deux choix
+    kb = [
+        [InlineKeyboardButton("🔒 Verrouiller (PIN requis)", callback_data="auth_lock_only")],
+        [InlineKeyboardButton("🚪 Changer de compte (Importer)", callback_data="auth_switch_account")]
+    ]
+    
+    await replace_view(
+        q,
+        "🛑 **MENU DÉCONNEXION**\n\n"
+        "Voulez-vous simplement verrouiller l'écran ou changer d'utilisateur ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return ConversationHandler.END
+
+async def auth_lock_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verrouille simplement le terminal."""
+    q = update.callback_query
+    await q.answer()
+    await replace_view(q, "🔒 **Terminal Verrouillé.**\nTapez /start pour revenir.")
+    return ConversationHandler.END
+
+async def auth_switch_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prépare le terrain pour un changement de compte."""
+    q = update.callback_query
+    await q.answer()
+    
+    # Note : On ne supprime pas l'user de la DB, on le laisse juste "dormant"
+    # Le prochain login par seed réattribuera l'ID Telegram.
+    
+    await replace_view(
+        q,
+        "🔄 **CHANGEMENT DE COMPTE**\n\n"
+        "Pour changer de compte, vous devez posséder sa **Clé Maître (Seed Phrase)**.\n\n"
+        "👉 **Cliquez ci-dessous pour commencer :**",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Importer un Wallet", callback_data="auth_import_start")]])
+    )
+    return ConversationHandler.END
+
+async def auth_import_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    await replace_view(
+        q,
+        "📝 **IMPORTATION DE COMPTE**\n\n"
+        "Veuillez entrer votre **Seed Phrase** (les 12 ou 24 mots) séparés par des espaces.\n\n"
+        "⚠️ _Ceci liera ce compte Telegram à ce Wallet._",
+        parse_mode="Markdown"
+    )
+    return ID_AUTH_WAIT_SEED
+
+async def auth_import_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    seed_input = update.message.text.strip()
+    telegram_id = str(update.effective_user.id)
+    
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # On cherche si cette seed existe
+    cur.execute("SELECT user_id, pin_code, username FROM users WHERE seed_phrase=?", (seed_input,))
+    row = cur.fetchone()
+    
+    if row:
+        target_user_id, pin, username = row
+        
+        # SÉCURITÉ CRITIQUE : 
+        # 1. On détache l'ID Telegram de l'ancien compte (où qu'il soit)
+        cur.execute("UPDATE users SET telegram_id = NULL WHERE telegram_id = ?", (telegram_id,))
+        # 2. On attache l'ID Telegram au nouveau compte cible
+        cur.execute("UPDATE users SET telegram_id = ? WHERE user_id = ?", (telegram_id, target_user_id))
+        con.commit()
+        con.close()
+        
+        await update.message.reply_text(
+            f"✅ **Compte récupéré !**\n"
+            f"👤 Bienvenue sur le profil de : {username or 'Utilisateur'}\n"
+            f"🔑 PIN requis : `{pin}`\n\n"
+            f"Tapez /start pour vous connecter.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+    else:
+        con.close()
+        await update.message.reply_text("❌ **Erreur :** Seed phrase inconnue ou invalide. Réessayez :")
+        return ID_AUTH_WAIT_SEED
 
 async def start_verifier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -4262,7 +4607,10 @@ async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # 1. OUTILS GOOGLE & MAPPING & DATES
 def validate_address_google(raw_address):
     """Interroge Google Maps pour nettoyer l'adresse."""
-    if "AIzaSyDcCG1bOF6d5kHOJce1__zFfNux-dAKoVI" in GOOGLE_API_KEY: return [] 
+    # Sécurité : Si pas de clé configurée dans .env, on retourne vide sans planter
+    if not GOOGLE_API_KEY or "AIzaSy" not in GOOGLE_API_KEY:
+        return []
+
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     try:
         res = requests.get(url, params={"address": raw_address, "key": GOOGLE_API_KEY, "language": "fr"})
@@ -4352,6 +4700,15 @@ async def id_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
+    
+    # --- CORRECTION : SUPPRESSION FORCÉE DU MESSAGE PRÉCÉDENT ---
+    # Cela permet d'effacer la photo du produit avant d'afficher le menu
+    try:
+        await q.message.delete()
+    except:
+        pass
+    # ------------------------------------------------------------
+
     kb = [
         [InlineKeyboardButton("🪪 Physical ID", callback_data="id_cat:physical")],
         [InlineKeyboardButton("🔢 Numerical ID", callback_data="id_cat:numerical")],
@@ -4359,7 +4716,14 @@ async def id_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🛠️ Tools", callback_data="id_cat:tool")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     ]
-    await replace_view(q, "🪪 **ID/Docs Center**\nChoisissez une catégorie :", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    
+    # On utilise send_message car on a supprimé l'ancien message
+    await context.bot.send_message(
+        chat_id=q.message.chat_id, 
+        text="🪪 **ID/Docs Center**\nChoisissez une catégorie :", 
+        reply_markup=InlineKeyboardMarkup(kb), 
+        parse_mode="Markdown"
+    )
     return ID_CAT_VIEW
 
 async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4378,11 +4742,11 @@ async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ Aucun produit.", reply_markup=kb_back_to_menu())
         return ConversationHandler.END
 
-    # Dictionnaire de traduction (Noms Longs -> Noms Courts)
+    
     short_names = {
-        "Quebec Driver License (Full)": "QC DL",
-        "Ontario Driver License": "ON DL",
-        "Quebec RESIDENCE": "CA PR",
+        "Quebec Driver License (Full)": "QC DRIVER LICENSE",
+        "Ontario Driver License": "ON DRIVER LICENSE",
+        "Quebec RESIDENCE": "CA RESIDENT PERMANENT",
         "SIN Card (Plastic)": "CA SIN",
         "Barcode Generator QC": "Gen QC",
         "Barcode Generator ON": "Gen ON"
@@ -4446,10 +4810,10 @@ async def id_view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Texte de description
     caption = (
-        f"🏷️ **{title}**\n\n"
-        f"💰 Prix : **{price:.2f}$**\n"
-        f"📦 Type : {tier}\n\n"
-        f"ℹ️ _Qualité supérieure, scanne parfaitement. Inclut recto/verso et hologrammes._"
+        f"🪪 **{title}**\n\n"
+        f"💰 Prix : **{price:.2f}$**\n\n"
+        f"🌎 Province : {tier}\n\n"
+        f"ℹ️ _Bankgrade, Scannable et UV. Inclut Recto/Verso._"
     )
     
     # Bouton Acheter qui redirige vers id_buy (la fonction qui demande la quantité)
@@ -4648,72 +5012,105 @@ async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     return ID_ASK_QTY
 
-# 3. DÉMARRAGE FORMULAIRE (MODIFIÉ)
+
+# 3. DÉMARRAGE FORMULAIRE (AVEC NETTOYAGE TOTAL)
 async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     user_id = str(q.from_user.id)
+    
+    # Initialisation de la liste de nettoyage
+    context.user_data['cleanup_ids'] = []
+    
+    # On ajoute le message actuel (le menu quantité) à la liste
+    try: context.user_data['cleanup_ids'].append(q.message.message_id)
+    except: pass
+
     total = context.user_data['id_product']['price'] * context.user_data['id_qty']
     if get_user_balance(user_id) < total:
         await q.edit_message_text("❌ Solde insuffisant.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recharger", callback_data="add_balance")]]))
         return ConversationHandler.END
     update_user_balance(user_id, -total)
     
-    # Demande Prénom (Séparé)
-    await q.edit_message_text("✍️ **Formulaire (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?")
+    # Demande Prénom
+    m = await q.edit_message_text("✍️ **Formulaire (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?")
+    # On track le message édité (c'est le même ID, mais on s'assure qu'il est dans la liste)
+    if m.message_id not in context.user_data['cleanup_ids']:
+        context.user_data['cleanup_ids'].append(m.message_id)
+        
     return ID_ASK_NAME
 
 async def id_save_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_firstname'] = update.message.text.strip()
-    await update.message.reply_text("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?")
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id) # Track réponse user
+    
+    m = await update.message.reply_text("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?")
+    context.user_data['cleanup_ids'].append(m.message_id) # Track question bot
     return ID_ASK_LASTNAME
 
 async def id_save_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_lastname'] = update.message.text.strip()
     context.user_data['form_name'] = f"{context.user_data['form_firstname']} {context.user_data['form_lastname']}"
-    
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+
     if context.user_data.get('id_category') == 'document':
         context.user_data['form_dob'] = "N/A"
-        await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
+        m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
+        context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_STREET
     else:
-        await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)")
+        m = await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)")
+        context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_DOB
 
 async def id_save_dob(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     clean_date = parse_date_smart(update.message.text)
     if not clean_date:
-        await update.message.reply_text("⚠️ Format invalide. Réessayez (ex: 15/05/1995).")
+        m = await update.message.reply_text("⚠️ Format invalide. Réessayez (ex: 15/05/1995).")
+        context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_DOB
     context.user_data['form_dob'] = clean_date
-    await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
+    m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_STREET
 
 async def id_save_street(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_street'] = update.message.text
-    await update.message.reply_text("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?")
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    m = await update.message.reply_text("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?")
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_CITY
 
 async def id_save_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_city'] = update.message.text
-    await update.message.reply_text("📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?")
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    m = await update.message.reply_text("📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?")
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_ZIP
 
 async def id_save_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     zip_code = update.message.text.upper().strip()
     context.user_data['addr_zip'] = zip_code
-    raw = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {zip_code}"
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     
-    msg = await update.message.reply_text("🔍 Validation Google Maps...")
+    raw = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {zip_code}"
+    m_wait = await update.message.reply_text("🔍 Validation Google Maps...")
+    context.user_data['cleanup_ids'].append(m_wait.message_id) # On track le msg "validation"
+    
     suggestions = validate_address_google(raw)
     context.user_data['addr_suggestions'] = suggestions or [raw]
     
     kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(context.user_data['addr_suggestions'])]
     kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
-    await msg.edit_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
+    
+    # On édite le message d'attente, l'ID ne change pas, donc c'est déjà tracké
+    await m_wait.edit_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
     return ID_CONFIRM_ADDR
 
 async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
+    # Pas besoin de tracker q.message car c'est celui de l'étape d'avant (déjà tracké)
+    
     if "retry" in q.data:
         await q.edit_message_text("📍 Entrez le **Numéro et la Rue** :"); return ID_ASK_STREET
     
@@ -4724,13 +5121,11 @@ async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_
         await q.edit_message_text("🏢 **Nom de l'Employeur** ?")
         return ID_ASK_DOC_EMPLOYER
     else:
-        # Vers les dates
         await q.edit_message_text("📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)")
         return ID_ASK_ISSUE
 
-# --- NOUVELLES FONCTIONS LOGIQUES ---
-
 async def id_save_issue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     txt = update.message.text
     if txt.lower() in ['today', "aujourd'hui", 'now']:
         clean_date = datetime.now().strftime("%Y-%m-%d")
@@ -4738,54 +5133,69 @@ async def id_save_issue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_date = parse_date_smart(txt)
     
     if not clean_date:
-        await update.message.reply_text("⚠️ Date invalide.")
+        m = await update.message.reply_text("⚠️ Date invalide.")
+        context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_ISSUE
     context.user_data['form_issue'] = clean_date
-    await update.message.reply_text("📅 **Quelle est l'Année d'Expiration ?**\n(Le jour/mois seront ceux de la naissance)\nEx: **2028**")
+    m = await update.message.reply_text("📅 **Quelle est l'Année d'Expiration ?**\n(Le jour/mois seront ceux de la naissance)\nEx: **2028**")
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_EXPIRY
 
 async def id_save_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     year = update.message.text.strip()
     if not year.isdigit() or len(year) != 4:
-        await update.message.reply_text("⚠️ Entrez juste l'année (ex: 2029).")
+        m = await update.message.reply_text("⚠️ Entrez juste l'année (ex: 2029).")
+        context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_EXPIRY
     
     dob = context.user_data.get('form_dob', '2000-01-01')
     context.user_data['form_expiry'] = f"{year}-{dob[5:]}"
-    await update.message.reply_text("🆔 **Numéro de Permis (DAQ) ?**\n(Ex: T1234-123456-12)")
+    m = await update.message.reply_text("🆔 **Numéro de Permis (DAQ) ?**\n(Ex: T1234-123456-12)")
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_DL_NUM
 
 async def id_save_dl_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     context.user_data['form_dl_number'] = update.message.text.upper().strip()
-    await update.message.reply_text("🔢 **Numéro de Référence (DCF/DD) ?**\n(Le petit numéro, ex: 12345678)")
+    m = await update.message.reply_text("🔢 **Numéro de Référence (DCF/DD) ?**\n(Le petit numéro, ex: 12345678)")
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_REF_NUM
 
 async def id_save_ref_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     context.user_data['form_ref_number'] = update.message.text.upper().strip()
     kb = [
         [InlineKeyboardButton("Homme (Male)", callback_data="sex:1"), InlineKeyboardButton("Femme (Female)", callback_data="sex:2")],
         [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")]
     ]
-    await update.message.reply_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb))
+    m = await update.message.reply_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_SEX
 
 async def id_save_sex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     sex = q.data.split(":")[1]
     context.user_data['form_sex'] = sex
+    
+    # On édite le message précédent pour confirmer le choix (le message est déjà tracké)
     try: await q.edit_message_text(f"👤 Sexe: {'Homme' if sex=='1' else 'Femme'}")
     except: pass
-    await q.message.reply_text("📏 **Quelle est votre taille ?**\n(Ex: 175 cm)")
+    
+    m = await q.message.reply_text("📏 **Quelle est votre taille ?**\n(Ex: 175 cm)")
+    context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
     return ID_ASK_HEIGHT
 
 async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     context.user_data['form_height'] = update.message.text
     kb = [
         [InlineKeyboardButton("Marron (Brown)", callback_data="eye:BRO"), InlineKeyboardButton("Bleu (Blue)", callback_data="eye:BLU")],
         [InlineKeyboardButton("Vert (Green)", callback_data="eye:GRN"), InlineKeyboardButton("Noisette (Hazel)", callback_data="eye:HZL")],
         [InlineKeyboardButton("Gris (Grey)", callback_data="eye:GRY"), InlineKeyboardButton("Noir (Black)", callback_data="eye:BLK")]
     ]
-    await update.message.reply_text("👁️ **Couleur des yeux ?**", reply_markup=InlineKeyboardMarkup(kb))
+    m = await update.message.reply_text("👁️ **Couleur des yeux ?**", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_EYES
 
 async def id_save_eyes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4795,20 +5205,22 @@ async def id_save_eyes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try: await q.edit_message_text(f"👁️ Yeux: {context.user_data['form_eyes']}")
         except: pass
     else:
+        context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
         context.user_data['form_eyes'] = update.message.text
 
-    # Si c'est un Tool, on montre le résumé avant de générer
     if context.user_data.get('id_category') == 'tool':
         return await id_show_summary(update, context)
 
-    await (update.message or update.callback_query.message).reply_text("📸 **Envoyez votre photo (Selfie)**")
+    # Si c'est un message texte manuel, le 'm' doit être tracké
+    msg_target = update.message if update.message else update.callback_query.message
+    m = await msg_target.reply_text("📸 **Envoyez votre photo (Selfie)**")
+    context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
     return ID_ASK_PHOTO
 
 async def id_save_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     context.user_data['form_photo_id'] = update.message.photo[-1].file_id
     return await id_finalize_order(update, context)
-
-# --- RÉSUMÉ & FIN ---
 
 async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
@@ -4838,10 +5250,12 @@ async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
           [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]]
     
     target = update.message or update.callback_query.message
-    await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    context.user_data.setdefault('cleanup_ids', []).append(m.message_id) # On track le résumé
     return ID_CONFIRM_SUMMARY
 
 async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
     q = update.callback_query
     if q: await q.answer()
     
@@ -4851,7 +5265,7 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prod = d.get('id_product')
     target = update.message or update.callback_query.message
 
-    # 0. TRANSFORMATION EN MAJUSCULES (Correction demandée)
+    # 0. TRANSFORMATION EN MAJUSCULES
     fn = str(d.get('form_firstname', '')).upper()
     ln = str(d.get('form_lastname', '')).upper()
     dob = str(d.get('form_dob', '')).upper()
@@ -4866,7 +5280,7 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     height = str(d.get('form_height', '')).upper()
     eyes = str(d.get('form_eyes', '')).upper()
 
-    # 1. Préparation des données pour l'API
+    # 1. Préparation API
     api_data = {
         "form_firstname": fn, "form_lastname": ln,
         "form_dob": dob, "form_issue": issue,
@@ -4876,28 +5290,47 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "form_sex": sex, "form_height": height, "form_eyes": eyes
     }
 
-    # Cas 1 : TOOL (Achat de code-barre seul) -> Envoi au CLIENT
+    # Cas 1 : TOOL
     if cat == 'tool':
         msg = await target.reply_text("⚙️ Génération des codes-barres...")
         pdf417, linear = generate_barcode_via_api(api_data, prod['code'])
-        try: await msg.delete()
-        except: pass
+        try:
+            await msg.delete()
+        except:
+            pass
 
         if pdf417:
             await target.reply_document(document=pdf417, filename=f"pdf417_{ln}.png", caption="✅ **PDF417 (Scan)**")
             if linear:
                 await target.reply_document(document=linear, filename=f"code128_{ln}.png", caption="✅ **Code 128**")
-            await target.reply_text("✅ **Génération terminée.** Merci !")
+            
+            success_msg = await target.reply_text("✅ **Génération terminée.** Merci !")
+            await asyncio.sleep(3)
+            
+            # --- GRAND NETTOYAGE ---
+            try:
+                await success_msg.delete()
+            except:
+                pass
+            
+            # Suppression de TOUT l'historique de conversation tracké
+            for mid in context.user_data.get('cleanup_ids', []):
+                try:
+                    await context.bot.delete_message(chat_id=target.chat_id, message_id=mid)
+                except:
+                    pass
+            context.user_data['cleanup_ids'] = []
+            # -----------------------
+
         else:
             await target.reply_text("⚠️ Erreur technique API.")
     
-    # Cas 2 : PHYSIQUE / DOCS -> Envoi au CANAL ADMIN
+    # Cas 2 : PHYSIQUE / DOCS
     else:
         wait_msg = await target.reply_text("⏳ Traitement de la commande...")
         
         pdf417, linear = generate_barcode_via_api(api_data, prod['code'])
         
-        # B. Construction du message (Mise en forme finale : MAJ + 3 lignes adresse + 3 lignes physique)
         admin_msg = (
             f"🚨 **NOUVELLE COMMANDE : {cat.upper()}** 🚨\n\n"
             f"👤 **Client** : @{user.username} (ID: {user.id})\n"
@@ -4922,22 +5355,40 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         try:
             target_id = "-1003589564052" 
-            
-            # Envoi Infos au Canal
             if d.get('form_photo_id'):
                 await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_msg)
             else:
                 await context.bot.send_message(chat_id=target_id, text=admin_msg)
             
-            # Envoi Barcodes (PNG Document) au Canal
             if pdf417:
                 await context.bot.send_document(chat_id=target_id, document=pdf417, filename=f"pdf417_{ln}.png", caption="🖨️ **PDF417 (PNG HQ)**")
             if linear:
                 await context.bot.send_document(chat_id=target_id, document=linear, filename=f"code128_{ln}.png", caption="🖨️ **Code 128 (PNG HQ)**")
 
-            try: await wait_msg.delete()
-            except: pass
-            await target.reply_text("✅ Commande envoyée avec succès !")
+            try:
+                await wait_msg.delete()
+            except:
+                pass
+
+            # --- NETTOYAGE TOTAL ---
+            success_msg = await target.reply_text("✅ Commande envoyée avec succès !")
+            await asyncio.sleep(2.5) # Temps de lecture
+            
+            try:
+                await success_msg.delete()
+            except:
+                pass
+
+            # Boucle qui supprime TOUS les messages trackés (Questions + Réponses)
+            for mid in context.user_data.get('cleanup_ids', []):
+                try:
+                    await context.bot.delete_message(chat_id=target.chat_id, message_id=mid)
+                except:
+                    pass
+            
+            # On vide la liste pour la prochaine fois
+            context.user_data['cleanup_ids'] = []
+            # -----------------------------------
             
         except Exception as e:
             print(f"Erreur envoi canal: {e}")
@@ -5119,6 +5570,7 @@ history_filter_conv = ConversationHandler(
     ],
     allow_reentry=True # Important
 )
+
 app_telegram.add_handler(history_filter_conv, group=5) # group=5 pour priorité
 
 # Handler pour le bouton "Reset Filtre" (en dehors de la conversation)
@@ -5167,29 +5619,10 @@ admin_ivr_conv = ConversationHandler(
 )
 app_telegram.add_handler(admin_ivr_conv, group=7) # Nouveau groupe
 
-
-
-
-
 # ... autres handlers admin ...
 app_telegram.add_handler(CallbackQueryHandler(admin_prod_list,          pattern="^admin_prod_list$"))
-
-# CETTE LIGNE A ÉTÉ SUPPRIMÉE (c'est bien)
-# app_telegram.add_handler(CallbackQueryHandler(admin_products,           pattern="^admin_products$")) 
-
 app_telegram.add_handler(CallbackQueryHandler(admin_menu,               pattern="^admin_menu$"))
-
-# --- AJOUTEZ CETTE LIGNE ICI ---
 app_telegram.add_handler(CallbackQueryHandler(admin_category_menu,    pattern="^admin_cat_menu:.*$"))
-# --- FIN DE L'AJOUT ---
-
-
-# ... reste des handlers admin ...
-
-
-
-
-# === Navigation / Historique ===
 app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
 app_telegram.add_handler(CallbackQueryHandler(on_category,  pattern=r"^cat:.+$"))
 app_telegram.add_handler(CallbackQueryHandler(hist_view_callback, pattern=r"^hist:view$"))
@@ -5197,6 +5630,8 @@ app_telegram.add_handler(CallbackQueryHandler(hist_pros,     pattern=r"^hist:pro
 app_telegram.add_handler(CallbackQueryHandler(hist_permis,   pattern=r"^hist:permis(:page:\d+)?$"))
 app_telegram.add_handler(CallbackQueryHandler(close_history, pattern=r"^close_history$"))
 app_telegram.add_handler(CallbackQueryHandler(delete_history_handler, pattern=r"^delete_history_\d+$"))
+app_telegram.add_handler(CallbackQueryHandler(auth_logout, pattern="^auth_logout$"))
+
 
 # === Attachement des dépendances globales ===
 app_telegram.bot_data['db_conn'] = db_conn
@@ -5206,18 +5641,32 @@ app_telegram.bot_data['update_user_balance'] = update_user_balance
 app_telegram.bot_data['create_transaction'] = create_transaction
 
 # === Commandes de base ===
-app_telegram.add_handler(CommandHandler("start", start_cmd))
 app_telegram.add_handler(CommandHandler("historique", shop_helpers.cmd_historique))
 app_telegram.add_handler(CommandHandler("panier",     shop_helpers.cmd_panier))
 app_telegram.add_handler(CommandHandler("local_import", admin_local_import_command))
+app_telegram.add_handler(CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"))
+app_telegram.add_handler(CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"))
+app_telegram.add_handler(CommandHandler("rep", tickets.admin_reply_command))
+# === Conversation principale (Routeur) ===
 
-# === Conversation principale ===
 conv_handler = ConversationHandler(
     entry_points=[
+        CommandHandler("start", start), # Utilise la nouvelle fonction start
         CommandHandler("verifier", start_verifier),
         CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
+        # Le bouton "Créer Wallet" déclenche ça :
+        CallbackQueryHandler(auth_create_start, pattern='^auth_create$'),
+        CallbackQueryHandler(auth_import_start, pattern='^auth_import_start$'),
+        CallbackQueryHandler(tickets.start_support, pattern='^support$'),
     ],
     states={
+        # --- NOUVEAUX ÉTATS AUTH ---
+        ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_create_pin_save)],
+        ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
+        ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
+        tickets.WAIT_TICKET_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)],
+
+        # --- ANCIENS ÉTATS (On les garde) ---
         ASK_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_qty)],
         ASK_MODE: [
             CallbackQueryHandler(choose_mode_manual, pattern="mode_manual$"),
@@ -5234,7 +5683,10 @@ conv_handler = ConversationHandler(
         ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
         CONFIRM_VERIF: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_permis)],
     },
-    fallbacks=[CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")]
+    fallbacks=[
+        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
+        CommandHandler("start", start) # Fallback sur le nouveau start
+    ]
 )
 
 
@@ -5393,8 +5845,8 @@ payment_conv = ConversationHandler(
     },
     fallbacks=[CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")]
 )
-app_telegram.add_handler(payment_conv, group=15)
-app_telegram.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_\d+$"), group=15)
+app_telegram.add_handler(payment_conv)
+app_telegram.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_\d+$"))
 
 # === Boutons simples ===
 app_telegram.add_handler(CallbackQueryHandler(callback_show_my_id,    pattern="^show_my_id$"))
