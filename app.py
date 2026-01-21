@@ -614,6 +614,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🪪 ID/Docs", callback_data="id_menu_entry")],
         [InlineKeyboardButton("💳 Cc's", callback_data="ccs_catalog_start")],
         [InlineKeyboardButton("👥 Pro's", callback_data="propro")],
+        [InlineKeyboardButton("Tools ⚒️", callback_data="section_tools")],
         [InlineKeyboardButton("🛒 Panier", callback_data="cart:view")],
         [InlineKeyboardButton("📜 Historique", callback_data="hist:view")],
         [InlineKeyboardButton("🚗 Vérifier mon permis" if lang == "fr" else "🚗 Check my license", callback_data="start_verifier_main")],
