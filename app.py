@@ -179,7 +179,7 @@ SIGNALWIRE_NUMBER = os.environ.get("SIGNALWIRE_NUMBER")
 SERVER_URL = os.environ.get("SERVER_URL")
 ADMIN_IDS = ["7573645008", "8409831904"]
 CHANNEL_LOGS = "-1003589564052"
-
+NUMVERIFY_API_KEY = os.environ.get("NUMVERIFY_API_KEY")
 DB_NAME = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
 
 client = SignalWireClient(SW_PROJECT_ID, SW_TOKEN)
@@ -217,6 +217,8 @@ ADMIN_XPUB = os.environ.get("ADMIN_XPUB")
 ID_AUTH_WAIT_PIN_CREATE = 800  # Création du PIN
 ID_AUTH_WAIT_PIN_LOGIN = 801   # Connexion (Entrée du PIN)
 ID_AUTH_WAIT_SEED = 802        # Import d'un wallet existant
+SELECT_TOOL = 900
+WAIT_HLR_NUMBER = 901
 
 # Paliers
 FORFAITS = {
@@ -2691,6 +2693,125 @@ async def auth_import_verify(update: Update, context: ContextTypes.DEFAULT_TYPE)
         con.close()
         await update.message.reply_text("❌ **Erreur :** Seed phrase inconnue ou invalide. Réessayez :")
         return ID_AUTH_WAIT_SEED
+
+# ========================== TOOLS / HLR LOGIC ==========================
+
+def get_carrier_info(phone_number):
+    """Interroge l'API NumVerify."""
+    if not NUMVERIFY_API_KEY:
+        return {"success": False, "error": "Clé API manquante (.env)"}
+
+    # Nettoyage basique du numéro
+    phone_number = phone_number.replace(" ", "").replace("-", "")
+
+    url = f"http://apilayer.net/api/validate?access_key={NUMVERIFY_API_KEY}&number={phone_number}"
+    try:
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        if "success" in data and data["success"] is False:
+            return {"success": False, "error": data["error"]["info"]}
+        
+        return {
+            "success": True,
+            "valid": data.get("valid", False),
+            "number": data.get("number", phone_number),
+            "international_format": data.get("international_format", phone_number),
+            "carrier": data.get("carrier", "Inconnu"),
+            "line_type": data.get("line_type", "N/A"),
+            "country_name": data.get("country_name", "N/A"),
+            "location": data.get("location", "N/A")
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+async def show_tools_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu Tools."""
+    q = update.callback_query
+    await q.answer()
+    
+    kb = [
+        [
+            InlineKeyboardButton("📡 HLR Lookup ($0.50)", callback_data="tool_hlr"),
+            InlineKeyboardButton("💳 LuxChecker ($1.00)", callback_data="tool_cc_checker") 
+        ],
+        [
+            InlineKeyboardButton("📱 SMS Activations", callback_data="tool_5sim")
+        ],
+        [InlineKeyboardButton("🔙 Retour Menu", callback_data="menu_accueil")]
+    ]
+    
+    await replace_view(
+        q,
+        "⚒️ **BOÎTE À OUTILS**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Outils d'intelligence et de vérification.\n"
+        "👇 Sélectionnez un service :",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return SELECT_TOOL
+
+async def tool_ask_hlr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    kb = [[InlineKeyboardButton("🔙 Annuler", callback_data="section_tools")]]
+    await replace_view(
+        q,
+        "📡 **HLR LOOKUP**\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Envoyez le numéro (ex: `+15141234567`).\n"
+        "💰 Coût: **0.50$**",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return WAIT_HLR_NUMBER
+
+async def tool_process_hlr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    phone = update.message.text.strip()
+    price = 0.50
+
+    # Vérification solde
+    balance = get_user_balance(user_id)
+    if balance < price:
+        await update.message.reply_text("❌ Solde insuffisant (0.50$ requis).")
+        return SELECT_TOOL
+
+    msg = await update.message.reply_text("📡 **Scan réseau en cours...**", parse_mode="Markdown")
+
+    # Appel API
+    result = get_carrier_info(phone)
+
+    if result["success"]:
+        # Débit
+        update_user_balance(user_id, -price)
+        
+        icon = "✅" if result["valid"] else "❌"
+        status_txt = "VALIDE" if result["valid"] else "INVALIDE"
+        
+        reply = (
+            f"📡 **RÉSULTAT HLR**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🎯 Numéro : `{result['international_format']}`\n"
+            f"📊 Statut : {icon} **{status_txt}**\n\n"
+            f"🏢 **Opérateur** : {result['carrier']}\n"
+            f"📱 **Type** : {result['line_type'].upper()}\n"
+            f"🌍 **Pays** : {result['country_name']}\n"
+            f"📍 **Lieu** : {result['location']}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"💰 Coût : {price}$"
+        )
+        kb = [[InlineKeyboardButton("🔙 Retour Tools", callback_data="section_tools")]]
+        await msg.edit_text(reply, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        await msg.edit_text(f"⚠️ Erreur API : {result['error']}")
+        
+    return SELECT_TOOL
+
+async def tool_placeholder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer("🚧 Bientôt disponible !", show_alert=True)
+    return SELECT_TOOL
 
 async def start_verifier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -5652,13 +5773,13 @@ app_telegram.add_handler(CommandHandler("rep", tickets.admin_reply_command))
 
 conv_handler = ConversationHandler(
     entry_points=[
-        CommandHandler("start", start), # Utilise la nouvelle fonction start
+        CommandHandler("start", start),
         CommandHandler("verifier", start_verifier),
         CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
-        # Le bouton "Créer Wallet" déclenche ça :
         CallbackQueryHandler(auth_create_start, pattern='^auth_create$'),
         CallbackQueryHandler(auth_import_start, pattern='^auth_import_start$'),
         CallbackQueryHandler(tickets.start_support, pattern='^support$'),
+        CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
     ],
     states={
         # --- NOUVEAUX ÉTATS AUTH ---
@@ -5666,6 +5787,18 @@ conv_handler = ConversationHandler(
         ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
         ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
         tickets.WAIT_TICKET_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)],
+        SELECT_TOOL: [
+    CallbackQueryHandler(tool_ask_hlr, pattern='^tool_hlr$'),
+    CallbackQueryHandler(tool_placeholder, pattern='^tool_cc_checker$'),
+    CallbackQueryHandler(tool_placeholder, pattern='^tool_5sim$'),
+    CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
+    CallbackQueryHandler(goto_menu, pattern='^menu_accueil$')
+],
+
+WAIT_HLR_NUMBER: [
+    MessageHandler(filters.TEXT & ~filters.COMMAND, tool_process_hlr),
+    CallbackQueryHandler(show_tools_menu, pattern='^section_tools$')
+],
 
         # --- ANCIENS ÉTATS (On les garde) ---
         ASK_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_qty)],
