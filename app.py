@@ -2565,7 +2565,12 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "pin_enter":
         con = sqlite3.connect(DB_NAME)
         cur = con.cursor()
-        cur.execute("SELECT pin_code FROM users WHERE user_id=?", (user_id,))
+        
+        # 👇👇 CORRECTION MAJEURE ICI 👇👇
+        # On cherche par telegram_id pour être sûr de trouver le bon user
+        cur.execute("SELECT pin_code FROM users WHERE telegram_id=?", (user_id,))
+        # -------------------------------
+        
         row = cur.fetchone()
         con.close()
         
@@ -2812,6 +2817,228 @@ async def tool_process_hlr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tool_placeholder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer("🚧 Bientôt disponible !", show_alert=True)
     return SELECT_TOOL
+
+
+SIM_API_KEY = os.environ.get("SIM_API_KEY")
+
+# --- Configuration des prix (Marge incluse) ---
+SMS_CATALOG = {
+    "whatsapp": {"price": 2.50, "label": "WhatsApp", "5sim_product": "whatsapp"},
+    "telegram": {"price": 2.50, "label": "Telegram", "5sim_product": "telegram"},
+    "google":   {"price": 2.00, "label": "Google/Gmail", "5sim_product": "google"},
+    "uber":     {"price": 2.00, "label": "Uber", "5sim_product": "uber"},
+    "tinder":   {"price": 2.00, "label": "Tinder", "5sim_product": "tinder"},
+    "paypal":   {"price": 2.25, "label": "PayPal", "5sim_product": "paypal"}
+}
+
+def api_5sim_buy(product, country="usa", operator="virtual51"):
+    """Achète un numéro USA (Virtual51 par défaut)."""
+    if not SIM_API_KEY: return {"success": False, "error": "Clé API manquante"}
+    
+    headers = {"Authorization": "Bearer " + SIM_API_KEY, "Accept": "application/json"}
+    # On force USA et l'opérateur demandé
+    url = f"https://5sim.net/v1/user/buy/activation/{country}/{operator}/{product}"
+    
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        if "id" not in data:
+            return {"success": False, "error": str(data)}
+        return {"success": True, "id": data['id'], "phone": data['phone'], "expires": data['expires']}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+def api_5sim_check(order_id):
+    """Vérifie le statut."""
+    headers = {"Authorization": "Bearer " + SIM_API_KEY, "Accept": "application/json"}
+    try:
+        r = requests.get(f"https://5sim.net/v1/user/check/{order_id}", headers=headers, timeout=5)
+        return r.json()
+    except: return {}
+
+def api_5sim_ban(order_id):
+    """BANNIT le numéro (remboursement 5sim immédiat si pas de code)."""
+    headers = {"Authorization": "Bearer " + SIM_API_KEY, "Accept": "application/json"}
+    try:
+        # L'action 'ban' signale que le numéro est mauvais/utilisé
+        requests.get(f"https://5sim.net/v1/user/ban/{order_id}", headers=headers, timeout=5)
+    except: pass
+
+async def show_sms_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu SMS USA."""
+    q = update.callback_query
+    await q.answer()
+    
+    kb = []
+    row = []
+    for key, info in SMS_CATALOG.items():
+        row.append(InlineKeyboardButton(f"{info['label']} ({info['price']}$)", callback_data=f"buy_sms:{key}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row: kb.append(row)
+    
+    kb.append([InlineKeyboardButton("🔙 Retour Tools", callback_data="section_tools")])
+    
+    await replace_view(
+        q,
+        "🇺🇸 **SMS ACTIVATIONS (USA - Virtual51)**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Choisissez le service.\n"
+        "⚡ _Numéros virtuels haute qualité._\n"
+        "🔄 _Bouton 'Ban/Rembourser' disponible si le numéro ne marche pas._",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return SELECT_TOOL
+
+async def handle_buy_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lance l'achat."""
+    q = update.callback_query
+    # On parse soit depuis le menu (buy_sms:whatsapp) soit depuis le bouton réessayer (retry_sms:whatsapp)
+    data_parts = q.data.split(":")
+    service_key = data_parts[1]
+    
+    await q.answer("Recherche de numéro...")
+    
+    item = SMS_CATALOG.get(service_key)
+    if not item: return
+    
+    user_id = str(q.from_user.id)
+    price = item['price']
+    
+    # 1. Solde
+    if get_user_balance(user_id) < price:
+        await q.message.reply_text("❌ Solde insuffisant.")
+        return SELECT_TOOL
+        
+    # 2. Achat
+    msg = await q.message.reply_text(f"🇺🇸 Recherche numéro **{item['label']}** (Virtual51)...")
+    
+    # On demande explicitement USA + virtual51
+    res = api_5sim_buy(item['5sim_product'], country="usa", operator="virtual51")
+    
+    if not res['success']:
+        # Fallback : si virtual51 n'a pas de stock, on essaie 'any' opérateur USA
+        res = api_5sim_buy(item['5sim_product'], country="usa", operator="any")
+        if not res['success']:
+            await msg.edit_text(f"❌ Aucun numéro dispo pour le moment.")
+            return SELECT_TOOL
+        
+    # 3. Débit & Affichage
+    update_user_balance(user_id, -price)
+    order_id = res['id']
+    phone = res['phone']
+    
+    # Lancement du monitoring
+    asyncio.create_task(monitor_sms_task(context.application, q.message.chat_id, msg.message_id, order_id, user_id, price, phone, service_key))
+    
+    return SELECT_TOOL
+
+async def sms_control_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le clic sur BAN ou CANCEL."""
+    q = update.callback_query
+    data = q.data # ex: sms_ban_123456_2.50_whatsapp
+    
+    parts = data.split("_")
+    action = parts[1] # ban
+    order_id = parts[2]
+    price = float(parts[3])
+    service_key = parts[4] if len(parts) > 4 else "whatsapp"
+    
+    user_id = str(q.from_user.id)
+
+    if action == "ban":
+        # 1. Appel API Ban (Annule côté 5sim)
+        api_5sim_ban(order_id)
+        
+        # 2. Remboursement Client
+        update_user_balance(user_id, +price)
+        
+        # 3. Menu pour réessayer
+        await q.answer("🚫 Numéro banni et remboursé.")
+        
+        kb = [
+            [InlineKeyboardButton("🔄 Essayer un autre numéro", callback_data=f"buy_sms:{service_key}")],
+            [InlineKeyboardButton("🔙 Retour Menu", callback_data="section_tools")]
+        ]
+        
+        await q.message.edit_text(
+            f"🚫 **Numéro annulé/banni.**\n"
+            f"💰 **{price}$** ont été remboursés sur votre solde.\n\n"
+            f"Voulez-vous réessayer avec un nouveau numéro ?",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+
+async def monitor_sms_task(app, chat_id, message_id, order_id, user_id, price, phone, service_key):
+    """Boucle de vérification avec bouton d'annulation."""
+    start_time = time.time()
+    timeout = 900 # 15 min
+    
+    # Clavier "Ban / Cancel" affiché PENDANT l'attente
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 Annuler / Mauvais Numéro", callback_data=f"sms_ban_{order_id}_{price}_{service_key}")]
+    ])
+    
+    while (time.time() - start_time) < timeout:
+        status_data = api_5sim_check(order_id)
+        status = status_data.get('status')
+        sms_list = status_data.get('sms', [])
+        
+        # SI LE CLIENT A CLIQUÉ SUR BAN ENTRE TEMPS
+        if status == "BANNED" or status == "CANCELED":
+            return # La tache s'arrête, le handler sms_control_callback a déjà géré l'affichage
+
+        # CODE REÇU
+        if sms_list and len(sms_list) > 0:
+            code = sms_list[0].get('code')
+            if code:
+                try:
+                    await app.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=f"✅ **CODE REÇU !**\n\n"
+                             f"🇺🇸 Service : {service_key.upper()}\n"
+                             f"☎️ Numéro : `{phone}`\n"
+                             f"💬 **CODE :** `{code}`\n\n"
+                             f"💰 Coût final : {price}$",
+                        parse_mode="Markdown"
+                    )
+                    # Finir la commande 5sim
+                    headers = {"Authorization": "Bearer " + SIM_API_KEY}
+                    requests.get(f"https://5sim.net/v1/user/finish/{order_id}", headers=headers)
+                except: pass
+                return
+
+        # Mise à jour visuelle
+        if int(time.time()) % 10 == 0:
+            remaining = int(timeout - (time.time() - start_time))
+            mins, secs = divmod(remaining, 60)
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"🇺🇸 **En attente du SMS (USA)...**\n"
+                         f"☎️ Numéro : `{phone}`\n"
+                         f"⏳ Expire dans : {mins}:{secs:02d}\n\n"
+                         f"_Si le numéro est déjà utilisé sur l'app, cliquez sur Annuler._",
+                    reply_markup=kb, # On remet le clavier à chaque refresh
+                    parse_mode="Markdown"
+                )
+            except: pass
+        
+        await asyncio.sleep(5)
+        
+    # TIMEOUT (Pas de code après 15 min)
+    update_user_balance(str(user_id), +price)
+    api_5sim_ban(order_id)
+    try:
+        await app.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            text=f"❌ **Temps écoulé.**\nLe montant de {price}$ a été remboursé."
+        )
+    except: pass
 
 async def start_verifier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -5789,6 +6016,9 @@ conv_handler = ConversationHandler(
         tickets.WAIT_TICKET_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)],
         SELECT_TOOL: [
     CallbackQueryHandler(tool_ask_hlr, pattern='^tool_hlr$'),
+    CallbackQueryHandler(show_sms_menu, pattern='^tool_5sim$'),
+    CallbackQueryHandler(handle_buy_sms, pattern='^buy_sms:'),
+    CallbackQueryHandler(sms_control_callback, pattern='^sms_ban_'),
     CallbackQueryHandler(tool_placeholder, pattern='^tool_cc_checker$'),
     CallbackQueryHandler(tool_placeholder, pattern='^tool_5sim$'),
     CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
