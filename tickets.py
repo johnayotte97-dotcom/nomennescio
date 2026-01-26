@@ -7,7 +7,8 @@ from telegram.ext import ContextTypes, ConversationHandler
 # CONFIGURATION
 # ==============================================================================
 # Mets ici le vrai chemin vers ta DB si nécessaire, ou laisse par défaut
-DB_NAME = "/home/johnmsaaq/bot-nomen/database.db"
+import os
+DB_NAME = os.environ.get("DB_NAME", "database.db")
 CHANNEL_LOGS = "-1003589564052" # Ton ID de groupe pour les logs
 
 # États de conversation
