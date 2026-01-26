@@ -211,7 +211,7 @@ async def admin_reply_native(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     # On vérifie si le message original contient l'ID client
     orig = update.message.reply_to_message.text or ""
-    match = re.search(r"\((\d+)\)", orig) # Cherche l'ID entre parenthèses ou via regex plus large
+    match = re.search(r"\(`?(\d+)`?\)", orig)
     
     # Fallback : Cherche "ID Client : `12345`"
     if not match: match = re.search(r"ID Client : `?(\d+)`?", orig)
