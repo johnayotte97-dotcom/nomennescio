@@ -408,17 +408,15 @@ def init_db():
     con.close()
     log("DB initialized (V2.2 Auto-Patch Ready)", "SYSTEM")
 
-def update_tickets_db():
-    """Met à jour la table tickets pour stocker les messages."""
+def patch_db_tickets():
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     try:
         cur.execute("ALTER TABLE support_tickets ADD COLUMN message TEXT")
         cur.execute("ALTER TABLE support_tickets ADD COLUMN category TEXT")
         cur.execute("ALTER TABLE support_tickets ADD COLUMN username TEXT")
-        print("✅ DB Patch: Colonnes tickets ajoutées.")
     except:
-        pass # Déjà fait
+        pass 
     con.commit()
     con.close()
 
@@ -4488,6 +4486,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- MODIFICATION : Ajoute les deux boutons produits ici ---
     keyboard = [
+        [InlineKeyboardButton("📨 Gestion Tickets", callback_data="admin_tickets_list")],
         [InlineKeyboardButton("👥 Utilisateurs", callback_data="admin_users")],
         [InlineKeyboardButton("🏷 Forfait utilisateur", callback_data="admin_setstatut")],
         [InlineKeyboardButton("🔁 Redémarrer le bot", callback_data="admin_hard_reboot")],
@@ -5929,7 +5928,7 @@ if __name__ == "__main__":
 # --- DB ---
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     shop_helpers.ensure_shop_tables(db_conn)
-    init_db()  # keep this if you already had it
+    init_db() 
     ensure_verifications_table()
 
     # --- Launch Flask (IVR) on PORT 5001 ---
@@ -6192,9 +6191,9 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(tickets.save_category, pattern="^ticket_cat:")
         ],
         tickets.WAIT_TICKET_MSG: [
-            CallbackQueryHandler(tickets.start_support, pattern="^support$"), # Bouton Retour
-            CallbackQueryHandler(tickets.start_ticket_reply, pattern="^ticket_reply_direct$"), # Bouton Répondre
-            CallbackQueryHandler(tickets.close_ticket, pattern="^ticket_close$"), # Bouton Fermer
+            # <--- C'EST ICI QU'IL FAUT CORRIGER
+            CallbackQueryHandler(tickets.start_support, pattern="^support$"), 
+            # SUPPRIME les lignes "start_ticket_reply" et "close_ticket" ici si elles y sont encore
             MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)
         ],
 
@@ -6375,6 +6374,7 @@ if __name__ == "__main__":
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     shop_helpers.ensure_shop_tables(db_conn)
     init_db()
+    patch_db_tickets()
     ensure_verifications_table()
     ensure_payment_table()
 
@@ -6394,6 +6394,23 @@ if __name__ == "__main__":
     app_telegram.add_handler(ccs_catalog_filter_conv)
     app_telegram.add_handler(payment_conv)
     app_telegram.add_handler(id_docs_conv)
+
+
+
+    # --- NOUVEAU : CONVERSATION POUR RÉPONSE ADMIN ---
+admin_ticket_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(tickets.admin_ask_reply, pattern="^adm_ticket_rep_")],
+    states={
+        tickets.ADMIN_TICKET_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.admin_send_reply)]
+    },
+    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
+)
+app_telegram.add_handler(admin_ticket_conv, group=9) 
+
+# --- HANDLERS SIMPLES ---
+app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
+app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
+app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
     app_telegram.add_handler(conv_handler) # Main Router
 
     # --- Handlers "Loose" (Admin & Callbacks simples) ---
