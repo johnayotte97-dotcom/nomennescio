@@ -27,6 +27,8 @@ from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
 from mnemonic import Mnemonic
 import tickets  # Importe notre nouveau fichier
+import random
+import string
 
 
 from telegram import (
@@ -214,11 +216,12 @@ CATALOG_FILTER_MAIN, CATALOG_FILTER_AWAIT_VALUE = range(500, 502)
 CCS_FILTER_MAIN, CCS_FILTER_AWAIT_VALUE = range(600, 602)
 WAIT_AMOUNT_CRYPTO = 800
 ADMIN_XPUB = os.environ.get("ADMIN_XPUB")
-ID_AUTH_WAIT_PIN_CREATE = 800  # Création du PIN
-ID_AUTH_WAIT_PIN_LOGIN = 801   # Connexion (Entrée du PIN)
-ID_AUTH_WAIT_SEED = 802        # Import d'un wallet existant
+ID_AUTH_WAIT_PIN_CREATE = 1500  # Création du PIN
+ID_AUTH_WAIT_PIN_LOGIN = 1501  # Connexion (Entrée du PIN)
+ID_AUTH_WAIT_SEED = 1502       # Import d'un wallet existant
 SELECT_TOOL = 900
 WAIT_HLR_NUMBER = 901
+ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
 
 # Paliers
 FORFAITS = {
@@ -404,6 +407,20 @@ def init_db():
     con.commit()
     con.close()
     log("DB initialized (V2.2 Auto-Patch Ready)", "SYSTEM")
+
+def update_tickets_db():
+    """Met à jour la table tickets pour stocker les messages."""
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    try:
+        cur.execute("ALTER TABLE support_tickets ADD COLUMN message TEXT")
+        cur.execute("ALTER TABLE support_tickets ADD COLUMN category TEXT")
+        cur.execute("ALTER TABLE support_tickets ADD COLUMN username TEXT")
+        print("✅ DB Patch: Colonnes tickets ajoutées.")
+    except:
+        pass # Déjà fait
+    con.commit()
+    con.close()
 
 def user_exists(telegram_id: str) -> bool:
     con = sqlite3.connect(DB_NAME)
@@ -2421,7 +2438,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    cur.execute("SELECT pin_code, username FROM users WHERE user_id=?", (user_id,))
+    
+    # 👇 CORRECTION : On cherche par telegram_id 👇
+    cur.execute("SELECT pin_code, username FROM users WHERE telegram_id=?", (user_id,))
+    
     row = cur.fetchone()
     con.close()
 
@@ -2438,7 +2458,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['auth_msg_id'] = msg.message_id
         return ID_AUTH_WAIT_PIN_LOGIN
 
-    # CAS B : Pas de PIN -> SETUP (inchangé)
+    # CAS B : Pas de PIN -> SETUP
     else:
         kb = [[InlineKeyboardButton("🆕 Créer un Wallet (Sécuriser)", callback_data="auth_create")]]
         await update.message.reply_text(
@@ -2569,6 +2589,7 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 👇👇 CORRECTION MAJEURE ICI 👇👇
         # On cherche par telegram_id pour être sûr de trouver le bon user
         cur.execute("SELECT pin_code FROM users WHERE telegram_id=?", (user_id,))
+        
         # -------------------------------
         
         row = cur.fetchone()
@@ -5512,14 +5533,44 @@ async def id_save_dl_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ID_ASK_REF_NUM
 
 async def id_save_ref_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # On sauvegarde les IDs pour le nettoyage automatique
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    context.user_data['form_ref_number'] = update.message.text.upper().strip()
+    
+    # Récupération et nettoyage du texte (tout en majuscules)
+    user_input = update.message.text.strip().upper()
+
+    final_ref = ""
+
+    # --- LOGIQUE RANDOM "ANY" ---
+    if user_input == "ANY":
+        # 1. Choisir le préfixe au hasard
+        prefix = random.choice(["R4MV", "PEVF"])
+        
+        # 2. Générer les 5 caractères restants (9 total - 4 préfixe = 5)
+        # Mélange de chiffres et de lettres majuscules
+        chars = string.ascii_uppercase + string.digits
+        suffix = ''.join(random.choices(chars, k=5))
+        
+        final_ref = prefix + suffix
+        
+        # Petit message pour confirmer au client le numéro généré
+        msg_gen = await update.message.reply_text(f"🎲 **Généré auto :** `{final_ref}`", parse_mode="Markdown")
+        context.user_data['cleanup_ids'].append(msg_gen.message_id)
+    else:
+        # Si le client a écrit un vrai numéro, on le garde
+        final_ref = user_input
+
+    # Sauvegarde dans le contexte
+    context.user_data['form_ref_number'] = final_ref
+
+    # Passage à l'étape suivante (Sexe)
     kb = [
         [InlineKeyboardButton("Homme (Male)", callback_data="sex:1"), InlineKeyboardButton("Femme (Female)", callback_data="sex:2")],
         [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")]
     ]
     m = await update.message.reply_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['cleanup_ids'].append(m.message_id)
+    
     return ID_ASK_SEX
 
 async def id_save_sex(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5539,7 +5590,7 @@ async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     context.user_data['form_height'] = update.message.text
     kb = [
-        [InlineKeyboardButton("Marron (Brown)", callback_data="eye:BRO"), InlineKeyboardButton("Bleu (Blue)", callback_data="eye:BLU")],
+        [InlineKeyboardButton("Brun (Brown)", callback_data="eye:BRO"), InlineKeyboardButton("Bleu (Blue)", callback_data="eye:BLU")],
         [InlineKeyboardButton("Vert (Green)", callback_data="eye:GRN"), InlineKeyboardButton("Noisette (Hazel)", callback_data="eye:HZL")],
         [InlineKeyboardButton("Gris (Grey)", callback_data="eye:GRY"), InlineKeyboardButton("Noir (Black)", callback_data="eye:BLK")]
     ]
@@ -5575,12 +5626,15 @@ async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     sex_map = {'1': 'Homme', '2': 'Femme', '9': 'X'}
     
+    # On nettoie la variable 'editing_key' pour éviter les bugs
+    context.user_data.pop('editing_key', None)
+
     txt = (
         f"📝 **RÉSUMÉ DES DONNÉES**\n\n"
         f"👤 **Identité**\n"
         f"• Prénom (DAC) : `{d.get('form_firstname')}`\n"
         f"• Nom (DCS) : `{d.get('form_lastname')}`\n"
-        f"• Sexe : `{sex_map.get(d.get('form_sex'), '?')}`\n"
+        f"• Sexe : `{sex_map.get(d.get('form_sex'), d.get('form_sex'))}`\n"
         f"• Taille : `{d.get('form_height')}`\n"
         f"• Yeux : `{d.get('form_eyes')}`\n\n"
         f"📅 **Dates**\n"
@@ -5595,13 +5649,129 @@ async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Permis (DAQ) : `{d.get('form_dl_number')}`\n"
         f"• Référence (DCF) : `{d.get('form_ref_number')}`"
     )
-    kb = [[InlineKeyboardButton("✅ CONFIRMER & GÉNÉRER", callback_data="confirm_gen")],
-          [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]]
+    
+    kb = [
+        [InlineKeyboardButton("✅ CONFIRMER & GÉNÉRER", callback_data="confirm_gen")],
+        # 👇 LE NOUVEAU BOUTON EST ICI 👇
+        [InlineKeyboardButton("✏️ Modifier / Corriger", callback_data="edit_open_menu")],
+        # -------------------------------
+        [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]
+    ]
     
     target = update.message or update.callback_query.message
-    m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    context.user_data.setdefault('cleanup_ids', []).append(m.message_id) # On track le résumé
+    # Si on vient d'une édition, on édite le message, sinon on envoie un nouveau
+    if update.callback_query:
+        try:
+            m = await target.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        except:
+             m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        
+    context.user_data.setdefault('cleanup_ids', []).append(m.message_id) 
     return ID_CONFIRM_SUMMARY
+
+async def id_open_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche la grille de 13 boutons pour choisir quoi modifier."""
+    q = update.callback_query
+    await q.answer()
+
+    # Liste des champs modifiables (Label, Clé interne)
+    fields = [
+        ("Prénom", "form_firstname"), ("Nom", "form_lastname"),
+        ("Sexe", "form_sex"), ("Taille", "form_height"),
+        ("Yeux", "form_eyes"), ("Date Naiss.", "form_dob"),
+        ("Émission", "form_issue"), ("Expiration", "form_expiry"),
+        ("Rue", "addr_street"), ("Ville", "addr_city"),
+        ("Code Postal", "addr_zip"), ("Permis (DAQ)", "form_dl_number"),
+        ("Réf (DCF)", "form_ref_number")
+    ]
+
+    # Création dynamique du clavier (2 par ligne)
+    kb = []
+    row = []
+    for label, key in fields:
+        row.append(InlineKeyboardButton(f"✏️ {label}", callback_data=f"do_edit:{key}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row: kb.append(row)
+    
+    kb.append([InlineKeyboardButton("🔙 Retour au Résumé", callback_data="back_to_summary")])
+
+    await q.message.edit_text(
+        "🔧 **MODE ÉDITION**\n\nAppuyez sur l'élément que vous voulez modifier :",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return ID_EDIT_MENU
+
+async def id_handle_edit_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """L'utilisateur a cliqué sur un champ. On lui demande la nouvelle valeur."""
+    q = update.callback_query
+    await q.answer()
+    
+    # Si clic sur "Retour"
+    if q.data == "back_to_summary":
+        return await id_show_summary(update, context)
+
+    # Récupération de la clé (ex: form_firstname)
+    key_to_edit = q.data.split(":")[1]
+    context.user_data['editing_key'] = key_to_edit
+    
+    # Mapping pour afficher un beau nom
+    nice_names = {
+        "form_firstname": "le Prénom", "form_lastname": "le Nom",
+        "form_sex": "le Sexe (1=H, 2=F)", "form_height": "la Taille",
+        "form_eyes": "les Yeux (BRO, BLU, etc.)", "form_dob": "la Date de Naissance",
+        "addr_zip": "le Code Postal"
+    }
+    field_name = nice_names.get(key_to_edit, "cette valeur")
+
+    kb = [[InlineKeyboardButton("🔙 Annuler", callback_data="cancel_edit_input")]]
+
+    await q.message.edit_text(
+        f"✍️ **Modification :**\n\n"
+        f"Veuillez entrer la nouvelle valeur pour **{field_name}** :",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return ID_EDIT_INPUT
+
+async def id_receive_new_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reçoit le texte corrigé, le sauvegarde et retourne au résumé."""
+    # Nettoyage visuel (supprime la réponse de l'utilisateur pour garder le chat propre)
+    try:
+        context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+        await update.message.delete()
+    except: pass
+
+    key = context.user_data.get('editing_key')
+    if not key:
+        return await id_show_summary(update, context)
+
+    new_val = update.message.text.strip()
+    
+    # Petit traitement spécial pour tout mettre en majuscules (sauf si c'est déjà géré plus loin)
+    if key in ['form_dl_number', 'form_ref_number', 'addr_zip']:
+        new_val = new_val.upper()
+        
+    # Sauvegarde
+    context.user_data[key] = new_val
+    
+    # Petit toast de confirmation (message temporaire)
+    temp = await update.message.reply_text(f"✅ Modifié : {new_val}")
+    time.sleep(1)
+    try: await temp.delete()
+    except: pass
+
+    # Retour au résumé (il se mettra à jour avec la nouvelle valeur)
+    # On doit simuler un update.callback_query pour id_show_summary
+    # Astuce : on utilise le dernier message du bot qui est tracké
+    
+    # On rappelle le résumé. Comme on n'a plus de callback_query valide ici (on est dans MessageHandler),
+    # id_show_summary va envoyer un nouveau message ou éditer le dernier connu.
+    return await id_show_summary(update, context)
 
 async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import asyncio
@@ -5995,9 +6165,12 @@ app_telegram.add_handler(CommandHandler("panier",     shop_helpers.cmd_panier))
 app_telegram.add_handler(CommandHandler("local_import", admin_local_import_command))
 app_telegram.add_handler(CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"))
 app_telegram.add_handler(CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"))
-app_telegram.add_handler(CommandHandler("rep", tickets.admin_reply_command))
-# === Conversation principale (Routeur) ===
 
+# ==============================================================================
+# GESTIONNAIRES DE CONVERSATION (HANDLERS)
+# ==============================================================================
+
+# 1. ROUTEUR PRINCIPAL (LOGIN, SUPPORT, TOOLS, VERIF PERMIS)
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
@@ -6009,28 +6182,38 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
     ],
     states={
-        # --- NOUVEAUX ÉTATS AUTH ---
+        # --- AUTHENTIFICATION ---
         ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_create_pin_save)],
         ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
         ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
-        tickets.WAIT_TICKET_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)],
+        
+        # --- SUPPORT (CORRIGÉ AVEC BOUTONS) ---
+        tickets.WAIT_CATEGORY: [
+            CallbackQueryHandler(tickets.save_category, pattern="^ticket_cat:")
+        ],
+        tickets.WAIT_TICKET_MSG: [
+            CallbackQueryHandler(tickets.start_support, pattern="^support$"), # Bouton Retour
+            CallbackQueryHandler(tickets.start_ticket_reply, pattern="^ticket_reply_direct$"), # Bouton Répondre
+            CallbackQueryHandler(tickets.close_ticket, pattern="^ticket_close$"), # Bouton Fermer
+            MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)
+        ],
+
+        # --- TOOLS (HLR / SMS) ---
         SELECT_TOOL: [
-    CallbackQueryHandler(tool_ask_hlr, pattern='^tool_hlr$'),
-    CallbackQueryHandler(show_sms_menu, pattern='^tool_5sim$'),
-    CallbackQueryHandler(handle_buy_sms, pattern='^buy_sms:'),
-    CallbackQueryHandler(sms_control_callback, pattern='^sms_ban_'),
-    CallbackQueryHandler(tool_placeholder, pattern='^tool_cc_checker$'),
-    CallbackQueryHandler(tool_placeholder, pattern='^tool_5sim$'),
-    CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
-    CallbackQueryHandler(goto_menu, pattern='^menu_accueil$')
-],
+            CallbackQueryHandler(tool_ask_hlr, pattern='^tool_hlr$'),
+            CallbackQueryHandler(show_sms_menu, pattern='^tool_5sim$'),
+            CallbackQueryHandler(handle_buy_sms, pattern='^buy_sms:'),
+            CallbackQueryHandler(sms_control_callback, pattern='^sms_ban_'),
+            CallbackQueryHandler(tool_placeholder, pattern='^tool_cc_checker$'),
+            CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
+            CallbackQueryHandler(goto_menu, pattern='^menu_accueil$')
+        ],
+        WAIT_HLR_NUMBER: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, tool_process_hlr),
+            CallbackQueryHandler(show_tools_menu, pattern='^section_tools$')
+        ],
 
-WAIT_HLR_NUMBER: [
-    MessageHandler(filters.TEXT & ~filters.COMMAND, tool_process_hlr),
-    CallbackQueryHandler(show_tools_menu, pattern='^section_tools$')
-],
-
-        # --- ANCIENS ÉTATS (On les garde) ---
+        # --- VERIF PERMIS (Legacy Flow) ---
         ASK_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_qty)],
         ASK_MODE: [
             CallbackQueryHandler(choose_mode_manual, pattern="mode_manual$"),
@@ -6041,7 +6224,6 @@ WAIT_HLR_NUMBER: [
         MANUAL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_receive_date)],
         CSV_WAIT: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, csv_receive_file)],
         BULK_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_confirm)],
-
         ASK_PRENOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_prenom)],
         ASK_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_nom)],
         ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
@@ -6049,80 +6231,67 @@ WAIT_HLR_NUMBER: [
     },
     fallbacks=[
         CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", start) # Fallback sur le nouveau start
+        CommandHandler("start", start)
     ]
 )
 
-
-app_telegram.add_handler(conv_handler)
-
-# --- AJOUTER AVEC LES AUTRES CONVERSATION HANDLERS ---
-
+# 2. ID/DOCS CENTER (AVEC ÉDITION ET BOUTON ANY)
 id_docs_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
     states={
-        # 1. Navigation Catalogue
         ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
         ID_PROD_VIEW: [
             CallbackQueryHandler(id_view_product, pattern="^id_view:"),
             CallbackQueryHandler(id_start_buy, pattern="^id_buy:")
         ],
-
-        # 2. Gestion Quantité (Interactive)
+        # Quantité
         ID_ASK_QTY: [
-            # Écoute les boutons +, -, +5, +10 (Mise à jour visuelle)
-            CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_(add|sub|add_5|add_10)"),
-            
-            # Écoute le bouton "Confirmer" (Passe à la suite)
+            CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_"),
             CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
-            
-            # Écoute la saisie texte (ex: "50")
             MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
         ],
-
-        # (Optionnel : Ancien état de confirmation, gardé par sécurité)
         ID_CONFIRM_BUY: [CallbackQueryHandler(id_start_form, pattern="^id_confirm_pay$")],
         
-        # 3. Identité
-        ID_ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_firstname)],
-        ID_ASK_LASTNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_lastname)],
-        ID_ASK_DOB: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dob)],
-        
-        # 4. Adresse
-        ID_ASK_STREET: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_street)],
-        ID_ASK_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_city)],
-        ID_ASK_ZIP: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_zip)],
+        # Formulaire
+        ID_ASK_NAME: [MessageHandler(filters.TEXT, id_save_firstname)],
+        ID_ASK_LASTNAME: [MessageHandler(filters.TEXT, id_save_lastname)],
+        ID_ASK_DOB: [MessageHandler(filters.TEXT, id_save_dob)],
+        ID_ASK_STREET: [MessageHandler(filters.TEXT, id_save_street)],
+        ID_ASK_CITY: [MessageHandler(filters.TEXT, id_save_city)],
+        ID_ASK_ZIP: [MessageHandler(filters.TEXT, id_save_zip)],
         ID_CONFIRM_ADDR: [CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
-        
-        # 5. Dates & Numéros
-        ID_ASK_ISSUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_issue)],
-        ID_ASK_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_expiry)],
-        ID_ASK_DL_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_num)],
-        ID_ASK_REF_NUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)],
-        
-        # 6. Physique
+        ID_ASK_ISSUE: [MessageHandler(filters.TEXT, id_save_issue)],
+        ID_ASK_EXPIRY: [MessageHandler(filters.TEXT, id_save_expiry)],
+        ID_ASK_DL_NUM: [MessageHandler(filters.TEXT, id_save_dl_num)],
+        ID_ASK_REF_NUM: [MessageHandler(filters.TEXT, id_save_ref_num)], # Contient la logique ANY
         ID_ASK_SEX: [CallbackQueryHandler(id_save_sex, pattern="^sex:")],
-        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_height)],
-        ID_ASK_EYES: [
-            CallbackQueryHandler(id_save_eyes, pattern="^eye:"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_eyes)
+        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT, id_save_height)],
+        ID_ASK_EYES: [CallbackQueryHandler(id_save_eyes, pattern="^eye:"), MessageHandler(filters.TEXT, id_save_eyes)],
+        
+        # Résumé & Edition (LE SYSTÈME "CORRIGER" EST ICI)
+        ID_CONFIRM_SUMMARY: [
+            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), 
+            CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$")
+        ],
+        ID_EDIT_MENU: [
+            CallbackQueryHandler(id_handle_edit_choice, pattern="^do_edit:"), 
+            CallbackQueryHandler(id_show_summary, pattern="^back_to_summary$")
+        ],
+        ID_EDIT_INPUT: [
+            MessageHandler(filters.TEXT, id_receive_new_value), 
+            CallbackQueryHandler(id_open_edit_menu, pattern="^cancel_edit_input$")
         ],
         
-        # 7. Résumé & Photo
-        ID_CONFIRM_SUMMARY: [CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$")],
         ID_ASK_PHOTO: [MessageHandler(filters.PHOTO, id_save_photo)],
-
-        # 8. Documents (Support Legacy pour T4/Paystub)
+        
+        # Docs Extras (Legacy)
         ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT, id_save_employer)],
         ID_ASK_DOC_JOB: [MessageHandler(filters.TEXT, id_save_job)],
         ID_ASK_DOC_ADDR: [MessageHandler(filters.TEXT, id_save_emp_addr)],
-        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")], # Ajouté pour le mode revenu
-        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT, id_save_hours)], # Ajouté
-        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT, id_save_rate)],   # Ajouté
-        ID_ASK_DOC_SIN: [
-            CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"),
-            MessageHandler(filters.TEXT, id_save_sin_or_range)
-        ],
+        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")],
+        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT, id_save_hours)],
+        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT, id_save_rate)],
+        ID_ASK_DOC_SIN: [CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"), MessageHandler(filters.TEXT, id_save_sin_or_range)],
     },
     fallbacks=[
         CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
@@ -6132,13 +6301,34 @@ id_docs_conv = ConversationHandler(
     name="id_docs_conversation"
 )
 
-app_telegram.add_handler(id_docs_conv) # Remis dans le groupe par défaut (0)
+# 3. AUTRES CONVERSATIONS (ADMIN, PAIEMENT, FILTRES)
+admin_search_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(admin_search_user_start, pattern="^admin_search_user_start$")],
+    states={ ADMIN_WAIT_SEARCH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_receive)] },
+    fallbacks=[CommandHandler("start", goto_menu), CallbackQueryHandler(admin_users, pattern="^admin_users")]
+)
 
-# === Filtres catalogue (NOUVEAU SYSTÈME) ===
+payment_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(add_balance_start, pattern="^add_balance$")],
+    states={ WAIT_AMOUNT_CRYPTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount_crypto)] },
+    fallbacks=[CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")]
+)
+
+admin_csv_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(admin_prod_csv_start, pattern="^admin_prod_csv$")],
+    states={ ADMIN_WAIT_CSV: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, admin_prod_csv_receive)] },
+    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$")],
+)
+
+admin_ivr_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:.*$")],
+    states={ ADMIN_IVR_AWAIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_ivr_receive)] },
+    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$")],
+    map_to_parent={ ConversationHandler.END: -1 }
+)
+
 catalog_filter_conv = ConversationHandler(
-    entry_points=[
-        CallbackQueryHandler(filter_start, pattern="^filter_open$"),
-    ],
+    entry_points=[CallbackQueryHandler(filter_start, pattern="^filter_open$")],
     states={
         CATALOG_FILTER_MAIN: [
             CallbackQueryHandler(filter_select_type, pattern="^filter:(name|city|base|price|year)$"),
@@ -6146,27 +6336,16 @@ catalog_filter_conv = ConversationHandler(
             CallbackQueryHandler(filter_reset, pattern="^filter_reset$"),
             CallbackQueryHandler(filter_page_nav, pattern="^filter:page:\d+$"),
         ],
-        CATALOG_FILTER_AWAIT_VALUE: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value),
-        ],
+        CATALOG_FILTER_AWAIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value)],
     },
-    fallbacks=[
-        CallbackQueryHandler(filter_cancel, pattern="^filter_cancel$"),
-        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", goto_menu)
-    ],
-    allow_reentry=True,
-    persistent=False, # Ne pas sauvegarder les états de filtre si le bot redémarre
-    name="catalog_filter_conversation"
+    fallbacks=[CallbackQueryHandler(filter_cancel, pattern="^filter_cancel$")],
+    persistent=False
 )
-app_telegram.add_handler(catalog_filter_conv) # Doit être dans un groupe
 
-
-# === Filtres catalogue (CLONE POUR CCS) ===
 ccs_catalog_filter_conv = ConversationHandler(
     entry_points=[
         CallbackQueryHandler(filter_start_ccs, pattern="^ccs_filter_open$"),
-        CallbackQueryHandler(ccs_catalog_start, pattern="^ccs_catalog_start$"), # <-- LIGNE AJOUTÉE
+        CallbackQueryHandler(ccs_catalog_start, pattern="^ccs_catalog_start$"),
     ],
     states={
         CCS_FILTER_MAIN: [
@@ -6175,96 +6354,116 @@ ccs_catalog_filter_conv = ConversationHandler(
             CallbackQueryHandler(filter_reset_ccs, pattern="^ccs_filter_reset$"),
             CallbackQueryHandler(filter_page_nav_ccs, pattern="^ccs_filter:page:\d+$"),
         ],
-        CCS_FILTER_AWAIT_VALUE: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value_ccs),
-        ],
+        CCS_FILTER_AWAIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value_ccs)],
     },
-    fallbacks=[
-        CallbackQueryHandler(filter_cancel_ccs, pattern="^ccs_filter_cancel$"),
-        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", goto_menu)
-    ],
-    allow_reentry=True,
-    persistent=False,
-    name="ccs_catalog_filter_conversation"
+    fallbacks=[CallbackQueryHandler(filter_cancel_ccs, pattern="^ccs_filter_cancel$")],
+    persistent=False
 )
-app_telegram.add_handler(ccs_catalog_filter_conv,) # Nouveau groupe (11)
-# === Produits ===
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_preview_callback, pattern=r"^prod:preview:\d+$"), group=-1)
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback,     pattern=r"^buy:\d+$"), group=-1)
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback,    pattern=r"^prod:view:\d+$"), group=-1)
 
-# === Panier ===
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback,      pattern=r"^cart:add:\d+$"), group=-1)
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback,     pattern=r"^cart:view$"),    group=-1)
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback,    pattern=r"^cart:clear$"),   group=-1)
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"),group=-1)
-
-
-# --- NOUVEAUX HANDLERS PAIEMENT ---
-payment_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(add_balance_start, pattern="^add_balance$")],
+history_filter_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(history_filter_start, pattern="^history_filter_start$")],
     states={
-        WAIT_AMOUNT_CRYPTO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_amount_crypto)],
+        HISTORY_FILTER_CHOICE: [CallbackQueryHandler(history_filter_choice, pattern="^history_filter_type:(name|sin|dl)$")],
+        HISTORY_FILTER_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, history_filter_input)],
     },
-    fallbacks=[CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")]
+    fallbacks=[CallbackQueryHandler(history_filter_cancel, pattern="^history_filter_cancel$")]
 )
-app_telegram.add_handler(payment_conv)
-app_telegram.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_\d+$"))
 
-# === Boutons simples ===
-app_telegram.add_handler(CallbackQueryHandler(callback_show_my_id,    pattern="^show_my_id$"))
-app_telegram.add_handler(CallbackQueryHandler(choose_lang,            pattern="^choose_lang$"))
-app_telegram.add_handler(CallbackQueryHandler(set_lang_fr,            pattern="^set_lang_fr$"))
-app_telegram.add_handler(CallbackQueryHandler(set_lang_en,            pattern="^set_lang_en$"))
-app_telegram.add_handler(CallbackQueryHandler(callback_check_balance, pattern="^check_balance$"))
-app_telegram.add_handler(CallbackQueryHandler(callback_support,       pattern="^support$"))
-app_telegram.add_handler(CallbackQueryHandler(callback_faq,           pattern="^faq$"))
-app_telegram.add_handler(CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$"))
-# === Admin ===
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm,   pattern="^admin_prod_del_\d+$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_del,           pattern="^admin_prod_del$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start,     pattern="^admin_prod_add$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_list,          pattern="^admin_prod_list$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_menu,               pattern="^admin_menu$"))
-admin_search_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(admin_search_user_start, pattern="^admin_search_user_start$")],
-    states={ ADMIN_WAIT_SEARCH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_receive)] },
-    fallbacks=[CommandHandler("start", goto_menu), CallbackQueryHandler(admin_users, pattern="^admin_users")]
-)
-app_telegram.add_handler(admin_search_conv, group=8)
-app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern=r"^admin_users(:page:\d+)?$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user,        pattern="^admin_adjust_.*$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_adjust_value,       pattern="^admin_adjval_.*$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_.*$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_setstatut,          pattern="^admin_setstatut$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_userstatut,         pattern="^admin_userstatut_.*$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final,    pattern="^admin_statut_.*$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot,        pattern="^admin_hard_reboot$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings,       pattern="^admin_ivr_settings$"))
+# ================= BOUCLE PRINCIPALE (MAIN) =================
+if __name__ == "__main__":
+    # --- INIT DB ---
+    db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+    shop_helpers.ensure_shop_tables(db_conn)
+    init_db()
+    ensure_verifications_table()
+    ensure_payment_table()
 
-from telegram.ext import filters, MessageHandler
-app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive),     group=21)
-app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_customamount_receive), group=22)
+    # --- FLASK (IVR) ---
+    flask_thread = threading.Thread(target=lambda: app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False), daemon=True)
+    flask_thread.start()
 
-app_telegram.add_handler(CallbackQueryHandler(menu_handler))
+    # --- TELEGRAM ---
+    app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Ajout des Handlers de Conversation (Ordre important)
+    app_telegram.add_handler(admin_search_conv, group=8)
+    app_telegram.add_handler(admin_csv_conv, group=6)
+    app_telegram.add_handler(admin_ivr_conv, group=7)
+    app_telegram.add_handler(history_filter_conv, group=5)
+    app_telegram.add_handler(catalog_filter_conv)
+    app_telegram.add_handler(ccs_catalog_filter_conv)
+    app_telegram.add_handler(payment_conv)
+    app_telegram.add_handler(id_docs_conv)
+    app_telegram.add_handler(conv_handler) # Main Router
 
+    # --- Handlers "Loose" (Admin & Callbacks simples) ---
+    app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_\d+$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_menu, pattern="^admin_menu$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern=r"^admin_users(:page:\d+)?$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_.*$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_adjust_value, pattern="^admin_adjval_.*$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_.*$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_.*$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_.*$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
+    app_telegram.add_handler(CallbackQueryHandler(history_filter_reset, pattern=r"^history_filter_reset$"), group=5)
+    
+    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive), group=21)
+    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_customamount_receive), group=22)
 
+    # --- Réponse Magique Admin (depuis le canal) ---
+    # Cette ligne permet au bot de lire les réponses dans le groupe admin
+    app_telegram.add_handler(MessageHandler(filters.Chat(chat_id=int(tickets.CHANNEL_LOGS)) & filters.REPLY, tickets.admin_reply_native))
 
+    # --- Callbacks Généraux ---
+    app_telegram.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_\d+$"))
+    app_telegram.add_handler(CallbackQueryHandler(callback_show_my_id, pattern="^show_my_id$"))
+    app_telegram.add_handler(CallbackQueryHandler(choose_lang, pattern="^choose_lang$"))
+    app_telegram.add_handler(CallbackQueryHandler(set_lang_fr, pattern="^set_lang_fr$"))
+    app_telegram.add_handler(CallbackQueryHandler(set_lang_en, pattern="^set_lang_en$"))
+    app_telegram.add_handler(CallbackQueryHandler(callback_check_balance, pattern="^check_balance$"))
+    app_telegram.add_handler(CallbackQueryHandler(callback_support, pattern="^support$"))
+    app_telegram.add_handler(CallbackQueryHandler(callback_faq, pattern="^faq$"))
+    app_telegram.add_handler(CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$"))
+    
+    app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:.*$"))
+    app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
+    app_telegram.add_handler(CallbackQueryHandler(on_category, pattern=r"^cat:.+$"))
+    app_telegram.add_handler(CallbackQueryHandler(hist_view_callback, pattern=r"^hist:view$"))
+    app_telegram.add_handler(CallbackQueryHandler(hist_pros, pattern=r"^hist:pros(:page:\d+)?$"))
+    app_telegram.add_handler(CallbackQueryHandler(hist_permis, pattern=r"^hist:permis(:page:\d+)?$"))
+    app_telegram.add_handler(CallbackQueryHandler(close_history, pattern=r"^close_history$"))
+    app_telegram.add_handler(CallbackQueryHandler(delete_history_handler, pattern=r"^delete_history_\d+$"))
+    app_telegram.add_handler(CallbackQueryHandler(auth_logout, pattern="^auth_logout$"))
+    app_telegram.add_handler(CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"))
+    app_telegram.add_handler(CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"))
 
-# === Boucle principale sécurisée ===
-try:
-    _ptb = globals().get('app_telegram') or globals().get('application')
-    if _ptb and hasattr(_ptb, 'run_polling'):
-        try:
-            bot_loop = asyncio.get_event_loop()
-        except RuntimeError:
-            bot_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(bot_loop)
-        _ptb.run_polling(close_loop=False)
-except Exception as _e:
-    pass
+    # Shop Helpers
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_preview_callback, pattern=r"^prod:preview:\d+$"), group=-1)
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"), group=-1)
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"), group=-1)
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"), group=-1)
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"), group=-1)
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"), group=-1)
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"), group=-1)
 
-import time
-while True:
-    time.sleep(3600)
+    app_telegram.add_handler(CallbackQueryHandler(menu_handler))
+
+    # Attachement Globals
+    app_telegram.bot_data['db_conn'] = db_conn
+    app_telegram.bot_data['db'] = db_conn
+    app_telegram.bot_data['get_user_balance'] = get_user_balance
+    app_telegram.bot_data['update_user_balance'] = update_user_balance
+    app_telegram.bot_data['create_transaction'] = create_transaction
+
+    # 4. Run
+    print("✅ BOT DÉMARRÉ.")
+    app_telegram.run_polling(close_loop=False)
+
+    while True:
+        time.sleep(3600)
