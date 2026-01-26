@@ -5925,11 +5925,13 @@ async def id_save_rate(u,c): pass
 async def id_save_sin_or_range(u,c): c.user_data['form_sin']=(u.message.text if u.message else "Range"); return await id_finalize_order(u,c)
 
 if __name__ == "__main__":
-# --- DB ---
+    # --- INIT DB ---
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     shop_helpers.ensure_shop_tables(db_conn)
-    init_db() 
+    init_db()
+    patch_db_tickets()
     ensure_verifications_table()
+    ensure_payment_table()
 
     # --- Launch Flask (IVR) on PORT 5001 ---
     flask_thread = threading.Thread(
@@ -6165,9 +6167,7 @@ app_telegram.add_handler(CommandHandler("local_import", admin_local_import_comma
 app_telegram.add_handler(CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"))
 app_telegram.add_handler(CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"))
 
-# ==============================================================================
-# GESTIONNAIRES DE CONVERSATION (HANDLERS)
-# ==============================================================================
+
 
 # 1. ROUTEUR PRINCIPAL (LOGIN, SUPPORT, TOOLS, VERIF PERMIS)
 conv_handler = ConversationHandler(
@@ -6181,7 +6181,7 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
     ],
     states={
-        # --- AUTHENTIFICATION ---
+        # --- AUTH ---
         ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_create_pin_save)],
         ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
         ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
@@ -6191,9 +6191,9 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(tickets.save_category, pattern="^ticket_cat:")
         ],
         tickets.WAIT_TICKET_MSG: [
-            # <--- C'EST ICI QU'IL FAUT CORRIGER
-            CallbackQueryHandler(tickets.start_support, pattern="^support$"), 
-            # SUPPRIME les lignes "start_ticket_reply" et "close_ticket" ici si elles y sont encore
+            CallbackQueryHandler(tickets.start_support, pattern="^support$"), # Bouton Retour
+            CallbackQueryHandler(tickets.start_ticket_reply, pattern="^ticket_reply_direct$"), # Bouton Répondre
+            CallbackQueryHandler(tickets.close_ticket, pattern="^ticket_close$"), # Bouton Fermer
             MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)
         ],
 
@@ -6368,13 +6368,23 @@ history_filter_conv = ConversationHandler(
     fallbacks=[CallbackQueryHandler(history_filter_cancel, pattern="^history_filter_cancel$")]
 )
 
+# 4. CONVERSATION ADMIN TICKETS (RÉPONSE)
+admin_ticket_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(tickets.admin_ask_reply, pattern="^adm_ticket_rep_")],
+    states={
+        tickets.ADMIN_TICKET_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.admin_send_reply)]
+    },
+    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
+)
+
+
 # ================= BOUCLE PRINCIPALE (MAIN) =================
 if __name__ == "__main__":
     # --- INIT DB ---
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     shop_helpers.ensure_shop_tables(db_conn)
     init_db()
-    patch_db_tickets()
+    tickets.patch_db_tickets() # Mise à jour DB Tickets
     ensure_verifications_table()
     ensure_payment_table()
 
@@ -6394,24 +6404,8 @@ if __name__ == "__main__":
     app_telegram.add_handler(ccs_catalog_filter_conv)
     app_telegram.add_handler(payment_conv)
     app_telegram.add_handler(id_docs_conv)
-
-
-
-    # --- NOUVEAU : CONVERSATION POUR RÉPONSE ADMIN ---
-admin_ticket_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(tickets.admin_ask_reply, pattern="^adm_ticket_rep_")],
-    states={
-        tickets.ADMIN_TICKET_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.admin_send_reply)]
-    },
-    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
-)
-app_telegram.add_handler(admin_ticket_conv, group=9) 
-
-# --- HANDLERS SIMPLES ---
-app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
-app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
-app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
     app_telegram.add_handler(conv_handler) # Main Router
+    app_telegram.add_handler(admin_ticket_conv, group=9) # Admin Tickets
 
     # --- Handlers "Loose" (Admin & Callbacks simples) ---
     app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_\d+$"))
@@ -6433,8 +6427,12 @@ app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, patt
     app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive), group=21)
     app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_customamount_receive), group=22)
 
+    # --- Handlers Tickets (Simples) ---
+    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
+    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
+    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
+
     # --- Réponse Magique Admin (depuis le canal) ---
-    # Cette ligne permet au bot de lire les réponses dans le groupe admin
     app_telegram.add_handler(MessageHandler(filters.Chat(chat_id=int(tickets.CHANNEL_LOGS)) & filters.REPLY, tickets.admin_reply_native))
 
     # --- Callbacks Généraux ---
