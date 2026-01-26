@@ -89,9 +89,9 @@ async def handle_ticket_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except: pass
     
-    # Retour au menu principal (import local pour éviter boucle)
-    from app import show_main_menu
-    await show_main_menu(user.id, clear=False)
+    # Retour au menu principal (Version sans bug)
+    kb = [[InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]]
+    await update.message.reply_text("✅ Ticket envoyé. Retour au menu :", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
 # Ces fonctions existent pour la compatibilité avec app.py
