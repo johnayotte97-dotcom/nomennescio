@@ -1776,10 +1776,11 @@ async def goto_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, batch_id: str, lang: str):
     """
-    Anime un message "Décryptage en cours..." pendant que le batch s'exécute.
-    S'arrête quand br["notified"] passe à True.
+    Anime un message et inclut une SÉCURITÉ ANTI-BLOCAGE (Timeout).
     """
     i = 0
+    timeout_limit = 45  # 45 boucles de 2s = 90 secondes max
+    
     # Laisse le temps au batch d'être créé
     await asyncio.sleep(1) 
     br = batch_runs.get(batch_id)
@@ -1787,12 +1788,12 @@ async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         return
 
     try:
-        # Boucle tant que le batch n'est pas marqué comme "notified" (terminé)
-        while not br.get("notified", False):
-            dots = "." * (i % 3 + 1) # Fait . .. ... . .. ...
+        # Boucle tant que le batch n'est pas fini ET qu'on n'a pas dépassé le temps limite
+        while not br.get("notified", False) and i < timeout_limit:
+            dots = "." * (i % 3 + 1)
             
-            # Utilise la fonction msg() pour obtenir le texte dans la bonne langue
-            base_text = msg(chat_id, 'decrytage_en_cours').replace('…','') # Récupère '🔄 Décryptage en cours'
+            # Utilise la fonction msg() pour obtenir le texte
+            base_text = msg(chat_id, 'decrytage_en_cours').replace('…','')
             text = f"{base_text}{dots} ({br.get('resolved', 0)}/{br.get('total', '?')})"
             
             try:
@@ -1801,29 +1802,42 @@ async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
                     chat_id=chat_id,
                     message_id=message_id
                 )
-            except Exception as e:
-                # Si le message est supprimé ou identique ("Message is not modified"), arrête la boucle
-                logger.info(f"Arrêt de l'animation (message {message_id}): {e}")
-                break
+            except Exception:
+                # Si le message est supprimé ou inchangé, on ignore
+                pass
             
             i += 1
-            await asyncio.sleep(2) # IMPORTANT: Pause de 2s pour éviter le flood
+            await asyncio.sleep(2)
             
-            # Rafraîchit la référence au batch
+            # Rafraîchit la référence
             br = batch_runs.get(batch_id)
-            if not br:
-                break # Le batch a été supprimé
+            if not br: break
+
+        # === GESTION DU TIMEOUT (Si bloqué) ===
+        if i >= timeout_limit and not br.get("notified", False):
+            # On force l'arrêt
+            br["notified"] = True
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="⚠️ **Délai dépassé.**\nLe système n'a pas reçu de retour des appels.\n\n1. Vérifiez que votre serveur est public (pas localhost).\n2. Vérifiez vos crédits SignalWire."
+            )
+            # On nettoie
+            try:
+                 # Optionnel : Annuler les appels en cours ici
+                 pass 
+            except: pass
+            return # On sort pour ne pas supprimer le message d'erreur tout de suite
 
     except Exception as e:
-        logger.error(f"Erreur dans animate_wait_message: {e}")
+        logger.error(f"Erreur animate_wait_message: {e}")
     finally:
-        # Une fois la boucle finie, supprime le message d'attente
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except:
-            pass
-
-        # AJOUTE CES DEUX FONCTIONS (après animate_wait_message, ligne 915)
+        # Si tout s'est bien passé (batch fini), on supprime le message d'attente
+        if br and br.get("notified", True) and i < timeout_limit:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except:
+                pass
 
 def get_ivr_timings():
     """Charge les temps de pause depuis le fichier JSON, ou utilise les défauts."""
@@ -6026,6 +6040,74 @@ admin_ticket_conv = ConversationHandler(
     },
     fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
 )
+
+
+# ==============================================================================
+# 4. FONCTIONS CATÉGORIES (MANQUANTES) - À COLLER ICI
+# ==============================================================================
+
+# ==============================================================================
+# FONCTION MANQUANTE : SUPPRESSION HISTORIQUE
+# ==============================================================================
+async def delete_history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        # Récupère l'ID de l'achat depuis le bouton
+        item_id = int(q.data.split("_")[-1])
+        user_id = str(q.from_user.id)
+        
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        # Sécurité : on supprime seulement si ça appartient à l'utilisateur
+        cur.execute("DELETE FROM purchases WHERE id=? AND user_id=?", (item_id, user_id))
+        con.commit()
+        con.close()
+        
+        await q.answer("🗑 Supprimé !")
+        # On supprime le message du bot pour nettoyer l'écran
+        try:
+            await q.message.delete()
+        except:
+            await q.message.edit_text("🗑 Cet élément a été supprimé.")
+            
+    except Exception as e:
+        print(f"Erreur suppression historique: {e}")
+        try: await q.answer("Erreur technique.")
+        except: pass
+
+def build_categories_kb():
+    """Génère le clavier des catégories."""
+    kb = [
+        [InlineKeyboardButton("💳 Cc's", callback_data="ccs_catalog_start")],
+        [InlineKeyboardButton("👥 Pro's", callback_data="propro")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+    ]
+    return InlineKeyboardMarkup(kb)
+
+async def on_back_cats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retourne au menu des catégories."""
+    q = update.callback_query
+    await q.answer()
+    try:
+        await q.edit_message_text("📂 **Catégories**", reply_markup=build_categories_kb(), parse_mode="Markdown")
+    except:
+        await q.message.reply_text("📂 **Catégories**", reply_markup=build_categories_kb(), parse_mode="Markdown")
+
+async def on_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le clic sur une catégorie générique."""
+    q = update.callback_query
+    await q.answer()
+    data = q.data.split(":")[-1]
+    
+    if data == "ccs":
+        # On suppose que show_products_ccs est défini plus haut
+        return await show_products_ccs(update, context, page=0)
+    elif data == "propro":
+        # On suppose que show_products est défini plus haut
+        return await show_products(update, context, page=0)
+    else:
+        await q.message.reply_text(f"Catégorie : {data}")
+
 
 conv_handler = ConversationHandler(
     entry_points=[
