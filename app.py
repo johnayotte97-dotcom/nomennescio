@@ -322,7 +322,7 @@ def init_db():
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     
-    # 1. Création des tables si elles n'existent pas
+    # 1. TABLE DES UTILISATEURS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -336,51 +336,20 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             lang TEXT DEFAULT 'fr',
             total_recharge REAL DEFAULT 0,
-            forfait TEXT DEFAULT 'bronze'
+            forfait TEXT DEFAULT 'bronze',
+            custom_username TEXT,
+            jabber_id TEXT
         )
     """)
     
-    # --- PATCH AUTOMATIQUE DES COLONNES MANQUANTES ---
-    # On vérifie si les colonnes critiques existent, sinon on les ajoute
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN user_id TEXT")
-        print("✅ PATCH DB: Colonne 'user_id' ajoutée.")
-        # Migration des données pour ne pas perdre les comptes
-        cur.execute("UPDATE users SET user_id = telegram_id WHERE user_id IS NULL")
-    except sqlite3.OperationalError:
-        pass 
+    # Patchs pour la table users (sécurité si déjà existante)
+    for col in [("user_id", "TEXT"), ("seed_phrase", "TEXT"), ("pin_code", "TEXT"), 
+                ("username", "TEXT"), ("custom_username", "TEXT"), ("jabber_id", "TEXT")]:
+        try:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
+        except sqlite3.OperationalError: pass
 
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN seed_phrase TEXT")
-        print("✅ PATCH DB: Colonne 'seed_phrase' ajoutée.")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN pin_code TEXT")
-        print("✅ PATCH DB: Colonne 'pin_code' ajoutée.")
-    except sqlite3.OperationalError:
-        pass
-        
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN username TEXT")
-    except sqlite3.OperationalError:
-        pass
-
-    # 👇👇 AJOUT POUR LE MENU ACCOUNT (JABBER & CUSTOM USER) 👇👇
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN custom_username TEXT")
-        print("✅ PATCH DB: Colonne 'custom_username' ajoutée.")
-    except sqlite3.OperationalError:
-        pass
-
-    try:
-        cur.execute("ALTER TABLE users ADD COLUMN jabber_id TEXT")
-        print("✅ PATCH DB: Colonne 'jabber_id' ajoutée.")
-    except sqlite3.OperationalError:
-        pass
-    # ---------------------------------------------------
-
+    # 2. TABLE DES TRANSACTIONS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             order_id TEXT PRIMARY KEY,
@@ -391,6 +360,7 @@ def init_db():
         )
     """)
 
+    # 3. TABLE DES PRODUITS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -405,15 +375,37 @@ def init_db():
         )
     """)
 
+    # 4. TABLE DES TICKETS (Version ajustée)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS support_tickets (
             ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT,
+            username TEXT,
+            category TEXT,
             status TEXT DEFAULT 'open',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    # Patchs pour support_tickets (pour le nouveau système)
+    for col in [("username", "TEXT"), ("category", "TEXT")]:
+        try:
+            cur.execute(f"ALTER TABLE support_tickets ADD COLUMN {col[0]} {col[1]}")
+        except sqlite3.OperationalError: pass
 
+    # 5. NOUVELLE TABLE : HISTORIQUE DES MESSAGES (CRITIQUE)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER,
+            sender_role TEXT, -- 'user' ou 'admin'
+            message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(ticket_id) REFERENCES support_tickets(ticket_id)
+        )
+    """)
+
+    # 6. TABLE LOTERIE
     cur.execute("""
         CREATE TABLE IF NOT EXISTS lottery (
             user_id TEXT PRIMARY KEY,
@@ -424,7 +416,7 @@ def init_db():
 
     con.commit()
     con.close()
-    log("DB initialized (V2.3 Account Ready)", "SYSTEM")
+    log("DB initialized (V3.0 Support Multi-Message Ready)", "SYSTEM")
 
 def patch_db_tickets():
     con = sqlite3.connect(DB_NAME)
@@ -6257,9 +6249,41 @@ def _generate_dashboard_text(cat, user_text, status_label, admin_reply=None):
     return txt
 
 async def ticket_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
+    user_id = str(update.effective_user.id)
+
+    # --- NOUVELLE VÉRIFICATION : TICKET EN COURS ---
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    # On cherche si l'utilisateur a un ticket qui n'est pas 'closed' ou 'read'
+    cur.execute(
+        "SELECT ticket_id FROM support_tickets WHERE user_id=? AND status IN ('open', 'replied') LIMIT 1", 
+        (user_id,)
+    )
+    existing_ticket = cur.fetchone()
+    con.close()
+
+    if existing_ticket:
+        # Si un ticket est trouvé, on refuse l'ouverture d'un nouveau
+        await q.edit_message_text(
+            "⚠️ **ACTION IMPOSSIBLE**\n\n"
+            f"Vous avez déjà un ticket en cours (ID: #{existing_ticket[0]}).\n"
+            "Veuillez attendre la fermeture de celui-ci avant d'en ouvrir un nouveau.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="support")]]),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END # On arrête la conversation ici
+    # -----------------------------------------------
+
+    # Si aucun ticket en cours, on continue normalement
     context.user_data['ticket_draft'] = ""
-    kb = [[InlineKeyboardButton("💳 PAIEMENT", callback_data="tick_cat:PAIEMENT")], [InlineKeyboardButton("🚚 COMMANDE", callback_data="tick_cat:COMMANDE")], [InlineKeyboardButton("🆘 AUTRE", callback_data="tick_cat:AUTRE")], [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]]
+    kb = [
+        [InlineKeyboardButton("💳 PAIEMENT", callback_data="tick_cat:PAIEMENT")],
+        [InlineKeyboardButton("🚚 COMMANDE", callback_data="tick_cat:COMMANDE")],
+        [InlineKeyboardButton("🆘 AUTRE", callback_data="tick_cat:AUTRE")],
+        [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
+    ]
     await replace_view(q, "📨 **NOUVEAU TICKET**\n\nSélectionnez le sujet :", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     return tickets.WAIT_CATEGORY
 
@@ -6416,46 +6440,40 @@ async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except: pass
 
 async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    
-    # On récupère l'ID du ticket depuis le callback_data (ex: view_reply:12)
+    q = update.callback_query; await q.answer()
     tid = q.data.split(":")[1]
     
-    con = sqlite3.connect(DB_NAME)
-    cur = con.cursor()
+    con = sqlite3.connect(DB_NAME); cur = con.cursor()
+    # 1. On récupère tous les messages du ticket par ordre chronologique
+    cur.execute("SELECT sender_role, message, created_at FROM ticket_messages WHERE ticket_id=? ORDER BY created_at ASC", (tid,))
+    messages = cur.fetchall()
     
-    # 1. On marque le ticket comme lu ('read') pour enlever le point rouge au prochain menu
-    cur.execute("UPDATE support_tickets SET status='read' WHERE ticket_id=?", (tid,))
-    
-    # 2. On récupère le message original (et la catégorie)
-    cur.execute("SELECT category, message FROM support_tickets WHERE ticket_id=?", (tid,))
-    row = cur.fetchone()
-    con.commit()
+    # 2. On récupère les infos de base du ticket
+    cur.execute("SELECT category, status FROM support_tickets WHERE ticket_id=?", (tid,))
+    t_info = cur.fetchone()
     con.close()
-    
-    if not row:
-        await q.edit_message_text("❌ Erreur : Ticket introuvable.")
+
+    if not t_info:
+        await q.edit_message_text("❌ Ticket introuvable.")
         return
 
-    cat, msg = row
+    cat, status = t_info
     
-    # Construction de l'affichage archive
-    txt = (
-        f"📩 **ARCHIVE TICKET #{tid}**\n"
-        f"📂 Catégorie : `{cat}`\n"
-        f"━━━━━━━━━━━━━━━━━━\n\n"
-        f"👤 **VOTRE MESSAGE :**\n"
-        f"_{msg}_\n\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"👮‍♂️ **RÉPONSE ADMIN :**\n"
-        f"✅ _Le support a traité votre demande._\n\n"
-        "*(Note : Si l'admin vous a répondu par message direct, vérifiez votre historique de chat)*"
-    )
+    # 3. Construction du fil de discussion
+    history_text = f"📝 **FIL DU TICKET #{tid}**\n📂 Catégorie : `{cat}`\n━━━━━━━━━━━━━━━━━━\n\n"
     
-    kb = [[InlineKeyboardButton("⬅️ Retour au Menu", callback_data="menu_accueil")]]
+    for role, msg, date in messages:
+        prefix = "👤 **VOUS :**" if role == 'user' else "👮‍♂️ **SUPPORT :**"
+        history_text += f"{prefix}\n{msg}\n\n"
+
+    history_text += "━━━━━━━━━━━━━━━━━━"
     
-    await q.edit_message_text(text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]]
+    # On ajoute un bouton pour répondre si le ticket n'est pas fermé
+    if status != 'closed':
+        kb.insert(0, [InlineKeyboardButton("✍️ Répondre", callback_data=f"ticket_reply_user:{tid}")])
+
+    await q.edit_message_text(text=history_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 admin_ticket_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
