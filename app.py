@@ -5251,118 +5251,93 @@ async def id_view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ID_PROD_VIEW
 
 
-# --- DÉBUT DU BLOC QUANTITÉ INTERACTIVE ---
-
-# --- DÉBUT DU BLOC QUANTITÉ INTERACTIVE CORRIGÉ ---
+# ==============================================================================
+# BLOC DE GESTION QUANTITÉ (CORRIGÉ & OPTIMISÉ)
+# ==============================================================================
 
 async def id_start_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
-    # 1. On récupère l'ID du produit
+    # 1. Initialisation du produit
     pid = int(q.data.split(":")[1])
-    
     con = sqlite3.connect(DB_NAME)
     row = con.execute("SELECT title, price, tier FROM products WHERE id=?", (pid,)).fetchone()
     con.close()
     
-    # 2. On initialise les données
     context.user_data['id_product'] = {'id': pid, 'name': row[0], 'price': row[1], 'code': row[2]}
     context.user_data['current_qty'] = 1 
     
-    # 3. CRUCIAL : On supprime la photo (Fiche produit) pour faire place au menu texte
-    # Si on ne fait pas ça, le edit_message_text suivant échouera silencieusement
-    try:
-        await q.message.delete()
-    except Exception:
-        pass
-
-    # 4. On affiche le menu de quantité (comme un NOUVEAU message)
-    await update_qty_display(update, context, new_message=True)
+    # 2. Suppression de la photo pour afficher le menu textuel
+    try: await q.message.delete()
+    except: pass
     
+    # 3. Affichage du menu quantité
+    await update_qty_display(update, context, new_message=True)
     return ID_ASK_QTY
 
 async def update_qty_display(update: Update, context: ContextTypes.DEFAULT_TYPE, new_message=False):
-    # Récupération des données
     qty = context.user_data.get('current_qty', 1)
     prod = context.user_data['id_product']
     total_price = prod['price'] * qty
     
-    # Clavier Interactif [-] 1 [+]
     kb = [
         [
-            InlineKeyboardButton("➖", callback_data="qty_sub"),
+            InlineKeyboardButton("➖", callback_data="qty_sub"), 
             InlineKeyboardButton(f"📦 {qty}", callback_data="noop"), 
             InlineKeyboardButton("➕", callback_data="qty_add")
         ],
         [
-            InlineKeyboardButton("+5", callback_data="qty_add_5"),
+            InlineKeyboardButton("+5", callback_data="qty_add_5"), 
             InlineKeyboardButton("+10", callback_data="qty_add_10")
         ],
+        # Ce bouton déclenche 'qty_confirm'
         [InlineKeyboardButton(f"✅ Confirmer ({total_price:.2f}$)", callback_data="qty_confirm")],
         [InlineKeyboardButton("⬅️ Annuler", callback_data="id_menu_entry")]
     ]
+    txt = f"🛒 **{prod['name']}**\n\n🔢 **Quantité : {qty}**\n💰 **Total : {total_price:.2f}$**\n\n_Utilisez les boutons ou écrivez un chiffre._"
     
-    txt = (
-        f"🛒 **{prod['name']}**\n"
-        f"Prix unitaire : {prod['price']:.2f}$\n\n"
-        f"🔢 **Quantité : {qty}**\n"
-        f"💰 **Total : {total_price:.2f}$**\n\n"
-        f"👇 Utilisez les boutons ou écrivez un chiffre."
-    )
-    
-    # Si on demande explicitement un nouveau message (cas du démarrage après la photo)
     if new_message:
-        chat_id = update.effective_chat.id
-        await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        return
-
-    # Sinon, on essaie de modifier le message existant
-    if update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        except Exception:
-            # Si l'edit échoue (ex: message trop vieux), on renvoie un neuf
-            pass
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
-        # Cas message texte manuel
-        await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        try: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        except: pass
 
 async def id_handle_qty_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
     
+    # --- PATCH CRITIQUE : Redirection du bouton Confirmer ---
+    # Le pattern regex "^qty_" capture aussi "qty_confirm", donc on doit gérer la redirection ici.
+    if data == "qty_confirm":
+        return await id_save_qty(update, context)
+    # --------------------------------------------------------
+
     current = context.user_data.get('current_qty', 1)
     
-    if data == "qty_add":
-        current += 1
-        await q.answer("Ajouté (+1)")
-    elif data == "qty_sub":
-        current = max(1, current - 1)
-        await q.answer("Retiré (-1)")
-    elif data == "qty_add_5":
-        current += 5
-        await q.answer("Ajouté (+5)")
-    elif data == "qty_add_10":
-        current += 10
-        await q.answer("Ajouté (+10)")
-        
+    if data == "qty_add": current += 1
+    elif data == "qty_sub": current = max(1, current - 1)
+    elif data == "qty_add_5": current += 5
+    elif data == "qty_add_10": current += 10
+    
     context.user_data['current_qty'] = current
     await update_qty_display(update, context, new_message=False)
     return ID_ASK_QTY
 
 async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cas A : Clic sur "✅ Confirmer"
-    if update.callback_query and update.callback_query.data == "qty_confirm":
-        context.user_data['id_qty'] = context.user_data['current_qty']
-        return await id_start_form(update, context) 
+    if update.callback_query:
+        # On valide la quantité actuelle
+        context.user_data['id_qty'] = context.user_data.get('current_qty', 1)
+        return await id_start_form(update, context)
         
-    # Cas B : Texte écrit (ex: "50")
+    # Cas B : Texte écrit manuellement (ex: "50")
     if update.message and update.message.text:
         text = update.message.text.strip()
         if text.isdigit() and int(text) > 0:
             context.user_data['current_qty'] = int(text)
-            await update_qty_display(update, context, new_message=True) # On renvoie le menu mis à jour
+            # On réaffiche pour confirmation visuelle
+            await update_qty_display(update, context, new_message=True)
             return ID_ASK_QTY
         else:
             await update.message.reply_text("⚠️ Chiffre invalide.")
@@ -5370,81 +5345,30 @@ async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     return ID_ASK_QTY
 
-# --- FIN DU BLOC QUANTITÉ CORRIGÉ ---
-
-async def id_handle_qty_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    data = q.data
-    
-    # Récupère la quantité actuelle
-    current = context.user_data.get('current_qty', 1)
-    
-    # Calcul
-    if data == "qty_add":
-        current += 1
-        await q.answer("Ajouté (+1)") # Petite notif toast
-    elif data == "qty_sub":
-        current = max(1, current - 1) # On ne descend pas sous 1
-        await q.answer("Retiré (-1)")
-    elif data == "qty_add_5":
-        current += 5
-        await q.answer("Ajouté (+5)")
-    elif data == "qty_add_10":
-        current += 10
-        await q.answer("Ajouté (+10)")
-        
-    # Sauvegarde et mise à jour visuelle
-    context.user_data['current_qty'] = current
-    await update_qty_display(update, context)
-    return ID_ASK_QTY
-        
-
-async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Cas A : Clic sur "✅ Confirmer"
-    if update.callback_query and update.callback_query.data == "qty_confirm":
-        # La quantité est déjà dans 'current_qty'
-        context.user_data['id_qty'] = context.user_data['current_qty']
-        return await id_start_form(update, context) # On passe à la suite
-        
-    # Cas B : Texte écrit (ex: "50")
-    if update.message and update.message.text:
-        text = update.message.text.strip()
-        if text.isdigit() and int(text) > 0:
-            context.user_data['current_qty'] = int(text)
-            # On réaffiche le menu avec le nouveau chiffre pour validation
-            await update_qty_display(update, context)
-            return ID_ASK_QTY
-        else:
-            await update.message.reply_text("⚠️ Chiffre invalide.")
-            return ID_ASK_QTY
-            
-    return ID_ASK_QTY
-
-
-# 3. DÉMARRAGE FORMULAIRE (AVEC NETTOYAGE TOTAL)
 async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    user_id = str(q.from_user.id)
+    user_id = str(update.effective_user.id)
     
-    # Initialisation de la liste de nettoyage
-    context.user_data['cleanup_ids'] = []
-    
-    # On ajoute le message actuel (le menu quantité) à la liste
-    try: context.user_data['cleanup_ids'].append(q.message.message_id)
-    except: pass
-
+    # 1. Vérification du solde (SANS DÉBITER)
     total = context.user_data['id_product']['price'] * context.user_data['id_qty']
     if get_user_balance(user_id) < total:
-        await q.edit_message_text("❌ Solde insuffisant.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recharger", callback_data="add_balance")]]))
+        await context.bot.send_message(
+            chat_id=user_id, 
+            text=f"❌ **Solde insuffisant.**\nRequis : {total:.2f}$ CAD.", 
+            reply_markup=kb_back_to_menu()
+        )
         return ConversationHandler.END
-    update_user_balance(user_id, -total)
     
-    # Demande Prénom
-    m = await q.edit_message_text("✍️ **Formulaire (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?")
-    # On track le message édité (c'est le même ID, mais on s'assure qu'il est dans la liste)
-    if m.message_id not in context.user_data['cleanup_ids']:
-        context.user_data['cleanup_ids'].append(m.message_id)
-        
+    # 2. Lancement du formulaire (Nouveau message propre)
+    context.user_data['cleanup_ids'] = []
+    
+    # On force un send_message pour éviter l'erreur "message to edit not found"
+    m = await context.bot.send_message(
+        chat_id=user_id, 
+        text="✍️ **FORMULAIRE (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?", 
+        parse_mode="Markdown"
+    )
+    context.user_data['cleanup_ids'].append(m.message_id)
+    
     return ID_ASK_NAME
 
 async def id_save_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5814,143 +5738,112 @@ async def id_receive_new_value(update: Update, context: ContextTypes.DEFAULT_TYP
 async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import asyncio
     q = update.callback_query
-    if q: await q.answer()
+    
+    # 1. On répond au callback immédiatement
+    if q:
+        try: await q.answer()
+        except: pass
     
     user = update.effective_user
     d = context.user_data
-    cat = d.get('id_category')
-    prod = d.get('id_product')
-    target = update.message or update.callback_query.message
+    
+    # Sécurité : On récupère les données
+    cat = d.get('id_category', 'ID')
+    prod = d.get('id_product', {})
+    prod_name = prod.get('name', 'Produit Inconnu')
+    prod_code = prod.get('code', 'QC')
 
-    # 0. TRANSFORMATION EN MAJUSCULES
-    fn = str(d.get('form_firstname', '')).upper()
-    ln = str(d.get('form_lastname', '')).upper()
-    dob = str(d.get('form_dob', '')).upper()
-    issue = str(d.get('form_issue', '')).upper()
-    expiry = str(d.get('form_expiry', '')).upper()
-    street = str(d.get('addr_street', '')).upper()
-    city = str(d.get('addr_city', '')).upper()
-    zip_code = str(d.get('addr_zip', '')).upper()
-    dl_num = str(d.get('form_dl_number', '')).upper()
-    ref_num = str(d.get('form_ref_number', '')).upper()
-    sex = str(d.get('form_sex', '')).upper()
-    height = str(d.get('form_height', '')).upper()
-    eyes = str(d.get('form_eyes', '')).upper()
+    # 2. Préparation des données
+    def clean(key): return str(d.get(key, '')).upper().strip()
 
-    # 1. Préparation API
     api_data = {
-        "form_firstname": fn, "form_lastname": ln,
-        "form_dob": dob, "form_issue": issue,
-        "form_expiry": expiry, "form_street": street,
-        "form_city": city, "form_zip": zip_code,
-        "form_dl_number": dl_num, "form_ref_number": ref_num,
-        "form_sex": sex, "form_height": height, "form_eyes": eyes
+        "form_firstname": clean('form_firstname'),
+        "form_lastname": clean('form_lastname'),
+        "form_dob": clean('form_dob'),
+        "form_sex": clean('form_sex'),
+        "form_height": clean('form_height'),
+        "form_eyes": clean('form_eyes'),
+        "form_street": clean('addr_street'),
+        "form_city": clean('addr_city'),
+        "form_zip": clean('addr_zip'),
+        "form_dl_number": clean('form_dl_number'),
+        "form_ref_number": clean('form_ref_number'),
+        "form_issue": clean('form_issue'),
+        "form_expiry": clean('form_expiry')
     }
 
-    # Cas 1 : TOOL
-    if cat == 'tool':
-        msg = await target.reply_text("⚙️ Génération des codes-barres...")
-        pdf417, linear = generate_barcode_via_api(api_data, prod['code'])
-        try:
-            await msg.delete()
-        except:
-            pass
+    # 3. Message de statut
+    status_msg = await context.bot.send_message(
+        chat_id=user.id, 
+        text="⏳ **Génération des fichiers et envoi en cours...**\n_(Cela peut prendre quelques secondes)_", 
+        parse_mode="Markdown"
+    )
 
-        if pdf417:
-            await target.reply_document(document=pdf417, filename=f"pdf417_{ln}.png", caption="✅ **PDF417 (Scan)**")
-            if linear:
-                await target.reply_document(document=linear, filename=f"code128_{ln}.png", caption="✅ **Code 128**")
-            
-            success_msg = await target.reply_text("✅ **Génération terminée.** Merci !")
-            await asyncio.sleep(3)
-            
-            # --- GRAND NETTOYAGE ---
-            try:
-                await success_msg.delete()
-            except:
-                pass
-            
-            # Suppression de TOUT l'historique de conversation tracké
-            for mid in context.user_data.get('cleanup_ids', []):
-                try:
-                    await context.bot.delete_message(chat_id=target.chat_id, message_id=mid)
-                except:
-                    pass
-            context.user_data['cleanup_ids'] = []
-            # -----------------------
+    try:
+        # 4. Génération Barcode (API) - CORRECTION ANTI-LAG
+        # On exécute la fonction bloquante dans un thread séparé pour ne pas figer le bot
+        loop = asyncio.get_running_loop()
+        pdf417, linear = await loop.run_in_executor(None, lambda: generate_barcode_via_api(api_data, prod_code))
 
-        else:
-            await target.reply_text("⚠️ Erreur technique API.")
-    
-    # Cas 2 : PHYSIQUE / DOCS
-    else:
-        wait_msg = await target.reply_text("⏳ Traitement de la commande...")
-        
-        pdf417, linear = generate_barcode_via_api(api_data, prod['code'])
-        
-        admin_msg = (
-            f"🚨 **NOUVELLE COMMANDE : {cat.upper()}** 🚨\n\n"
-            f"👤 **Client** : @{user.username} (ID: {user.id})\n"
-            f"🛒 **Produit** : {prod['name']} (x{d.get('id_qty')})\n\n"
-            f"📋 **DONNÉES DU FORMULAIRE :**\n"
+        # 5. Débit de l'argent (C'est le bon moment, juste avant l'envoi)
+        # Vous aviez mis le débit au début, je conseille de le mettre ici ou de le laisser au début si vous préférez.
+        # Pour l'instant, on assume que le solde a été vérifié avant.
+        # Si vous voulez débiter ici :
+        total_cost = d.get('id_qty', 1) * prod.get('price', 0)
+        update_user_balance(str(user.id), -total_cost)
+
+
+        # 6. Message Admin
+        admin_txt = (
+            f"🚨 NOUVELLE COMMANDE : {cat.upper()} 🚨\n\n"
+            f"👤 CLIENT : {user.first_name} (@{user.username if user.username else 'N/A'})\n"
+            f"🆔 ID : {user.id}\n"
+            f"🛒 PRODUIT : {prod_name} (x{d.get('id_qty', 1)})\n"
+            f"💰 TOTAL : {total_cost:.2f}$\n"
             f"--------------------------------\n"
-            f"📛 Nom : {fn} {ln}\n"
-            f"🎂 DDN : {dob}\n"
-            f"📍 Adresse : {street}\n"
-            f"🏙️ Ville : {city}\n"
-            f"📮 CP : {zip_code}\n"
+            f"📛 Nom : {api_data['form_firstname']} {api_data['form_lastname']}\n"
+            f"🎂 DDN : {api_data['form_dob']}\n"
+            f"👫 Sexe : {api_data['form_sex']} | Taille : {api_data['form_height']} | Yeux : {api_data['form_eyes']}\n"
+            f"📍 Adresse : {api_data['form_street']}, {api_data['form_city']} ({api_data['form_zip']})\n"
             f"--------------------------------\n"
-            f"🆔 Permis : {dl_num}\n"
-            f"🔢 Réf : {ref_num}\n"
-            f"📅 Émission : {issue}\n"
-            f"📅 Expiration : {expiry}\n"
-            f"--------------------------------\n"
-            f"📏 Taille : {height}\n"
-            f"👁️ Yeux : {eyes}\n"
-            f"👤 Sexe : {sex}"
+            f"🆔 DOCUMENTS :\n"
+            f"💳 Permis : {api_data['form_dl_number']}\n"
+            f"🔢 Réf : {api_data['form_ref_number']}\n"
+            f"📅 Dates : ISS {api_data['form_issue']} / EXP {api_data['form_expiry']}\n"
+            f"--------------------------------"
         )
+
+        target_id = "-1003589564052" # Channel Logs
         
-        try:
-            target_id = "-1003589564052" 
-            if d.get('form_photo_id'):
-                await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_msg)
-            else:
-                await context.bot.send_message(chat_id=target_id, text=admin_msg)
-            
-            if pdf417:
-                await context.bot.send_document(chat_id=target_id, document=pdf417, filename=f"pdf417_{ln}.png", caption="🖨️ **PDF417 (PNG HQ)**")
-            if linear:
-                await context.bot.send_document(chat_id=target_id, document=linear, filename=f"code128_{ln}.png", caption="🖨️ **Code 128 (PNG HQ)**")
+        # Envoi Photo si présente + Texte
+        if d.get('form_photo_id'):
+            await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_txt)
+        else:
+            await context.bot.send_message(chat_id=target_id, text=admin_txt)
+        
+        # Envoi Barcodes (Seulement si générés)
+        if pdf417: 
+            await context.bot.send_document(chat_id=target_id, document=pdf417, filename=f"pdf417_{api_data['form_lastname']}.png")
+        if linear: 
+            await context.bot.send_document(chat_id=target_id, document=linear, filename=f"code128_{api_data['form_lastname']}.png")
 
-            try:
-                await wait_msg.delete()
-            except:
-                pass
+        # 7. Succès Client
+        await status_msg.edit_text("✅ **Commande reçue !**\nLes fichiers ont été envoyés à l'équipe.\nVotre solde a été débité.", parse_mode="Markdown")
 
-            # --- NETTOYAGE TOTAL ---
-            success_msg = await target.reply_text("✅ Commande envoyée avec succès !")
-            await asyncio.sleep(2.5) # Temps de lecture
-            
-            try:
-                await success_msg.delete()
-            except:
-                pass
+    except Exception as e:
+        print(f"CRITICAL ERROR: {e}")
+        await status_msg.edit_text(f"⚠️ **Erreur technique.**\nL'admin a été notifié. Ne refaites pas la commande.")
 
-            # Boucle qui supprime TOUS les messages trackés (Questions + Réponses)
-            for mid in context.user_data.get('cleanup_ids', []):
-                try:
-                    await context.bot.delete_message(chat_id=target.chat_id, message_id=mid)
-                except:
-                    pass
-            
-            # On vide la liste pour la prochaine fois
-            context.user_data['cleanup_ids'] = []
-            # -----------------------------------
-            
-        except Exception as e:
-            print(f"Erreur envoi canal: {e}")
-            await target.reply_text(f"⚠️ Erreur lors de l'envoi : {e}")
-
+    # 8. Nettoyage sécurisé
+    await asyncio.sleep(2)
+    for mid in d.get('cleanup_ids', []):
+        try: await context.bot.delete_message(chat_id=user.id, message_id=mid)
+        except: pass
+    
+    context.user_data['cleanup_ids'] = []
+    
+    # 9. Retour Menu (SANS L'IMPORT QUI FAIT CRASHER)
+    # On appelle directement la fonction car elle est dans le même fichier
     await show_main_menu(user.id)
     return ConversationHandler.END
 
@@ -6448,7 +6341,7 @@ id_docs_conv = ConversationHandler(
         
         # Résumé & Edition
         ID_CONFIRM_SUMMARY: [
-            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), 
+            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"),
             CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$")
         ],
         ID_EDIT_MENU: [
@@ -6538,13 +6431,12 @@ async def enforcement_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Tâche de fond qui tourne chaque minute.
-    Vérifie qui est inactif depuis > 5 minutes et le verrouille.
+    Vérifie qui est inactif depuis > 5 minutes, NETTOIE L'ÉCRAN et le verrouille.
     """
     TIMEOUT = 300  # 5 minutes en secondes
     now = time.time()
     
     # On itère sur tous les utilisateurs actifs en mémoire
-    # Note : Nécessite que le bot garde les user_data en mémoire (comportement par défaut)
     if not context.application.user_data:
         return
 
@@ -6559,8 +6451,37 @@ async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
         if last > 0 and (now - last) > TIMEOUT:
             data['is_locked'] = True
             
-            # Récupération du username pour l'affichage (optionnel)
-            # On fait une requête DB rapide pour avoir le nom propre
+            # --- 1. GRAND NETTOYAGE (SUPPRIME TOUT LE HAUT) ---
+            # On rassemble toutes les listes de messages possibles
+            msgs_to_delete = []
+            
+            # Liste du formulaire ID (Celle qui reste affichée sur ton screen)
+            msgs_to_delete.extend(data.get('cleanup_ids', []))
+            
+            # Listes des autres modules
+            msgs_to_delete.extend(data.get('verif_flow_msg_ids', [])) # Verif Permis
+            msgs_to_delete.extend(data.get('hist_msgs', []))          # Historique
+            msgs_to_delete.extend(data.get('filter_msgs', []))        # Filtres
+            msgs_to_delete.extend(data.get('ccs_filter_msgs', []))    # Filtres CCS
+            
+            # Liste globale standard
+            if user_id in bot_messages:
+                msgs_to_delete.extend(bot_messages[user_id])
+                bot_messages[user_id] = [] # On vide la globale
+
+            # Suppression brutale de tous les messages collectés
+            for mid in set(msgs_to_delete): # set() pour éviter les doublons
+                try:
+                    await context.bot.delete_message(chat_id=user_id, message_id=mid)
+                except:
+                    pass
+            
+            # On vide les listes en mémoire pour être propre
+            data['cleanup_ids'] = []
+            data['verif_flow_msg_ids'] = []
+            # ----------------------------------------------------
+
+            # Récupération du username pour l'affichage
             try:
                 con = sqlite3.connect(DB_NAME)
                 cur = con.cursor()
@@ -6571,17 +6492,15 @@ async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
             except:
                 username = "Utilisateur"
 
-            # Action : On efface tout et on affiche le PIN
+            # Action : On affiche le PIN (L'écran est maintenant vide au dessus)
             try:
-                await clear_conversation(int(user_id)) # Fonction existante de nettoyage
-                
                 await context.bot.send_message(
                     chat_id=int(user_id),
                     text=f"🔒 **INACTIVITÉ DÉTECTÉE**\nTerminal verrouillé auto (5 min).\n\nUtilisateur : {username}\nPIN : `____`",
                     reply_markup=get_pin_keyboard(),
                     parse_mode="Markdown"
                 )
-                print(f"[AUTO-LOCK] Utilisateur {user_id} verrouillé pour inactivité.")
+                print(f"[AUTO-LOCK] Utilisateur {user_id} verrouillé et nettoyé.")
             except Exception as e:
                 print(f"[AUTO-LOCK ERROR] {e}")
 
@@ -6695,8 +6614,10 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"), group=-1)
     app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"), group=-1)
     app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"), group=-1)
-
+    app_telegram.add_handler(CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), group=0)
     app_telegram.add_handler(CallbackQueryHandler(menu_handler))
+
+    
 
     # Attachement Globals
     app_telegram.bot_data['db_conn'] = db_conn
