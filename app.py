@@ -198,7 +198,8 @@ app = Flask(__name__)
  ID_ASK_HEIGHT, ID_ASK_EYES, ID_ASK_PHOTO,
  # --- NOUVELLES ÉTAPES AJOUTÉES ---
  ID_ASK_LASTNAME, ID_ASK_ISSUE, ID_ASK_EXPIRY, 
- ID_ASK_DL_NUM, ID_ASK_REF_NUM, ID_ASK_SEX, ID_CONFIRM_SUMMARY
+ ID_ASK_DL_NUM, ID_ASK_REF_NUM, ID_ASK_SEX, ID_CONFIRM_SUMMARY,
+ TICKET_DRAFT
  ) = range(3000, 3028) # On augmente le range à 3028
 # Étapes Conversation (1 permis historique)
 ASK_PRENOM, ASK_NOM, ASK_DATE, CONFIRM_VERIF = range(4)
@@ -644,6 +645,16 @@ def convertir_en_code_saaq(code: str) -> str:
 # ========================== MENUS ==========================
 def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
     lang = get_user_lang(str(user_id))
+    
+    # --- VÉRIFICATION NOTIFICATIONS CLIENT ---
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT count(*) FROM support_tickets WHERE user_id=? AND status='replied'", (str(user_id),))
+    has_reply = cur.fetchone()[0] > 0
+    con.close()
+    
+    label_support = "📞 Support (🔴 1)" if has_reply else "📞 Support"
+
     menu = [
         [InlineKeyboardButton("🪪 ID's", callback_data="id_menu_entry")],
         [InlineKeyboardButton("💳 Cc's", callback_data="ccs_catalog_start")],
@@ -655,7 +666,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💳 Recharger" if lang == "fr" else "💳 Top up", callback_data="add_balance")],
         [InlineKeyboardButton("🌐 Langue/Language", callback_data="choose_lang")],
         [InlineKeyboardButton("📣 Channel", callback_data="join_private_channel")],
-        [InlineKeyboardButton("📞 Support", callback_data="support")],
+        [InlineKeyboardButton(label_support, callback_data="support")], 
         [InlineKeyboardButton("📚 FAQ", callback_data="faq")],
         [InlineKeyboardButton("👤 Mon Compte", callback_data="account_menu")],
         [InlineKeyboardButton("🔒 Log Out", callback_data="auth_logout")],
@@ -1894,12 +1905,24 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    lang = get_user_lang(str(update.effective_user.id))
-    await replace_view(
-        q,
-        "Support : @nomennesciosupport" if lang == "fr" else "Support: @nomennesciosupport",
-        reply_markup=kb_back_to_menu()
-    )
+    
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY id DESC LIMIT 1", (str(update.effective_user.id),))
+    reply_row = cur.fetchone()
+    con.close()
+
+    kb = [[InlineKeyboardButton("🆕 Ouvrir un Ticket", callback_data="ticket_create_start")]]
+    
+    intro_text = "🆘 **CENTRE DE SUPPORT**\n\nComment pouvons-nous vous aider ?"
+    if reply_row:
+        kb.insert(0, [InlineKeyboardButton("🔴 VOIR LA RÉPONSE ADMIN", callback_data=f"view_reply:{reply_row[0]}")])
+        intro_text += "\n\n⚠️ **Vous avez une réponse non lue !**"
+
+    kb.append([InlineKeyboardButton("👤 Contact Direct", url="https://t.me/nomennesciosupport")])
+    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")])
+    
+    await replace_view(q, intro_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -4512,37 +4535,35 @@ async def admin_hard_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Vérification Admin
     if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
         return
 
     q = update.callback_query
-    try:
-        await q.answer()
-    except Exception:
-        pass
+    try: await q.answer()
+    except: pass
 
-    # --- MODIFICATION : Ajoute les deux boutons produits ici ---
+    # --- VÉRIFICATION NOTIFICATIONS ADMIN ---
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT count(*) FROM support_tickets WHERE status='open'")
+    open_count = cur.fetchone()[0]
+    con.close()
+    
+    label_tickets = f"📨 Gestion Tickets (🔴 {open_count})" if open_count > 0 else "📨 Gestion Tickets"
+
     keyboard = [
-        [InlineKeyboardButton("📨 Gestion Tickets", callback_data="admin_tickets_list")],
+        [InlineKeyboardButton(label_tickets, callback_data="admin_tickets_list")],
         [InlineKeyboardButton("👥 Utilisateurs", callback_data="admin_users")],
         [InlineKeyboardButton("🏷 Forfait utilisateur", callback_data="admin_setstatut")],
         [InlineKeyboardButton("🔁 Redémarrer le bot", callback_data="admin_hard_reboot")],
-        # Nouveaux boutons pour chaque catégorie
         [InlineKeyboardButton("💳 Produits Cc's", callback_data="admin_cat_menu:ccs")],
         [InlineKeyboardButton("🧱 Produits Pro's", callback_data="admin_cat_menu:propro")],
         [InlineKeyboardButton("⏱️ Réglages Temps IVR", callback_data="admin_ivr_settings")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")],
     ]
-    # --- FIN MODIFICATION ---
 
-    try:
-        # S'assure d'éditer le message existant si possible
-        await q.message.edit_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception:
-        # Si l’edit échoue (message trop ancien), on envoie un nouveau
-        await q.message.reply_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
+    try: await q.message.edit_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
+    except: await q.message.reply_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def admin_ivr_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le menu de réglage des temps IVR."""
@@ -5950,9 +5971,12 @@ history_filter_conv = ConversationHandler(
 
 # 4. CONVERSATION ADMIN TICKETS (RÉPONSE)
 admin_ticket_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(tickets.admin_ask_reply, pattern="^adm_ticket_rep_")],
+    entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
     states={
-        tickets.ADMIN_TICKET_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.admin_send_reply)]
+        tickets.ADMIN_TICKET_REPLY: [
+            CallbackQueryHandler(admin_handle_virtual_click, pattern="^adm_vkey:"),
+            CallbackQueryHandler(admin_menu, pattern="^admin_menu$")
+        ]
     },
     fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
 )
@@ -6220,6 +6244,189 @@ async def acc_reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+# ==============================================================================
+# ⌨️ SYSTÈME TICKET "TERMINAL" (CLAVIER VIRTUEL + DASHBOARD)
+# ==============================================================================
+
+def get_virtual_keyboard(page='letters', prefix="vkey"):
+    kb = []
+    if page == 'letters':
+        rows = [['Q','W','E','R','T','Y','U','I','O','P'], ['A','S','D','F','G','H','J','K','L'], ['Z','X','C','V','B','N','M']]
+        for r in rows: kb.append([InlineKeyboardButton(char, callback_data=f"{prefix}:{char}") for char in r])
+        kb.append([InlineKeyboardButton("123..", callback_data=f"{prefix}:switch_num"), InlineKeyboardButton("␣ ESPACE", callback_data=f"{prefix}:SPACE"), InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")])
+    elif page == 'numbers':
+        kb = [[InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(1,4)], [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(4,7)], [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(7,10)]]
+        kb.append([InlineKeyboardButton("ABC..", callback_data=f"{prefix}:switch_let"), InlineKeyboardButton("0", callback_data=f"{prefix}:0"), InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")])
+    
+    cancel_cb = "admin_menu" if "adm" in prefix else "menu_accueil"
+    kb.append([InlineKeyboardButton("❌ ANNULER", callback_data=cancel_cb), InlineKeyboardButton("✅ ENVOYER", callback_data=f"{prefix}:SEND")])
+    return InlineKeyboardMarkup(kb)
+
+def _generate_dashboard_text(cat, user_text, status_label, admin_reply=None):
+    content = user_text if user_text else "_(Écrivez votre message ici...)_"
+    txt = f"📝 **SUPPORT LIVE // {cat}**\nStatut : {status_label}\n━━━━━━━━━━━━━━━━━━\n\n👤 **VOUS :**\n{content}\n"
+    if admin_reply: txt += f"\n━━━━━━━━━━━━━━━━━━\n👮‍♂️ **ADMIN :**\n{admin_reply}\n"
+    return txt
+
+async def ticket_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    context.user_data['ticket_draft'] = ""
+    kb = [[InlineKeyboardButton("💳 PAIEMENT", callback_data="tick_cat:PAIEMENT")], [InlineKeyboardButton("🚚 COMMANDE", callback_data="tick_cat:COMMANDE")], [InlineKeyboardButton("🆘 AUTRE", callback_data="tick_cat:AUTRE")], [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]]
+    await replace_view(q, "📨 **NOUVEAU TICKET**\n\nSélectionnez le sujet :", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return tickets.WAIT_CATEGORY
+
+async def ticket_init_virtual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    cat = q.data.split(":")[1]
+    context.user_data['ticket_cat'] = cat
+    context.user_data['ticket_buffer'] = ""
+    try: await q.message.delete()
+    except: pass
+    
+    msg = await context.bot.send_message(chat_id=update.effective_chat.id, text=_generate_dashboard_text(cat, "", "✏️ En rédaction..."), reply_markup=get_virtual_keyboard('letters'), parse_mode="Markdown")
+    context.user_data['dashboard_id'] = msg.message_id
+    return TICKET_DRAFT
+
+async def ticket_handle_virtual_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; 
+    try: await q.answer()
+    except: pass
+    
+    data = q.data.split(":")[1]
+    current_text = context.user_data.get('ticket_buffer', "")
+    cat = context.user_data.get('ticket_cat', "SUPPORT")
+    dash_id = context.user_data.get('dashboard_id')
+
+    if data == "DEL": current_text = current_text[:-1]
+    elif data == "SPACE": current_text += " "
+    elif data == "switch_num": 
+        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('numbers')); return TICKET_DRAFT
+    elif data == "switch_let": 
+        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('letters')); return TICKET_DRAFT
+    elif data == "SEND": 
+        if len(current_text) < 2: 
+            await q.answer("⚠️ Trop court !", show_alert=True); return TICKET_DRAFT
+        else: return await ticket_finalize_send(update, context, current_text)
+    else: current_text += data
+    
+    context.user_data['ticket_buffer'] = current_text
+    try: await context.bot.edit_message_text(chat_id=q.message.chat_id, message_id=dash_id, text=_generate_dashboard_text(cat, current_text + "_", "✏️ En rédaction..."), reply_markup=q.message.reply_markup, parse_mode="Markdown")
+    except: pass
+    return TICKET_DRAFT
+
+async def ticket_reject_physical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: await update.message.delete()
+    except: pass
+    m = await update.message.reply_text("⛔ **ERREUR PROTOCOLE**\nUtilisez le clavier virtuel uniquement.")
+    await asyncio.sleep(2); 
+    try: await m.delete()
+    except: pass
+    return TICKET_DRAFT
+
+async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text):
+    import asyncio
+    q = update.callback_query
+    user_id = str(update.effective_user.id)
+    cat = context.user_data.get('ticket_cat')
+    
+    con = sqlite3.connect(DB_NAME); cur = con.cursor()
+    try: cur.execute("ALTER TABLE support_tickets ADD COLUMN dashboard_msg_id INTEGER")
+    except: pass
+    cur.execute("INSERT INTO support_tickets (user_id, category, message, status, username, dashboard_msg_id) VALUES (?,?,?,?,?,?)", (user_id, cat, message_text, 'open', update.effective_user.username, None))
+    ticket_id = cur.lastrowid
+    con.commit(); con.close()
+    
+    # Notif Admin avec bouton FERMER
+    admin_txt = f"🚨 **TICKET #{ticket_id}**\n👤 {user_id}\n📂 {cat}\n📝 {message_text}"
+    kb_admin = InlineKeyboardMarkup([[InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{ticket_id}"), InlineKeyboardButton("🔒 Fermer", callback_data=f"adm_ticket_close_{ticket_id}")]])
+    try: await context.bot.send_message(chat_id=CHANNEL_LOGS, text=admin_txt, reply_markup=kb_admin, parse_mode="Markdown")
+    except: pass
+
+    # Clean Client
+    try: await q.edit_message_text(text=f"✅ **TICKET #{ticket_id} ENREGISTRÉ.**\n\n🗑️ _Nettoyage du terminal..._", parse_mode="Markdown", reply_markup=None)
+    except: pass
+    await asyncio.sleep(2.5)
+    try: await q.message.delete()
+    except: pass
+    
+    # Nettoyage profond
+    if 'cleanup_ids' in context.user_data: 
+        for mid in context.user_data['cleanup_ids']:
+            try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
+            except: pass
+        context.user_data['cleanup_ids'] = []
+
+    await show_main_menu(int(user_id), clear=True)
+    return ConversationHandler.END
+
+# --- LOGIQUE ADMIN RÉPONSE ---
+async def admin_reply_start_virtual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = q.data.split("_")[-1]
+    context.user_data['current_ticket_id'] = tid
+    context.user_data['admin_buffer'] = ""
+    
+    con = sqlite3.connect(DB_NAME); cur = con.cursor()
+    cur.execute("SELECT message FROM support_tickets WHERE ticket_id=?", (tid,)); row = cur.fetchone()
+    con.close()
+    user_msg = row[0] if row else "???"
+    
+    txt = f"👮‍♂️ **RÉPONSE TICKET #{tid}**\n━━━━━━━━━━━━━━━━━━\n📩 Client:\n_{user_msg}_\n━━━━━━━━━━━━━━━━━━\n⌨️ RÉPONSE:\n`_`"
+    await q.message.edit_text(text=txt, reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey"), parse_mode="Markdown")
+    return tickets.ADMIN_TICKET_REPLY
+
+async def admin_handle_virtual_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; 
+    try: await q.answer() 
+    except: pass
+    action = q.data.split(":")[1]
+    curr = context.user_data.get('admin_buffer', "")
+    tid = context.user_data.get('current_ticket_id', "?")
+    
+    if action == "DEL": curr = curr[:-1]
+    elif action == "SPACE": curr += " "
+    elif action == "switch_num": await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('numbers', prefix="adm_vkey")); return tickets.ADMIN_TICKET_REPLY
+    elif action == "switch_let": await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey")); return tickets.ADMIN_TICKET_REPLY
+    elif action == "SEND": return await admin_finalize_reply(update, context, curr)
+    else: curr += action
+    
+    context.user_data['admin_buffer'] = curr
+    try: await q.edit_message_text(text=f"👮‍♂️ **RÉPONSE TICKET #{tid}**\n━━━━━━━━━━━━━━━━━━\n⌨️ RÉPONSE:\n`{curr}_`", reply_markup=q.message.reply_markup, parse_mode="Markdown")
+    except: pass
+    return tickets.ADMIN_TICKET_REPLY
+
+async def admin_finalize_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_text):
+    q = update.callback_query
+    tid = context.user_data.get('current_ticket_id')
+    con = sqlite3.connect(DB_NAME); cur = con.cursor()
+    cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
+    con.commit(); con.close()
+    
+    await q.edit_message_text(text=f"✅ **RÉPONSE ENREGISTRÉE.**\n\nLe client verra le badge 🔴 au menu.", parse_mode="Markdown", reply_markup=None)
+    await asyncio.sleep(1.5)
+    await admin_menu(update, context)
+    return ConversationHandler.END
+
+async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = q.data.split("_")[-1]
+    con = sqlite3.connect(DB_NAME); con.execute("UPDATE support_tickets SET status='closed' WHERE ticket_id=?", (tid,)); con.commit(); con.close()
+    try: await q.edit_message_text(text=f"🔒 **TICKET #{tid} FERMÉ.**", parse_mode="Markdown", reply_markup=None)
+    except: pass
+
+async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = q.data.split(":")[1]
+    
+    con = sqlite3.connect(DB_NAME); cur = con.cursor()
+    cur.execute("UPDATE support_tickets SET status='read' WHERE ticket_id=?", (tid,))
+    cur.execute("SELECT category, message FROM support_tickets WHERE ticket_id=?", (tid,)); row = cur.fetchone()
+    con.commit(); con.close()
+    
+    cat, msg = row if row else ("?", "?")
+    txt = f"📝 **ARCHIVE TICKET #{tid}**\n📂 {cat}\n━━━━━━━━━━━━━━━━━━\n👤 **VOUS :**\n{msg}\n\n━━━━━━━━━━━━━━━━━━\n👮‍♂️ **ADMIN :**\n_(Réponse consultée - voir avec admin si besoin)_"
+    await replace_view(q, txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]]), parse_mode="Markdown")
+
 
 conv_handler = ConversationHandler(
     entry_points=[
@@ -6249,15 +6456,14 @@ conv_handler = ConversationHandler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.admin_send_reply),
             CallbackQueryHandler(tickets.admin_list_tickets, pattern='^admin_tickets_list$')
         ],
-        # --- SUPPORT ---
+       
         tickets.WAIT_CATEGORY: [
-            CallbackQueryHandler(tickets.save_category, pattern="^ticket_cat:")
+            CallbackQueryHandler(ticket_init_virtual, pattern="^tick_cat:")
         ],
-        tickets.WAIT_TICKET_MSG: [
-            CallbackQueryHandler(tickets.start_support, pattern="^support$"),
-            # Pas de start_ticket_reply ici pour le client
-            CallbackQueryHandler(tickets.close_ticket, pattern="^ticket_close$"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)
+        TICKET_DRAFT: [
+            CallbackQueryHandler(ticket_handle_virtual_click, pattern="^vkey:"), # Clic touches virtuelles
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_reject_physical), # Rejet clavier physique
+            CallbackQueryHandler(goto_menu, pattern="^menu_accueil$") # Annuler
         ],
 
         # --- TOOLS ---
@@ -6625,6 +6831,11 @@ if __name__ == "__main__":
     app_telegram.bot_data['get_user_balance'] = get_user_balance
     app_telegram.bot_data['update_user_balance'] = update_user_balance
     app_telegram.bot_data['create_transaction'] = create_transaction
+
+    app_telegram.add_handler(CallbackQueryHandler(admin_close_ticket, pattern="^adm_ticket_close_"))
+    app_telegram.add_handler(CallbackQueryHandler(ticket_view_reply_handler, pattern="^view_reply:"))
+    # Et bien sûr, le handler pour lancer la création du ticket (déjà présent normalement dans show_tools_menu ou callback_support, mais vérifie)
+    app_telegram.add_handler(CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"))
 
     # 4. Run
     print("✅ BOT DÉMARRÉ.")
