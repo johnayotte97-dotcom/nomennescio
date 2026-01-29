@@ -1908,7 +1908,7 @@ async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY id DESC LIMIT 1", (str(update.effective_user.id),))
+    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY ticket_id DESC LIMIT 1", (str(update.effective_user.id),))
     reply_row = cur.fetchone()
     con.close()
 
