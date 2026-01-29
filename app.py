@@ -1908,8 +1908,7 @@ async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY ticket_id DESC LIMIT 1", (str(update.effective_user.id),))
-    reply_row = cur.fetchone()
+    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY ticket_id DESC LIMIT 1", (str(update.effective_user.id),))    reply_row = cur.fetchone()
     con.close()
 
     kb = [[InlineKeyboardButton("🆕 Ouvrir un Ticket", callback_data="ticket_create_start")]]
@@ -6417,36 +6416,46 @@ async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except: pass
 
 async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
+    
+    # On récupère l'ID du ticket depuis le callback_data (ex: view_reply:12)
     tid = q.data.split(":")[1]
     
-    con = sqlite3.connect(DB_NAME); cur = con.cursor()
-    # On marque comme lu
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # 1. On marque le ticket comme lu ('read') pour enlever le point rouge au prochain menu
     cur.execute("UPDATE support_tickets SET status='read' WHERE ticket_id=?", (tid,))
-    # On récupère les infos
+    
+    # 2. On récupère le message original (et la catégorie)
     cur.execute("SELECT category, message FROM support_tickets WHERE ticket_id=?", (tid,))
     row = cur.fetchone()
-    con.commit(); con.close()
+    con.commit()
+    con.close()
     
     if not row:
-        await q.answer("❌ Ticket introuvable.", show_alert=True)
+        await q.edit_message_text("❌ Erreur : Ticket introuvable.")
         return
-        
+
     cat, msg = row
+    
+    # Construction de l'affichage archive
     txt = (
-        f"📩 **VOTRE TICKET #{tid}**\n"
-        f"📂 Sujet : `{cat}`\n"
+        f"📩 **ARCHIVE TICKET #{tid}**\n"
+        f"📂 Catégorie : `{cat}`\n"
         f"━━━━━━━━━━━━━━━━━━\n\n"
         f"👤 **VOTRE MESSAGE :**\n"
         f"_{msg}_\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"👮‍♂️ **RÉPONSE DU SUPPORT :**\n"
-        f"✅ _Votre demande a été traitée par nos services._\n\n"
-        f"👉 _(Pour plus de détails, contactez l'admin si nécessaire.)_"
+        f"👮‍♂️ **RÉPONSE ADMIN :**\n"
+        f"✅ _Le support a traité votre demande._\n\n"
+        "*(Note : Si l'admin vous a répondu par message direct, vérifiez votre historique de chat)*"
     )
     
-    kb = [[InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]]
-    await replace_view(q, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton("⬅️ Retour au Menu", callback_data="menu_accueil")]]
+    
+    await q.edit_message_text(text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 admin_ticket_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
