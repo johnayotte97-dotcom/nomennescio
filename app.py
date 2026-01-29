@@ -36,7 +36,8 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
-    ConversationHandler, ContextTypes, CallbackQueryHandler
+    ConversationHandler, ContextTypes, CallbackQueryHandler,
+    TypeHandler, ApplicationHandlerStop
 )
 # ================= SECURITY HEARTBEAT =================
 # Ton lien Healthchecks personnel
@@ -188,6 +189,7 @@ client = SignalWireClient(SW_PROJECT_ID, SW_TOKEN)
 app = Flask(__name__)
 
 # ========================== CONSTANTES ==========================
+
 (ID_MENU_START, ID_CAT_VIEW, ID_PROD_VIEW, ID_ASK_QTY, ID_CONFIRM_BUY,
  ID_ASK_NAME, ID_ASK_DOB, 
  ID_ASK_STREET, ID_ASK_CITY, ID_ASK_ZIP, ID_CONFIRM_ADDR,
@@ -222,6 +224,8 @@ ID_AUTH_WAIT_SEED = 1502       # Import d'un wallet existant
 SELECT_TOOL = 900
 WAIT_HLR_NUMBER = 901
 ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
+
+(ACC_WAIT_NEW_PIN, ACC_WAIT_USERNAME, ACC_WAIT_JABBER, ACC_WAIT_RESET_CONFIRM) = range(3200, 3204)
 
 # Paliers
 FORFAITS = {
@@ -343,7 +347,7 @@ def init_db():
         # Migration des données pour ne pas perdre les comptes
         cur.execute("UPDATE users SET user_id = telegram_id WHERE user_id IS NULL")
     except sqlite3.OperationalError:
-        pass # La colonne existe déjà, on ignore
+        pass 
 
     try:
         cur.execute("ALTER TABLE users ADD COLUMN seed_phrase TEXT")
@@ -359,6 +363,19 @@ def init_db():
         
     try:
         cur.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    # 👇👇 AJOUT POUR LE MENU ACCOUNT (JABBER & CUSTOM USER) 👇👇
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN custom_username TEXT")
+        print("✅ PATCH DB: Colonne 'custom_username' ajoutée.")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN jabber_id TEXT")
+        print("✅ PATCH DB: Colonne 'jabber_id' ajoutée.")
     except sqlite3.OperationalError:
         pass
     # ---------------------------------------------------
@@ -406,7 +423,7 @@ def init_db():
 
     con.commit()
     con.close()
-    log("DB initialized (V2.2 Auto-Patch Ready)", "SYSTEM")
+    log("DB initialized (V2.3 Account Ready)", "SYSTEM")
 
 def patch_db_tickets():
     con = sqlite3.connect(DB_NAME)
@@ -628,10 +645,10 @@ def convertir_en_code_saaq(code: str) -> str:
 def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
     lang = get_user_lang(str(user_id))
     menu = [
-        [InlineKeyboardButton("🪪 ID/Docs", callback_data="id_menu_entry")],
+        [InlineKeyboardButton("🪪 ID's", callback_data="id_menu_entry")],
         [InlineKeyboardButton("💳 Cc's", callback_data="ccs_catalog_start")],
         [InlineKeyboardButton("👥 Pro's", callback_data="propro")],
-        [InlineKeyboardButton("Tools ⚒️", callback_data="section_tools")],
+        [InlineKeyboardButton("⚒️ Tools ", callback_data="section_tools")],
         [InlineKeyboardButton("🛒 Panier", callback_data="cart:view")],
         [InlineKeyboardButton("📜 Historique", callback_data="hist:view")],
         [InlineKeyboardButton("🚗 Vérifier mon permis" if lang == "fr" else "🚗 Check my license", callback_data="start_verifier_main")],
@@ -640,6 +657,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📣 Channel", callback_data="join_private_channel")],
         [InlineKeyboardButton("📞 Support", callback_data="support")],
         [InlineKeyboardButton("📚 FAQ", callback_data="faq")],
+        [InlineKeyboardButton("👤 Mon Compte", callback_data="account_menu")],
         [InlineKeyboardButton("🔒 Log Out", callback_data="auth_logout")],
     ]
     if str(user_id) in ADMIN_IDS:
@@ -1776,68 +1794,60 @@ async def goto_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, batch_id: str, lang: str):
     """
-    Anime un message et inclut une SÉCURITÉ ANTI-BLOCAGE (Timeout).
+    Anime un message "Décryptage en cours..." avec un timeout de 5 minutes et votre message personnalisé.
     """
     i = 0
-    timeout_limit = 45  # 45 boucles de 2s = 90 secondes max
+    # Timeout réglé à 5 minutes (150 tours * 2 secondes = 300s) pour éviter l'apparition prématurée
+    timeout_limit = 150
     
     # Laisse le temps au batch d'être créé
     await asyncio.sleep(1) 
     br = batch_runs.get(batch_id)
-    if not br:
-        return
+    if not br: return
 
     try:
-        # Boucle tant que le batch n'est pas fini ET qu'on n'a pas dépassé le temps limite
+        # Boucle tant que le batch n'est pas fini
         while not br.get("notified", False) and i < timeout_limit:
             dots = "." * (i % 3 + 1)
-            
-            # Utilise la fonction msg() pour obtenir le texte
             base_text = msg(chat_id, 'decrytage_en_cours').replace('…','')
             text = f"{base_text}{dots} ({br.get('resolved', 0)}/{br.get('total', '?')})"
             
             try:
-                await context.bot.edit_message_text(
-                    text=text,
-                    chat_id=chat_id,
-                    message_id=message_id
-                )
-            except Exception:
-                # Si le message est supprimé ou inchangé, on ignore
-                pass
+                await context.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id)
+            except: pass # Si le message ne change pas, on ignore
             
             i += 1
             await asyncio.sleep(2)
             
-            # Rafraîchit la référence
             br = batch_runs.get(batch_id)
             if not br: break
 
-        # === GESTION DU TIMEOUT (Si bloqué) ===
+        # === GESTION DU TIMEOUT (Si ça dépasse 5 min) ===
         if i >= timeout_limit and not br.get("notified", False):
-            # On force l'arrêt
             br["notified"] = True
+            
+            # Votre message personnalisé
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text="⚠️ **Délai dépassé.**\nLe système n'a pas reçu de retour des appels.\n\n1. Vérifiez que votre serveur est public (pas localhost).\n2. Vérifiez vos crédits SignalWire."
+                text=(
+                    "❌ **Échec du décryptage.**\n\n"
+                    "Nous n'avons pas pu décrypter le permis.\n"
+                    "La demande sera envoyée à un administrateur pour révision.\n\n"
+                    "👉 Veuillez essayer un nouveau permis.\n"
+                    "⚠️ Si l'erreur persiste, veuillez créer un ticket."
+                ),
+                parse_mode="Markdown"
             )
-            # On nettoie
-            try:
-                 # Optionnel : Annuler les appels en cours ici
-                 pass 
-            except: pass
-            return # On sort pour ne pas supprimer le message d'erreur tout de suite
+            return
 
     except Exception as e:
         logger.error(f"Erreur animate_wait_message: {e}")
     finally:
-        # Si tout s'est bien passé (batch fini), on supprime le message d'attente
+        # Si tout s'est bien passé (batch fini avant le timeout), on supprime le message d'attente
         if br and br.get("notified", True) and i < timeout_limit:
-            try:
-                await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-            except:
-                pass
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            except: pass
 
 def get_ivr_timings():
     """Charge les temps de pause depuis le fichier JSON, ou utilise les défauts."""
@@ -2553,25 +2563,59 @@ async def auth_create_pin_save(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- ÉTAPE C : LOGIN (VÉRIFICATION PIN) ---
 async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Gestion du clavier PIN avec affichage fluide.
+    """
     q = update.callback_query
-    # On répond tout de suite pour éviter que le bouton charge dans le vide
+    # On répond immédiatement pour la fluidité tactile
     try: await q.answer() 
     except: pass
     
     data = q.data
     user_id = str(update.effective_user.id)
     
-    # Récupère le PIN en cours de frappe
+    # Récupère le PIN actuel (ou vide si rien)
     current_input = context.user_data.get('temp_pin_input', "")
 
-    # 1. Gestion des chiffres
+    # === CAS 1 : L'utilisateur tape un CHIFFRE ===
     if data.startswith("pin_") and data[4:].isdigit():
         digit = data.split("_")[1]
-        if len(current_input) < 8: # Max 8 chiffres
+        
+        # Limite de sécurité à 20 chiffres pour éviter les abus
+        if len(current_input) < 20: 
             current_input += digit
             context.user_data['temp_pin_input'] = current_input
             
-            mask = "⚫" * len(current_input) + "_" * (4 - len(current_input)) if len(current_input) < 4 else "⚫" * len(current_input)
+            # --- Construction du masque visuel ---
+            nb = len(current_input)
+            # Si moins de 4, on complète avec des ronds vides pour garder l'alignement
+            if nb < 4:
+                mask = "⚫" * nb + "◯" * (4 - nb)
+            else:
+                mask = "⚫" * nb
+            
+            try:
+                await q.edit_message_text(
+                    f"🔒 **TERMINAL VERROUILLÉ**\nPIN : {mask}",
+                    reply_markup=get_pin_keyboard(),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                # Si Telegram bloque car ça va trop vite, on ignore (le prochain clic mettra à jour)
+                pass
+
+    # === CAS 2 : BOUTON EFFACER (DEL) ===
+    elif data == "pin_del":
+        if len(current_input) > 0:
+            current_input = current_input[:-1]
+            context.user_data['temp_pin_input'] = current_input
+            
+            nb = len(current_input)
+            if nb < 4:
+                mask = "⚫" * nb + "◯" * (4 - nb)
+            else:
+                mask = "⚫" * nb
+                
             try:
                 await q.edit_message_text(
                     f"🔒 **TERMINAL VERROUILLÉ**\nPIN : {mask}",
@@ -2580,54 +2624,35 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except: pass
 
-    # 2. Gestion Effacer
-    elif data == "pin_del":
-        current_input = current_input[:-1]
-        context.user_data['temp_pin_input'] = current_input
-        mask = "⚫" * len(current_input) + "_" * (4 - len(current_input)) if len(current_input) < 4 else "⚫" * len(current_input)
-        try:
-            await q.edit_message_text(
-                f"🔒 **TERMINAL VERROUILLÉ**\nPIN : {mask}",
-                reply_markup=get_pin_keyboard(),
-                parse_mode="Markdown"
-            )
-        except: pass
-
-    # 3. Gestion Valider
+    # === CAS 3 : BOUTON VALIDER (OK) ===
     elif data == "pin_enter":
         con = sqlite3.connect(DB_NAME)
         cur = con.cursor()
-        
-        # 👇👇 CORRECTION MAJEURE ICI 👇👇
-        # On cherche par telegram_id pour être sûr de trouver le bon user
         cur.execute("SELECT pin_code FROM users WHERE telegram_id=?", (user_id,))
-        
-        # -------------------------------
-        
         row = cur.fetchone()
         con.close()
         
+        # Vérification du code
         if row and row[0] == current_input:
-            # --- SUCCÈS ---
+            # ✅ CODE BON
+            context.user_data['is_locked'] = False # Déverrouillage
+            context.user_data['temp_pin_input'] = "" # Reset
             
-            # A. On essaie de supprimer le clavier
-            try:
-                await q.message.delete()
-            except:
-                # B. Si on ne peut pas supprimer, on le modifie pour qu'il disparaisse visuellement
-                try:
-                    await q.edit_message_text("✅ **Connexion réussie.**", parse_mode="Markdown")
+            # Supprime le clavier PIN
+            try: await q.message.delete()
+            except: 
+                try: await q.edit_message_text("✅")
                 except: pass
             
-            # C. On lance le menu
+            # Affiche le menu principal
             await show_main_menu(update.effective_user.id, clear=True)
             return ConversationHandler.END
         else:
-            # --- ECHEC ---
-            context.user_data['temp_pin_input'] = ""
+            # ❌ CODE FAUX
+            context.user_data['temp_pin_input'] = "" # On vide le champ
             try:
                 await q.edit_message_text(
-                    "⛔ **CODE FAUX !** Réessayez.\nPIN : `____`",
+                    "⛔ **CODE FAUX !** Réessayez.\nPIN : `◯◯◯◯`",
                     reply_markup=get_pin_keyboard(),
                     parse_mode="Markdown"
                 )
@@ -5929,8 +5954,6 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(user.id)
     return ConversationHandler.END
 
-# Handlers Document (Placeholder pour éviter erreurs d'import)
-# Handlers Document (Placeholder pour éviter erreurs d'import)
 async def id_save_employer(u,c): 
     c.user_data['form_employer'] = u.message.text
     await u.message.reply_text("Poste ?")
@@ -6042,13 +6065,6 @@ admin_ticket_conv = ConversationHandler(
 )
 
 
-# ==============================================================================
-# 4. FONCTIONS CATÉGORIES (MANQUANTES) - À COLLER ICI
-# ==============================================================================
-
-# ==============================================================================
-# FONCTION MANQUANTE : SUPPRESSION HISTORIQUE
-# ==============================================================================
 async def delete_history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
@@ -6109,6 +6125,209 @@ async def on_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"Catégorie : {data}")
 
 
+
+
+# ==============================================================================
+# 👤 GESTION DU COMPTE (NETTOYAGE AUTOMATIQUE)
+# ==============================================================================
+
+async def account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu Mon Compte."""
+    q = update.callback_query
+    if q: await q.answer()
+    
+    user_id = str(update.effective_user.id)
+    
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    try:
+        cur.execute("SELECT custom_username, jabber_id FROM users WHERE telegram_id=?", (user_id,))
+        row = cur.fetchone()
+        c_user = row[0] if row and row[0] else "Non défini"
+        c_jabber = row[1] if row and row[1] else "Non défini"
+    except:
+        c_user = "Non défini"
+        c_jabber = "Non défini"
+    con.close()
+    
+    text = (
+        f"👤 **MON COMPTE**\n\n"
+        f"🆔 **ID Telegram:** `{user_id}`\n"
+        f"👤 **Username:** `{c_user}`\n"
+        f"💬 **Jabber:** `{c_jabber}`\n"
+        f"🔐 **Sécurité:** PIN Actif\n\n"
+        "Que voulez-vous modifier ?"
+    )
+    
+    kb = [
+        [InlineKeyboardButton("🔐 Changer mon PIN", callback_data="acc_change_pin")],
+        [InlineKeyboardButton("👤 Changer Username", callback_data="acc_set_user"),
+         InlineKeyboardButton("💬 Changer Jabber", callback_data="acc_set_jabber")],
+        [InlineKeyboardButton("⚠️ Reset Wallet (Seed)", callback_data="acc_reset_seed")],
+        [InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]
+    ]
+    
+    if q:
+        try: await q.message.edit_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        except: await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        
+    return SELECT_TOOL 
+
+# --- 1. CHANGER PIN (CLEAN) ---
+async def acc_ask_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    msg = await q.message.edit_text(
+        "🔐 **Nouveau PIN**\n\nVeuillez entrer votre nouveau code PIN (4 à 8 chiffres) :",
+        reply_markup=kb_back_cancel()
+    )
+    context.user_data['acc_prompt_id'] = msg.message_id # On retient l'ID de la question
+    return ACC_WAIT_NEW_PIN
+
+async def acc_save_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
+    new_pin = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+    
+    # 🧹 NETTOYAGE 1 : Supprime la réponse de l'utilisateur
+    try: await update.message.delete()
+    except: pass
+
+    # 🧹 NETTOYAGE 2 : Supprime la question du bot
+    try: await context.bot.delete_message(chat_id=user_id, message_id=context.user_data.get('acc_prompt_id'))
+    except: pass
+    
+    if not new_pin.isdigit() or len(new_pin) < 4 or len(new_pin) > 8:
+        # Erreur : on renvoie un message (et on le track pour le supprimer au prochain essai)
+        msg = await update.message.reply_text("❌ Le PIN doit contenir 4 à 8 chiffres.\nRéessayez :")
+        context.user_data['acc_prompt_id'] = msg.message_id
+        return ACC_WAIT_NEW_PIN
+    
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("UPDATE users SET pin_code=? WHERE telegram_id=?", (new_pin, user_id))
+    con.commit()
+    con.close()
+    
+    # 🧹 NETTOYAGE 3 : Confirmation Flash (2 secondes puis disparait)
+    conf = await update.message.reply_text("✅ **PIN modifié avec succès !**")
+    await asyncio.sleep(2)
+    try: await conf.delete()
+    except: pass
+    
+    await show_main_menu(int(user_id), clear=True)
+    return ConversationHandler.END
+
+# --- 2. USERNAME (CLEAN) ---
+async def acc_ask_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    msg = await q.message.edit_text(
+        "👤 **Username**\n\nEntrez le nom d'affichage souhaité (ex: LeBossDu93) :",
+        reply_markup=kb_back_cancel()
+    )
+    context.user_data['acc_prompt_id'] = msg.message_id
+    return ACC_WAIT_USERNAME
+
+async def acc_save_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
+    txt = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+    
+    # 🧹 NETTOYAGE : User msg + Bot Question
+    try: await update.message.delete()
+    except: pass
+    try: await context.bot.delete_message(chat_id=user_id, message_id=context.user_data.get('acc_prompt_id'))
+    except: pass
+    
+    con = sqlite3.connect(DB_NAME)
+    con.execute("UPDATE users SET custom_username=? WHERE telegram_id=?", (txt, user_id))
+    con.commit()
+    con.close()
+    
+    # 🧹 NETTOYAGE : Confirmation Flash
+    conf = await update.message.reply_text(f"✅ Username défini sur : **{txt}**")
+    await asyncio.sleep(2)
+    try: await conf.delete()
+    except: pass
+    
+    await show_main_menu(int(user_id), clear=True)
+    return ConversationHandler.END
+
+# --- 3. JABBER (CLEAN) ---
+async def acc_ask_jabber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    msg = await q.message.edit_text(
+        "💬 **Jabber ID**\n\nEntrez votre adresse Jabber/XMPP (ex: user@jabb.im) :",
+        reply_markup=kb_back_cancel()
+    )
+    context.user_data['acc_prompt_id'] = msg.message_id
+    return ACC_WAIT_JABBER
+
+async def acc_save_jabber(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import asyncio
+    txt = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+    
+    # 🧹 NETTOYAGE
+    try: await update.message.delete()
+    except: pass
+    try: await context.bot.delete_message(chat_id=user_id, message_id=context.user_data.get('acc_prompt_id'))
+    except: pass
+    
+    con = sqlite3.connect(DB_NAME)
+    con.execute("UPDATE users SET jabber_id=? WHERE telegram_id=?", (txt, user_id))
+    con.commit()
+    con.close()
+    
+    # 🧹 NETTOYAGE
+    conf = await update.message.reply_text(f"✅ Jabber défini sur : **{txt}**")
+    await asyncio.sleep(2)
+    try: await conf.delete()
+    except: pass
+    
+    await show_main_menu(int(user_id), clear=True)
+    return ConversationHandler.END
+
+# --- 4. RESET SEED (Reste inchangé) ---
+async def acc_reset_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    kb = [
+        [InlineKeyboardButton("🔥 OUI, RESET TOUT 🔥", callback_data="confirm_reset_seed")],
+        [InlineKeyboardButton("❌ Annuler", callback_data="account_menu")]
+    ]
+    await q.message.edit_text(
+        "⚠️ **DANGER : RESET WALLET** ⚠️\n\n"
+        "Vous êtes sur le point de déconnecter ce wallet de votre compte.\n"
+        "Si vous n'avez pas sauvegardé votre Seed (24 mots), **VOS FONDS SERONT PERDUS À JAMAIS**.\n\n"
+        "Voulez-vous vraiment générer un nouveau wallet ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return ACC_WAIT_RESET_CONFIRM
+
+async def acc_reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = str(update.effective_user.id)
+    
+    con = sqlite3.connect(DB_NAME)
+    con.execute("DELETE FROM users WHERE telegram_id=?", (user_id,))
+    con.commit()
+    con.close()
+    
+    await q.message.edit_text(
+        "♻️ **Compte réinitialisé.**\n\n"
+        "Votre wallet a été détaché.\n"
+        "Veuillez taper /start pour configurer un nouveau portefeuille."
+    )
+    return ConversationHandler.END
+
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
@@ -6118,13 +6337,25 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(auth_import_start, pattern='^auth_import_start$'),
         CallbackQueryHandler(tickets.start_support, pattern='^support$'),
         CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
+        CallbackQueryHandler(account_menu, pattern='^account_menu$'),
     ],
     states={
         # --- AUTHENTIFICATION ---
         ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_create_pin_save)],
         ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
         ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
-
+        
+        ACC_WAIT_NEW_PIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_pin)],
+        ACC_WAIT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_user)],
+        ACC_WAIT_JABBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_jabber)],
+        ACC_WAIT_RESET_CONFIRM: [
+            CallbackQueryHandler(acc_reset_confirm, pattern="^confirm_reset_seed$"),
+            CallbackQueryHandler(account_menu, pattern="^account_menu$")
+        ],
+        tickets.ADMIN_TICKET_REPLY: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.admin_send_reply),
+            CallbackQueryHandler(tickets.admin_list_tickets, pattern='^admin_tickets_list$')
+        ],
         # --- SUPPORT ---
         tickets.WAIT_CATEGORY: [
             CallbackQueryHandler(tickets.save_category, pattern="^ticket_cat:")
@@ -6143,6 +6374,15 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(handle_buy_sms, pattern='^buy_sms:'),
             CallbackQueryHandler(sms_control_callback, pattern='^sms_ban_'),
             CallbackQueryHandler(tool_placeholder, pattern='^tool_cc_checker$'),
+            CallbackQueryHandler(account_menu, pattern='^account_menu$'),
+            CallbackQueryHandler(acc_ask_pin, pattern='^acc_change_pin$'),
+            CallbackQueryHandler(tickets.admin_list_tickets, pattern='^admin_tickets_list$'),
+            CallbackQueryHandler(tickets.admin_view_ticket, pattern='^adm_ticket_view_'),
+            CallbackQueryHandler(tickets.admin_close_no_reply, pattern='^adm_ticket_close_'),
+            CallbackQueryHandler(tickets.admin_ask_reply, pattern='^adm_ticket_rep_'),
+            CallbackQueryHandler(acc_ask_user, pattern='^acc_set_user$'),
+            CallbackQueryHandler(acc_ask_jabber, pattern='^acc_set_jabber$'),
+            CallbackQueryHandler(acc_reset_ask, pattern='^acc_reset_seed$'),
             CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
             CallbackQueryHandler(goto_menu, pattern='^menu_accueil$')
         ],
@@ -6239,6 +6479,112 @@ id_docs_conv = ConversationHandler(
     name="id_docs_conversation"
 )
 
+# ==============================================================================
+# 🧩 SYSTÈME DE VERROUILLAGE AUTO (INACTIVITÉ)
+# ==============================================================================
+
+async def enforcement_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Middleware de sécurité. Gère le verrouillage et empêche les doubles clics.
+    """
+    if not update.effective_user:
+        return
+
+    # 1. Mise à jour de l'activité
+    context.user_data['last_active'] = time.time()
+
+    # 2. Vérification du verrouillage
+    if context.user_data.get('is_locked', False):
+        
+        # Est-ce une tentative de PIN ?
+        is_pin_attempt = False
+        if update.callback_query and update.callback_query.data.startswith("pin_"):
+            is_pin_attempt = True
+
+        if is_pin_attempt:
+            # --- PROTECTION ANTI-DOUBLON ---
+            # Si cette update a déjà été traitée par un autre handler, on arrête.
+            if getattr(context, "pin_handled_flag", False):
+                raise ApplicationHandlerStop
+            
+            # Sinon, on marque comme traité
+            context.pin_handled_flag = True
+            # -------------------------------
+
+            # On appelle le handler du PIN manuellement
+            res = await auth_pin_handler(update, context)
+            
+            # Si le code est bon (END), on déverrouille
+            if res == ConversationHandler.END:
+                context.user_data['is_locked'] = False
+                # On arrête tout pour ne pas déclencher d'autres menus
+                raise ApplicationHandlerStop
+            else:
+                # Code faux ou incomplet, on arrête la propagation
+                raise ApplicationHandlerStop
+
+        else:
+            # Si l'utilisateur clique ailleurs (Menu, etc.) alors qu'il est bloqué
+            if update.callback_query:
+                try: await update.callback_query.answer("🔒 Terminal Verrouillé. Entrez le PIN.", show_alert=True)
+                except: pass
+            
+            try: await update.message.delete()
+            except: pass
+            
+            # On bloque tout le reste
+            raise ApplicationHandlerStop
+
+async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Tâche de fond qui tourne chaque minute.
+    Vérifie qui est inactif depuis > 5 minutes et le verrouille.
+    """
+    TIMEOUT = 300  # 5 minutes en secondes
+    now = time.time()
+    
+    # On itère sur tous les utilisateurs actifs en mémoire
+    # Note : Nécessite que le bot garde les user_data en mémoire (comportement par défaut)
+    if not context.application.user_data:
+        return
+
+    for user_id, data in context.application.user_data.items():
+        # Si déjà verrouillé, on passe
+        if data.get('is_locked'):
+            continue
+            
+        last = data.get('last_active', 0)
+        
+        # Si inactif depuis trop longtemps
+        if last > 0 and (now - last) > TIMEOUT:
+            data['is_locked'] = True
+            
+            # Récupération du username pour l'affichage (optionnel)
+            # On fait une requête DB rapide pour avoir le nom propre
+            try:
+                con = sqlite3.connect(DB_NAME)
+                cur = con.cursor()
+                cur.execute("SELECT username FROM users WHERE telegram_id=?", (str(user_id),))
+                row = cur.fetchone()
+                con.close()
+                username = row[0] if row else "Utilisateur"
+            except:
+                username = "Utilisateur"
+
+            # Action : On efface tout et on affiche le PIN
+            try:
+                await clear_conversation(int(user_id)) # Fonction existante de nettoyage
+                
+                await context.bot.send_message(
+                    chat_id=int(user_id),
+                    text=f"🔒 **INACTIVITÉ DÉTECTÉE**\nTerminal verrouillé auto (5 min).\n\nUtilisateur : {username}\nPIN : `____`",
+                    reply_markup=get_pin_keyboard(),
+                    parse_mode="Markdown"
+                )
+                print(f"[AUTO-LOCK] Utilisateur {user_id} verrouillé pour inactivité.")
+            except Exception as e:
+                print(f"[AUTO-LOCK ERROR] {e}")
+
 # ================= BOUCLE PRINCIPALE (MAIN) =================
 if __name__ == "__main__":
     # --- INIT DB ---
@@ -6263,6 +6609,21 @@ if __name__ == "__main__":
     # --- TELEGRAM ---
     app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
     
+    # === CORRECTION CRITIQUE (Ce qui manquait) ===
+    # On capture la boucle d'événement pour éviter le crash 'NoneType'
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    bot_loop = loop
+
+    app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
+
+    app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
+    # ============================================
+
     # Ajout des Handlers (Ordre CRITIQUE)
     app_telegram.add_handler(admin_search_conv, group=8)
     app_telegram.add_handler(admin_csv_conv, group=6)
