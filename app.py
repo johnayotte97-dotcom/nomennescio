@@ -6277,7 +6277,7 @@ async def ticket_init_virtual(update: Update, context: ContextTypes.DEFAULT_TYPE
     return TICKET_DRAFT
 
 async def ticket_handle_virtual_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; 
+    q = update.callback_query
     try: await q.answer()
     except: pass
     
@@ -6286,21 +6286,34 @@ async def ticket_handle_virtual_click(update: Update, context: ContextTypes.DEFA
     cat = context.user_data.get('ticket_cat', "SUPPORT")
     dash_id = context.user_data.get('dashboard_id')
 
-    if data == "DEL": current_text = current_text[:-1]
-    elif data == "SPACE": current_text += " "
+    if data == "DEL":
+        current_text = current_text[:-1]
+    elif data == "SPACE":
+        current_text += " "
     elif data == "switch_num": 
-        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('numbers')); return TICKET_DRAFT
+        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('numbers'))
+        return TICKET_DRAFT
     elif data == "switch_let": 
-        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('letters')); return TICKET_DRAFT
+        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('letters'))
+        return TICKET_DRAFT
     elif data == "SEND": 
         if len(current_text) < 2: 
-            await q.answer("⚠️ Trop court !", show_alert=True); return TICKET_DRAFT
-        else: return await ticket_finalize_send(update, context, current_text)
-    else: current_text += data
+            await q.answer("⚠️ Message trop court !", show_alert=True)
+            return TICKET_DRAFT
+        return await ticket_finalize_send(update, context, current_text)
+    else:
+        current_text += data
     
     context.user_data['ticket_buffer'] = current_text
-    try: await context.bot.edit_message_text(chat_id=q.message.chat_id, message_id=dash_id, text=_generate_dashboard_text(cat, current_text + "_", "✏️ En rédaction..."), reply_markup=q.message.reply_markup, parse_mode="Markdown")
-    except: pass
+    
+    # MISE À JOUR VISUELLE DU DASHBOARD
+    try:
+        # On ajoute un "_" à la fin pour simuler un curseur
+        new_text = _generate_dashboard_text(cat, current_text + " █", "✏️ RÉDACTION EN COURS...")
+        await q.edit_message_text(text=new_text, reply_markup=q.message.reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        print(f"Erreur update dash: {e}")
+        
     return TICKET_DRAFT
 
 async def ticket_reject_physical(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6408,14 +6421,32 @@ async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAUL
     tid = q.data.split(":")[1]
     
     con = sqlite3.connect(DB_NAME); cur = con.cursor()
+    # On marque comme lu
     cur.execute("UPDATE support_tickets SET status='read' WHERE ticket_id=?", (tid,))
-    cur.execute("SELECT category, message FROM support_tickets WHERE ticket_id=?", (tid,)); row = cur.fetchone()
+    # On récupère les infos
+    cur.execute("SELECT category, message FROM support_tickets WHERE ticket_id=?", (tid,))
+    row = cur.fetchone()
     con.commit(); con.close()
     
-    cat, msg = row if row else ("?", "?")
-    txt = f"📝 **ARCHIVE TICKET #{tid}**\n📂 {cat}\n━━━━━━━━━━━━━━━━━━\n👤 **VOUS :**\n{msg}\n\n━━━━━━━━━━━━━━━━━━\n👮‍♂️ **ADMIN :**\n_(Réponse consultée - voir avec admin si besoin)_"
-    await replace_view(q, txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]]), parse_mode="Markdown")
-
+    if not row:
+        await q.answer("❌ Ticket introuvable.", show_alert=True)
+        return
+        
+    cat, msg = row
+    txt = (
+        f"📩 **VOTRE TICKET #{tid}**\n"
+        f"📂 Sujet : `{cat}`\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 **VOTRE MESSAGE :**\n"
+        f"_{msg}_\n\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👮‍♂️ **RÉPONSE DU SUPPORT :**\n"
+        f"✅ _Votre demande a été traitée par nos services._\n\n"
+        f"👉 _(Pour plus de détails, contactez l'admin si nécessaire.)_"
+    )
+    
+    kb = [[InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]]
+    await replace_view(q, txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 admin_ticket_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
