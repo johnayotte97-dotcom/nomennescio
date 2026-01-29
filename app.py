@@ -1897,20 +1897,36 @@ async def callback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    user_id = str(update.effective_user.id)
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY ticket_id DESC LIMIT 1", (str(update.effective_user.id),))    reply_row = cur.fetchone()
+    
+    # 1. On cherche s'il y a une réponse admin non lue (pour le bouton rouge)
+    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY ticket_id DESC LIMIT 1", (user_id,))
+    reply_row = cur.fetchone()
+    
+    # 2. On vérifie s'il y a un ticket ouvert ou répondu (pour masquer le bouton "Ouvrir")
+    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status IN ('open', 'replied') LIMIT 1", (user_id,))
+    active_ticket = cur.fetchone()
+    
     con.close()
 
-    kb = [[InlineKeyboardButton("🆕 Ouvrir un Ticket", callback_data="ticket_create_start")]]
-    
+    kb = []
     intro_text = "🆘 **CENTRE DE SUPPORT**\n\nComment pouvons-nous vous aider ?"
-    if reply_row:
-        kb.insert(0, [InlineKeyboardButton("🔴 VOIR LA RÉPONSE ADMIN", callback_data=f"view_reply:{reply_row[0]}")])
-        intro_text += "\n\n⚠️ **Vous avez une réponse non lue !**"
 
-    kb.append([InlineKeyboardButton("👤 Contact Direct", url="https://t.me/nomennesciosupport")])
+    # CONDITION : On n'affiche le bouton "Ouvrir" QUE SI aucun ticket n'est actif
+    if not active_ticket:
+        kb.append([InlineKeyboardButton("🆕 Ouvrir un Ticket", callback_data="ticket_create_start")])
+    else:
+        intro_text += f"\n\n⏳ **Ticket en cours : #{active_ticket[0]}**\n_Vous ne pouvez pas ouvrir de nouveau ticket tant que celui-ci n'est pas clôturé._"
+
+    # Si une réponse est prête, on affiche le bouton pour la voir
+    if reply_row:
+        # On l'insère en haut s'il y a une réponse
+        kb.insert(0, [InlineKeyboardButton("🔴 VOIR LA RÉPONSE ADMIN", callback_data=f"view_reply:{reply_row[0]}")])
+        intro_text += "\n\n⚠️ **Vous avez une réponse en attente !**"
+
     kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")])
     
     await replace_view(q, intro_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
@@ -6440,40 +6456,42 @@ async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except: pass
 
 async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
+    
+    # Récupération de l'ID du ticket
     tid = q.data.split(":")[1]
     
-    con = sqlite3.connect(DB_NAME); cur = con.cursor()
-    # 1. On récupère tous les messages du ticket par ordre chronologique
-    cur.execute("SELECT sender_role, message, created_at FROM ticket_messages WHERE ticket_id=? ORDER BY created_at ASC", (tid,))
-    messages = cur.fetchall()
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
     
-    # 2. On récupère les infos de base du ticket
-    cur.execute("SELECT category, status FROM support_tickets WHERE ticket_id=?", (tid,))
-    t_info = cur.fetchone()
+    # 1. On récupère tout le fil de discussion
+    cur.execute("SELECT sender_role, message FROM ticket_messages WHERE ticket_id=? ORDER BY created_at ASC", (tid,))
+    rows = cur.fetchall()
+    
+    # 2. On récupère la catégorie du ticket
+    cur.execute("SELECT category FROM support_tickets WHERE ticket_id=?", (tid,))
+    cat_row = cur.fetchone()
+    cat = cat_row[0] if cat_row else "Support"
+    
+    # 3. On marque comme lu
+    cur.execute("UPDATE support_tickets SET status='read' WHERE ticket_id=? AND status='replied'", (tid,))
+    
+    con.commit()
     con.close()
 
-    if not t_info:
-        await q.edit_message_text("❌ Ticket introuvable.")
-        return
-
-    cat, status = t_info
+    # Construction du texte du chat
+    history_text = f"📨 **FIL DU TICKET #{tid}**\n📂 Sujet : `{cat}`\n━━━━━━━━━━━━━━━━━━\n\n"
+    for role, msg in rows:
+        author = "👤 **VOUS :**" if role == 'user' else "👮‍♂️ **SUPPORT :**"
+        history_text += f"{author}\n{msg}\n\n"
     
-    # 3. Construction du fil de discussion
-    history_text = f"📝 **FIL DU TICKET #{tid}**\n📂 Catégorie : `{cat}`\n━━━━━━━━━━━━━━━━━━\n\n"
-    
-    for role, msg, date in messages:
-        prefix = "👤 **VOUS :**" if role == 'user' else "👮‍♂️ **SUPPORT :**"
-        history_text += f"{prefix}\n{msg}\n\n"
-
     history_text += "━━━━━━━━━━━━━━━━━━"
     
-    kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]]
-    # On ajoute un bouton pour répondre si le ticket n'est pas fermé
-    if status != 'closed':
-        kb.insert(0, [InlineKeyboardButton("✍️ Répondre", callback_data=f"ticket_reply_user:{tid}")])
-
+    kb = [[InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]]
     await q.edit_message_text(text=history_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+#####################################################################################################################################
 
 admin_ticket_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
