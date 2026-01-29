@@ -6457,39 +6457,46 @@ async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    await q.answer() # Indispensable pour que le bouton arrête de "tourner"
     
-    # Récupération de l'ID du ticket
-    tid = q.data.split(":")[1]
-    
+    # On extrait l'ID (ex: view_reply:12 -> 12)
+    try:
+        tid = q.data.split(":")[1]
+    except IndexError:
+        await q.edit_message_text("❌ Erreur de lecture du ticket.")
+        return
+
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     
-    # 1. On récupère tout le fil de discussion
+    # 1. On récupère tout l'historique
     cur.execute("SELECT sender_role, message FROM ticket_messages WHERE ticket_id=? ORDER BY created_at ASC", (tid,))
     rows = cur.fetchall()
     
-    # 2. On récupère la catégorie du ticket
+    # 2. On récupère la catégorie
     cur.execute("SELECT category FROM support_tickets WHERE ticket_id=?", (tid,))
-    cat_row = cur.fetchone()
-    cat = cat_row[0] if cat_row else "Support"
+    cat_res = cur.fetchone()
+    cat = cat_res[0] if cat_res else "Support"
     
     # 3. On marque comme lu
     cur.execute("UPDATE support_tickets SET status='read' WHERE ticket_id=? AND status='replied'", (tid,))
-    
     con.commit()
     con.close()
 
-    # Construction du texte du chat
-    history_text = f"📨 **FIL DU TICKET #{tid}**\n📂 Sujet : `{cat}`\n━━━━━━━━━━━━━━━━━━\n\n"
+    if not rows:
+        await q.edit_message_text("📭 Aucun message trouvé dans l'historique.")
+        return
+
+    # Construction du texte
+    txt = f"📨 **FIL DU TICKET #{tid}**\n📂 Sujet : `{cat}`\n━━━━━━━━━━━━━━━━━━\n\n"
     for role, msg in rows:
         author = "👤 **VOUS :**" if role == 'user' else "👮‍♂️ **SUPPORT :**"
-        history_text += f"{author}\n{msg}\n\n"
+        txt += f"{author}\n{msg}\n\n"
     
-    history_text += "━━━━━━━━━━━━━━━━━━"
+    txt += "━━━━━━━━━━━━━━━━━━"
     
-    kb = [[InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]]
-    await q.edit_message_text(text=history_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="support")]]
+    await q.edit_message_text(text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 #####################################################################################################################################
 
@@ -6862,6 +6869,7 @@ if __name__ == "__main__":
     app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_customamount_receive), group=22)
 
     # Handlers Tickets (Simples)
+    app_telegram.add_handler(CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"))
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
@@ -6912,10 +6920,6 @@ if __name__ == "__main__":
     app_telegram.bot_data['update_user_balance'] = update_user_balance
     app_telegram.bot_data['create_transaction'] = create_transaction
 
-    app_telegram.add_handler(CallbackQueryHandler(admin_close_ticket, pattern="^adm_ticket_close_"))
-    app_telegram.add_handler(CallbackQueryHandler(ticket_view_reply_handler, pattern="^view_reply:"))
-    # Et bien sûr, le handler pour lancer la création du ticket (déjà présent normalement dans show_tools_menu ou callback_support, mais vérifie)
-    app_telegram.add_handler(CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"))
 
     # 4. Run
     print("✅ BOT DÉMARRÉ.")
