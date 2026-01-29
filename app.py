@@ -6436,9 +6436,7 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
         CallbackQueryHandler(auth_create_start, pattern='^auth_create$'),
         CallbackQueryHandler(auth_import_start, pattern='^auth_import_start$'),
-        
-        # --- MODIFICATION ICI : On garde support, mais on AJOUTE ticket_create_start ---
-        CallbackQueryHandler(tickets.start_support, pattern='^support$'),
+        CallbackQueryHandler(callback_support, pattern='^support$'),
         CallbackQueryHandler(ticket_create_start, pattern='^ticket_create_start$'), # <--- AJOUTEZ CETTE LIGNE
         # -------------------------------------------------------------------------------
 
