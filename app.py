@@ -200,7 +200,7 @@ app = Flask(__name__)
  ID_ASK_LASTNAME, ID_ASK_ISSUE, ID_ASK_EXPIRY, 
  ID_ASK_DL_NUM, ID_ASK_REF_NUM, ID_ASK_SEX, ID_CONFIRM_SUMMARY,
  TICKET_DRAFT
- ) = range(3000, 3028) # On augmente le range à 3028
+ ) = range(3000, 3029) # On augmente le range à 3028
 # Étapes Conversation (1 permis historique)
 ASK_PRENOM, ASK_NOM, ASK_DATE, CONFIRM_VERIF = range(4)
 
@@ -5969,17 +5969,6 @@ history_filter_conv = ConversationHandler(
     fallbacks=[CallbackQueryHandler(history_filter_cancel, pattern="^history_filter_cancel$")]
 )
 
-# 4. CONVERSATION ADMIN TICKETS (RÉPONSE)
-admin_ticket_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
-    states={
-        tickets.ADMIN_TICKET_REPLY: [
-            CallbackQueryHandler(admin_handle_virtual_click, pattern="^adm_vkey:"),
-            CallbackQueryHandler(admin_menu, pattern="^admin_menu$")
-        ]
-    },
-    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
-)
 
 
 async def delete_history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6426,6 +6415,18 @@ async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAUL
     cat, msg = row if row else ("?", "?")
     txt = f"📝 **ARCHIVE TICKET #{tid}**\n📂 {cat}\n━━━━━━━━━━━━━━━━━━\n👤 **VOUS :**\n{msg}\n\n━━━━━━━━━━━━━━━━━━\n👮‍♂️ **ADMIN :**\n_(Réponse consultée - voir avec admin si besoin)_"
     await replace_view(q, txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]]), parse_mode="Markdown")
+
+
+admin_ticket_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
+    states={
+        tickets.ADMIN_TICKET_REPLY: [
+            CallbackQueryHandler(admin_handle_virtual_click, pattern="^adm_vkey:"),
+            CallbackQueryHandler(admin_menu, pattern="^admin_menu$")
+        ]
+    },
+    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
+)
 
 
 conv_handler = ConversationHandler(
