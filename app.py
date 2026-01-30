@@ -6375,6 +6375,7 @@ async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYP
     except: pass
     cur.execute("INSERT INTO support_tickets (user_id, category, message, status, username, dashboard_msg_id) VALUES (?,?,?,?,?,?)", (user_id, cat, message_text, 'open', update.effective_user.username, None))
     ticket_id = cur.lastrowid
+    cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'user', ?)", (ticket_id, message_text))
     con.commit(); con.close()
     
     # Notif Admin avec bouton FERMER
@@ -6449,54 +6450,51 @@ async def admin_finalize_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    tid = q.data.split("_")[-1]
-    con = sqlite3.connect(DB_NAME); con.execute("UPDATE support_tickets SET status='closed' WHERE ticket_id=?", (tid,)); con.commit(); con.close()
-    try: await q.edit_message_text(text=f"🔒 **TICKET #{tid} FERMÉ.**", parse_mode="Markdown", reply_markup=None)
-    except: pass
-
-async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer() # Indispensable pour que le bouton arrête de "tourner"
+    query = update.callback_query
+    tid = query.data.split("_")[-1]
     
-    # On extrait l'ID (ex: view_reply:12 -> 12)
-    try:
-        tid = q.data.split(":")[1]
-    except IndexError:
-        await q.edit_message_text("❌ Erreur de lecture du ticket.")
-        return
-
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
+    # Le statut doit être exactement 'closed'
+    cur.execute("UPDATE support_tickets SET status='closed' WHERE ticket_id=?", (tid,))
+    con.commit()
+    con.close()
     
-    # 1. On récupère tout l'historique
+    await query.edit_message_text(f"✅ Ticket #{tid} fermé avec succès.")
+
+async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    tid = q.data.split(":")[1]
+    
+    con = sqlite3.connect(DB_NAME); cur = con.cursor()
+    
+    # ON RÉCUPÈRE TOUT LE FIL (User + Admin)
     cur.execute("SELECT sender_role, message FROM ticket_messages WHERE ticket_id=? ORDER BY created_at ASC", (tid,))
     rows = cur.fetchall()
     
-    # 2. On récupère la catégorie
+    # On récupère les infos du ticket pour le titre
     cur.execute("SELECT category FROM support_tickets WHERE ticket_id=?", (tid,))
-    cat_res = cur.fetchone()
-    cat = cat_res[0] if cat_res else "Support"
+    res = cur.fetchone()
+    cat = res[0] if res else "Support"
     
-    # 3. On marque comme lu
+    # Marquer comme lu
     cur.execute("UPDATE support_tickets SET status='read' WHERE ticket_id=? AND status='replied'", (tid,))
-    con.commit()
-    con.close()
+    con.commit(); con.close()
 
-    if not rows:
-        await q.edit_message_text("📭 Aucun message trouvé dans l'historique.")
-        return
-
-    # Construction du texte
-    txt = f"📨 **FIL DU TICKET #{tid}**\n📂 Sujet : `{cat}`\n━━━━━━━━━━━━━━━━━━\n\n"
-    for role, msg in rows:
-        author = "👤 **VOUS :**" if role == 'user' else "👮‍♂️ **SUPPORT :**"
-        txt += f"{author}\n{msg}\n\n"
+    # Construction du texte du chat
+    history_text = f"📨 **FIL DU TICKET #{tid}**\n📂 Sujet : `{cat}`\n━━━━━━━━━━━━━━━━━━\n\n"
     
-    txt += "━━━━━━━━━━━━━━━━━━"
+    if not rows:
+        history_text += "_Aucun message dans l'historique._"
+    else:
+        for role, msg in rows:
+            author = "👤 **VOUS :**" if role == 'user' else "👮‍♂️ **SUPPORT :**"
+            history_text += f"{author}\n{msg}\n\n"
+    
+    history_text += "━━━━━━━━━━━━━━━━━━"
     
     kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="support")]]
-    await q.edit_message_text(text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    await q.edit_message_text(text=history_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 #####################################################################################################################################
 
@@ -6873,6 +6871,7 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
+    app_telegram.add_handler(CallbackQueryHandler(ticket_view_reply_handler, pattern="^view_reply:"))
 
     # Réponse Magique Admin
     app_telegram.add_handler(MessageHandler(filters.Chat(chat_id=int(tickets.CHANNEL_LOGS)) & filters.REPLY, tickets.admin_reply_native))
