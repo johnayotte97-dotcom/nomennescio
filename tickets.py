@@ -148,33 +148,43 @@ async def admin_ask_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADMIN_TICKET_REPLY
 
 async def admin_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Envoie la réponse et enregistre dans l'historique."""
     tid = context.user_data.get('reply_tid')
     uid = context.user_data.get('reply_uid')
     msg_resp = update.message.text
     
     try:
-        # 1. Envoi au client
+        # 1. Envoi du message direct au client via le bot
         await context.bot.send_message(
             chat_id=uid,
             text=f"👨‍💻 **SUPPORT (Ticket #{tid}) :**\n━━━━━━━━━━━━━━━━━━\n{msg_resp}",
             parse_mode="Markdown"
         )
         
-        # 2. Sauvegarde historique et statut
+        # 2. Connexion à la base de données pour l'historique et le statut
         con = sqlite3.connect(DB_NAME)
         cur = con.cursor()
-        cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", (tid, msg_resp))
-        cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
+        
+        # Enregistrement dans la table d'historique pour le fil de discussion client
+        cur.execute(
+            "INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", 
+            (tid, msg_resp)
+        )
+        
+        # Mise à jour du statut en 'replied' pour déclencher l'affichage du bouton chez le client
+        cur.execute(
+            "UPDATE support_tickets SET status='replied' WHERE ticket_id=?", 
+            (tid,)
+        )
+        
         con.commit()
         con.close()
         
-        await update.message.reply_text("✅ Réponse envoyée et enregistrée.")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Échec : {e}")
+        await update.message.reply_text("✅ Réponse envoyée et historique mis à jour.")
         
-    kb = [[InlineKeyboardButton("🔙 Liste", callback_data="admin_tickets_list")]]
-    await update.message.reply_text("Ticket mis à jour.", reply_markup=InlineKeyboardMarkup(kb))
+    except Exception as e:
+        # Log de l'erreur en cas de problème SQL ou d'envoi
+        await update.message.reply_text(f"⚠️ Échec de l'opération : {e}")
+        
     return ConversationHandler.END
 
 async def admin_close_no_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
