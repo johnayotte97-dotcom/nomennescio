@@ -42,12 +42,11 @@ def patch_db_tickets():
                     print("✅ Colonne renommée avec succès.")
                 except Exception as e:
                     print(f"⚠️ Echec renommage (Peut-être pas supporté) : {e}")
-                    # Si le renommage échoue, on recrée la table proprement (Drastique mais nécessaire)
                     cur.execute("ALTER TABLE support_tickets RENAME TO support_tickets_old")
         except:
             pass
 
-        # 2. Création de la table propre (si elle n'existe pas ou a été renommée)
+        # 2. Création de la table propre
         cur.execute("""
             CREATE TABLE IF NOT EXISTS support_tickets (
                 ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,18 +59,21 @@ def patch_db_tickets():
             )
         """)
         
-        # 3. Ajout des colonnes manquantes (Patch standard)
-        try:
-            cur.execute("ALTER TABLE support_tickets ADD COLUMN message TEXT")
-        except: pass
-
-        try:
-            cur.execute("ALTER TABLE support_tickets ADD COLUMN category TEXT")
-        except: pass
-
-        try:
-            cur.execute("ALTER TABLE support_tickets ADD COLUMN username TEXT")
-        except: pass
+        # 3. Table Historique (Crucial pour la vue client)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS ticket_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER,
+                sender_role TEXT,
+                message TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Patch colonnes
+        for col in ["message", "category", "username"]:
+            try: cur.execute(f"ALTER TABLE support_tickets ADD COLUMN {col} TEXT")
+            except: pass
         
         con.commit()
         print("✅ [TICKETS] DB prête et corrigée.")
@@ -83,40 +85,31 @@ def patch_db_tickets():
 # --- PARTIE ADMIN ---
 
 async def admin_list_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche la liste des tickets."""
+    """Affiche la liste des tickets ouverts."""
     q = update.callback_query
     try: await q.answer()
     except: pass
     
-    print(f"🔎 [ADMIN] Liste tickets demandée par {q.from_user.id}")
-
     try:
         con = sqlite3.connect(DB_NAME)
-        # On sélectionne ticket_id. Grâce au patch, cette colonne existe forcément maintenant.
-        rows = con.execute("SELECT ticket_id, username, category FROM support_tickets WHERE status='open' ORDER BY ticket_id DESC LIMIT 10").fetchall()
+        rows = con.execute("SELECT ticket_id, username, category FROM support_tickets WHERE status IN ('open', 'replied') ORDER BY ticket_id DESC LIMIT 10").fetchall()
         con.close()
     except Exception as e:
-        # Si ça plante encore, c'est grave, on affiche l'erreur
-        print(f"❌ Erreur SQL: {e}")
-        await q.message.reply_text(f"❌ Erreur SQL : {e}\n\nEssayez de redémarrer le bot pour appliquer le patch.")
+        await q.message.reply_text(f"❌ Erreur SQL : {e}")
         return ConversationHandler.END
 
     if not rows:
         kb = [[InlineKeyboardButton("⬅️ Retour Admin", callback_data="admin_menu")]]
-        msg_text = "✅ **Aucun ticket ouvert.** Tout est propre."
-        try: await q.message.edit_text(msg_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        except: await q.message.reply_text(msg_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await q.message.edit_text("✅ **Aucun ticket ouvert.**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return ConversationHandler.END
 
     kb = []
     for tid, uname, cat in rows:
-        label = f"#{tid} {uname} ({cat})" if uname else f"#{tid} Inconnu"
+        label = f"#{tid} {uname or 'Inconnu'} ({cat})"
         kb.append([InlineKeyboardButton(label, callback_data=f"adm_ticket_view_{tid}")])
     
     kb.append([InlineKeyboardButton("⬅️ Retour Admin", callback_data="admin_menu")])
-    
-    try: await q.message.edit_text("📨 **TICKETS EN ATTENTE**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    except: await q.message.reply_text("📨 **TICKETS EN ATTENTE**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    await q.message.edit_text("📨 **TICKETS EN ATTENTE**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def admin_view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -132,12 +125,7 @@ async def admin_view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await admin_list_tickets(update, context)
     
     uid, uname, cat, msg_content, date = row
-    # Sécurité si les champs sont vides
-    uname = uname or "Inconnu"
-    cat = cat or "Général"
-    msg_content = msg_content or "(Pas de message)"
-
-    txt = f"🎫 **TICKET #{tid}**\n👤 {uname} (`{uid}`)\n📂 {cat}\n📅 {date}\n\n📝 `{msg_content}`"
+    txt = f"🎫 **TICKET #{tid}**\n👤 {uname or 'Inconnu'} (`{uid}`)\n📂 {cat}\n📅 {date}\n\n📝 `{msg_content}`"
     
     kb = [
         [InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{tid}_{uid}")],
@@ -154,33 +142,39 @@ async def admin_ask_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['reply_uid'] = data[4]
     
     await q.message.reply_text(
-        f"✍️ **Réponse pour le ticket #{data[3]} :**\n"
-        "Écrivez votre message ci-dessous.",
+        f"✍️ **Réponse pour le ticket #{data[3]} :**\nÉcrivez votre message :",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Annuler", callback_data="admin_tickets_list")]])
     )
     return ADMIN_TICKET_REPLY
 
 async def admin_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Envoie la réponse et enregistre dans l'historique."""
     tid = context.user_data.get('reply_tid')
     uid = context.user_data.get('reply_uid')
     msg_resp = update.message.text
     
     try:
+        # 1. Envoi au client
         await context.bot.send_message(
             chat_id=uid,
             text=f"👨‍💻 **SUPPORT (Ticket #{tid}) :**\n━━━━━━━━━━━━━━━━━━\n{msg_resp}",
             parse_mode="Markdown"
         )
-        await update.message.reply_text("✅ Réponse envoyée.")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Échec envoi : {e}")
         
-    con = sqlite3.connect(DB_NAME)
-    con.execute("UPDATE support_tickets SET status='closed' WHERE ticket_id=?", (tid,))
-    con.commit(); con.close()
-    
+        # 2. Sauvegarde historique et statut
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", (tid, msg_resp))
+        cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
+        con.commit()
+        con.close()
+        
+        await update.message.reply_text("✅ Réponse envoyée et enregistrée.")
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Échec : {e}")
+        
     kb = [[InlineKeyboardButton("🔙 Liste", callback_data="admin_tickets_list")]]
-    await update.message.reply_text("Ticket fermé.", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("Ticket mis à jour.", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
 async def admin_close_no_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,19 +183,33 @@ async def admin_close_no_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     con = sqlite3.connect(DB_NAME)
     con.execute("UPDATE support_tickets SET status='closed' WHERE ticket_id=?", (tid,))
     con.commit(); con.close()
+    await q.answer("Ticket fermé.")
     await admin_list_tickets(update, context)
 
 async def admin_reply_native(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Réponse rapide via Reply dans le canal de logs."""
     if not update.message.reply_to_message: return
     orig = update.message.reply_to_message.text or ""
-    match = re.search(r"\(`?(\d+)`?\)", orig)
+    match = re.search(r"TICKET #(\d+)", orig)
     if match:
-        uid = match.group(1)
-        try:
-            await context.bot.send_message(chat_id=uid, text=f"👨‍💻 **RÉPONSE :**\n{update.message.text}", parse_mode="Markdown")
-            await update.message.set_reaction("👍")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Erreur: {e}")
+        tid = match.group(1)
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        cur.execute("SELECT user_id FROM support_tickets WHERE ticket_id=?", (tid,))
+        row = cur.fetchone()
+        
+        if row:
+            uid = row[0]
+            try:
+                msg_text = update.message.text
+                await context.bot.send_message(chat_id=uid, text=f"👨‍💻 **SUPPORT :**\n{msg_text}", parse_mode="Markdown")
+                cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", (tid, msg_text))
+                cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
+                con.commit()
+                await update.message.set_reaction("👍")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Erreur: {e}")
+        con.close()
 
 # --- PARTIE CLIENT ---
 async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,24 +233,31 @@ async def save_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_TICKET_MSG
 
 async def handle_ticket_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Crée le ticket et insère le premier message dans l'historique."""
     user = update.effective_user
     msg = update.message.text
     cat = context.user_data.get('ticket_cat', 'GENERAL')
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    # On utilise bien ticket_id ici (auto-incrémenté)
+    # 1. Ticket principal
     cur.execute("INSERT INTO support_tickets (user_id, username, category, message, status) VALUES (?,?,?,?,?)",
                 (str(user.id), user.username or user.first_name, cat, msg, 'open'))
     tid = cur.lastrowid
+    
+    # 2. Premier message dans l'historique
+    cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'user', ?)", (tid, msg))
+    
     con.commit(); con.close()
     
     await update.message.reply_text(f"✅ **Ticket #{tid} créé.**\nOn vous répond bientôt.")
     try:
-        await context.bot.send_message(chat_id=CHANNEL_LOGS, text=f"🔔 **Ticket #{tid}**\n👤 {user.id}\n📝 {msg}")
+        # Notif admin optimisée
+        kb_admin = InlineKeyboardMarkup([[InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{tid}_{user.id}")]])
+        await context.bot.send_message(chat_id=CHANNEL_LOGS, text=f"🚨 **NOUVEAU TICKET # {tid}**\n👤 {user.id} (@{user.username})\n📂 {cat}\n📝 {msg}", reply_markup=kb_admin)
     except: pass
     return ConversationHandler.END
 
-# Fonctions dummy pour éviter ImportError si app.py les cherche
+# Fonctions dummy pour compatibilité app.py
 async def start_ticket_reply(u,c): pass
 async def close_ticket(u,c): pass
