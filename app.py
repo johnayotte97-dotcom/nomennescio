@@ -654,7 +654,6 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⚒️ Tools ", callback_data="section_tools")],
         [InlineKeyboardButton("🛒 Panier", callback_data="cart:view")],
         [InlineKeyboardButton("📜 Historique", callback_data="hist:view")],
-        [InlineKeyboardButton("🚗 Vérifier mon permis" if lang == "fr" else "🚗 Check my license", callback_data="start_verifier_main")],
         [InlineKeyboardButton("💳 Recharger" if lang == "fr" else "💳 Top up", callback_data="add_balance")],
         [InlineKeyboardButton("🌐 Langue/Language", callback_data="choose_lang")],
         [InlineKeyboardButton("📣 Channel", callback_data="join_private_channel")],
@@ -2413,16 +2412,22 @@ async def history_filter_cancel(update: Update, context: ContextTypes.DEFAULT_TY
     q = update.callback_query
     await q.answer()
 
+    # On essaie de supprimer le message de choix de filtre
     try:
         await q.message.delete()
     except Exception:
         pass
 
+    # On nettoie la mémoire
     context.user_data.pop('history_filter_type', None)
 
     # Relance l'historique normal
-    q.data = "hist:pros:page:0" # simule un retour à la page 0
+    # On modifie manuellement les data pour simuler un retour à la page 0
+    q.data = "hist:pros:page:0" 
+    
+    # Appel de la fonction d'historique
     await hist_pros(update, context)
+    
     return ConversationHandler.END
 
 async def history_filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2822,7 +2827,15 @@ async def show_tools_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
+    # --- CORRECTION ICI : On récupère la langue du client ---
+    user_id = update.effective_user.id
+    lang = get_user_lang(str(user_id))
+    # --------------------------------------------------------
+    
     kb = [
+        # Le bouton s'adapte maintenant à la langue
+        [InlineKeyboardButton("🚗 Vérifier Permis (SAAQ)" if lang == "fr" else "🚗 Check License (SAAQ)", callback_data="start_verifier_main")],
+        
         [
             InlineKeyboardButton("📡 HLR Lookup ($0.50)", callback_data="tool_hlr"),
             InlineKeyboardButton("💳 LuxChecker ($1.00)", callback_data="tool_cc_checker") 
@@ -3137,34 +3150,35 @@ async def start_verifier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_verifier_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import logging
-    logger = logging.getLogger("BTN_VERIF")
-    logger.info("➡️ Bouton 'Vérifier mon permis' cliqué")
-
+    # Log pour le debug
+    print(f"DEBUG: start_verifier_main appelé par {update.effective_user.id}")
+    
     q = update.callback_query
     await q.answer()
-    logger.info(f"✅ callback_query répondu pour {q.from_user.id}")
-
+    
     user_id = update.effective_user.id
-    logger.info(f"🎯 User ID: {user_id}")
-
+    
+    # Nettoyage complet de la session pour éviter les conflits
     reset_session(user_id)
     context.user_data.clear()
-    logger.info("🧹 Session et user_data reset")
-
-    # --- CORRECTION ICI ---
-    # On utilise replace_view pour remplacer le menu et on sauvegarde le message
-    await replace_view(
-        q,
-        text=msg(user_id, "enter_bulk_qty"),
-        reply_markup=kb_back_cancel()
-    )
-    # On ajoute l'ID du message à la liste pour qu'il soit supprimé plus tard
-    context.user_data['verif_flow_msg_ids'] = [q.message.message_id]
-    # --- FIN CORRECTION ---
     
-    logger.info("📤 Message ASK_QTY envoyé")
-
+    # On envoie le message de départ
+    # On utilise edit_message_text si possible pour fluidifier
+    try:
+        msgx = await q.edit_message_text(
+            text=msg(user_id, "enter_bulk_qty"),
+            reply_markup=kb_back_cancel()
+        )
+    except:
+        msgx = await q.message.reply_text(
+            text=msg(user_id, "enter_bulk_qty"),
+            reply_markup=kb_back_cancel()
+        )
+    
+    # On sauvegarde le message pour le nettoyage futur
+    context.user_data['verif_flow_msg_ids'] = [msgx.message_id]
+    
+    # POINT CRITIQUE : On retourne l'état de départ de la vérification
     return ASK_QTY
 
 def _mode_keyboard(lang: str) -> InlineKeyboardMarkup:
@@ -4316,216 +4330,329 @@ async def admin_search_user_receive(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("❌ ID introuvable. Réessayez ou /cancel.")
         return ADMIN_WAIT_SEARCH_ID
 
+
+
 async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Guard admin
-    if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
+    """
+    1. Affiche le profil de l'utilisateur.
+    Gère la sécurité de session et réinitialise les modes d'édition.
+    """
+    # 1. Guard Admin
+    if str(update.effective_user.id) not in ADMIN_IDS: return
+
+    # 2. SÉCURITÉ : On désactive le mode "Édition de Solde" si on revient ici
+    # Cela évite que le bot intercepte des messages si l'admin change d'avis
+    context.user_data["SOLDE_EDIT_MODE"] = False 
+
+    target_id = None
+    q = None
+    
+    # 3. Récupération de l'ID cible
+    # Cas A : Clic sur un bouton (Update standard)
+    if hasattr(update, 'callback_query') and update.callback_query:
+        q = update.callback_query
+        try: await q.answer()
+        except: pass
+        if "admin_adjust_" in q.data:
+            target_id = q.data.replace("admin_adjust_", "")
+    
+    # Cas B : Appel interne (après modification ou via variable globale)
+    if not target_id:
+        target_id = context.user_data.get('target_user')
+
+    # Cas C : Si toujours rien, on utilise la variable blindée SOLDE_TARGET_ID par précaution
+    if not target_id:
+        target_id = context.user_data.get('SOLDE_TARGET_ID')
+
+    if not target_id:
+        try: await update.effective_message.reply_text("❌ Erreur : ID utilisateur perdu.")
+        except: pass
         return
-    
-    q = update.callback_query # CORRIGÉ : Définit q
-    await q.answer()
 
-    cbdata = q.data # CORRIGÉ : Utilise q.data
-    telegram_id = cbdata.replace("admin_adjust_", "")
-    context.user_data["target_user"] = telegram_id
+    # 4. Sauvegarde BLINDÉE pour la suite
+    context.user_data["target_user"] = target_id
+    context.user_data["SOLDE_TARGET_ID"] = target_id # On synchronise les deux variables
 
-    keyboard = [
-        [
-            InlineKeyboardButton("+10$",  callback_data=f"admin_adjval_{telegram_id}_10"),
-            InlineKeyboardButton("+100$", callback_data=f"admin_adjval_{telegram_id}_100"),
-            InlineKeyboardButton("+250$", callback_data=f"admin_adjval_{telegram_id}_250"),
-        ],
-        [
-            InlineKeyboardButton("-10$",  callback_data=f"admin_adjval_{telegram_id}_-10"),
-            InlineKeyboardButton("-100$", callback_data=f"admin_adjval_{telegram_id}_-100"),
-            InlineKeyboardButton("-250$", callback_data=f"admin_adjval_{telegram_id}_-250"),
-        ],
-        [InlineKeyboardButton("Montant personnalisé", callback_data=f"admin_customamount_{telegram_id}")],
-        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_users")], # Ce bouton ramène à la liste des utilisateurs, c'est bon
-    ]
+    # 5. Récupération DB
+    con = sqlite3.connect(DB_NAME)
+    row = con.execute("SELECT username, balance FROM users WHERE telegram_id=?", (target_id,)).fetchone()
+    con.close()
     
-    # CORRIGÉ: Utilise replace_view au lieu de reply_text
-    await replace_view(
-        q,
-        f"Quel ajustement pour l'utilisateur {telegram_id[-5:]} ?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    username = row[0] if row else "Inconnu"
+    balance = row[1] if row else 0.0
+
+    # 6. Construction Interface
+    txt = (
+        f"👤 **GESTION UTILISATEUR**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 ID : `{target_id}`\n"
+        f"📛 Nom : @{username}\n"
+        f"💰 Solde actuel : **{balance:.2f} $**\n"
+        f"━━━━━━━━━━━━━━━━━━"
     )
 
-
-async def admin_adjust_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Guard admin
-    if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
-        return
-    await update.callback_query.answer()
-
-    cbdata = update.callback_query.data
-    _, _, telegram_id, amount = cbdata.split("_")
-    amount = float(amount)
-
-    new_balance, new_statut = credit_and_upgrade(telegram_id, amount)
-    await update.callback_query.message.reply_text(f"✅ Solde mis à jour : {new_balance:.2f} $ CAD.")
-
+    kb = [
+        [InlineKeyboardButton("✍️ Modifier le Solde (+/-)", callback_data=f"admin_customamount_{target_id}")],
+        [InlineKeyboardButton("🗑 Supprimer l'utilisateur", callback_data=f"admin_deluser_ask_{target_id}")],
+        [InlineKeyboardButton("🔙 Retour Liste", callback_data="admin_users")]
+    ]
+    
+    # 7. Affichage intelligent (Edit ou Send)
     try:
-        await app_telegram.bot.send_message(
-            chat_id=int(telegram_id),
-            text=f"💵 Votre solde a été ajusté de {amount:+.2f} $ CAD. Nouveau solde : {new_balance:.2f} $ CAD."
-        )
-    except Exception as e:
-        await update.callback_query.message.reply_text(
-            f"Impossible de notifier l'utilisateur {telegram_id} : {e}"
-        )
-
-    return ConversationHandler.END
+        if q:
+            await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    except:
+        # Fallback ultime (si message trop vieux pour être édité)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 
 async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Guard admin
-    if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
-        return
-    await update.callback_query.answer()
+    q = update.callback_query
+    await q.answer()
 
-    cbdata = update.callback_query.data
-    telegram_id = cbdata.replace("admin_customamount_", "")
-    context.user_data["target_user"] = telegram_id
+    # Extraction ID
+    target_id = q.data.split("_")[-1]
+    
+    # 🔥 SAUVEGARDE BLINDÉE (Clés Uniques)
+    context.user_data["SOLDE_TARGET_ID"] = target_id
+    context.user_data["SOLDE_EDIT_MODE"] = True   # On active le mode édition
+    
+    # On sauvegarde aussi dans la variable générique au cas où
+    context.user_data["target_user"] = target_id 
 
-    await update.callback_query.message.reply_text(
-        "Entre le montant à ajouter (+) ou retirer (-) du solde :"
+    kb = [[InlineKeyboardButton("🔙 Annuler", callback_data=f"admin_adjust_{target_id}")]]
+
+    msg = await q.edit_message_text(
+        f"✍️ **MODIFICATION SOLDE**\n"
+        f"👤 Cible : `{target_id}`\n\n"
+        f"Entrez le montant à ajouter (+) ou retirer (-).\n"
+        f"Exemple : `50` pour ajouter, `-20` pour retirer.",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
     )
-    return ADMIN_AWAIT_AMOUNT
+    
+    context.user_data['prompt_msg_id'] = msg.message_id
+    
+    # On retourne ConversationHandler.END car on gère ça manuellement avec le Flag
+    return ConversationHandler.END
 
 
-# --- admin_customamount_receive (message handler, pas de callback -> pas de q.answer) ---
 async def admin_customamount_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # --- SECURITÉ AJOUTÉE ---
-    if not update.effective_user:
-        return # Ignore si pas d'utilisateur
-    # ------------------------
+    from datetime import datetime
+    import asyncio
 
-    # Guard 1: only admin
-    if str(update.effective_user.id) not in ADMIN_IDS:
+    # 1. Vérification : Est-ce qu'on est en train de modifier un solde ?
+    if not context.user_data.get("SOLDE_EDIT_MODE"):
+        return # Si non, on ignore ce message, ce n'est pas pour nous.
+
+    user = update.effective_user
+    text = update.message.text.strip()
+    
+    # 2. Récupération ID BLINDÉE
+    target_id = context.user_data.get("SOLDE_TARGET_ID")
+    
+    # Sécurité ultime : Si vide, on tente le fallback
+    if not target_id:
+        target_id = context.user_data.get("target_user")
+
+    if not target_id:
+        await update.message.reply_text("❌ Erreur Mémoire : ID perdu. Recliquez sur le bouton Modifier.")
+        context.user_data["SOLDE_EDIT_MODE"] = False # On désactive pour pas bloquer
         return
-    # Guard 2: only when a target user has been set
-    telegram_id = context.user_data.get("target_user")
-    if not telegram_id:
-        return
 
+    # 3. Traitement
     try:
-        amount = float(update.message.text.replace(",", "."))
-    except Exception:
-        await update.message.reply_text("Montant invalide, recommence.")
-        return ADMIN_AWAIT_AMOUNT
+        amount = float(text.replace(',', '.'))
+    except ValueError:
+        msg_err = await update.message.reply_text("❌ Chiffre invalide.")
+        await asyncio.sleep(2)
+        try: 
+            await update.message.delete()
+            await msg_err.delete()
+        except: pass
+        return # On reste en mode édition tant qu'il n'y a pas de chiffre valide
 
-    new_balance, new_statut = credit_and_upgrade(telegram_id, amount)
-    await update.message.reply_text(f"✅ Solde mis à jour : {new_balance:.2f} $ CAD.")
+    # 4. Mise à jour DB
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    cur.execute("SELECT balance FROM users WHERE telegram_id=?", (target_id,))
+    row = cur.fetchone()
+    old_bal = row[0] if row else 0.0
+    new_bal = old_bal + amount
+    sign = "+" if amount >= 0 else ""
 
+    cur.execute("UPDATE users SET balance=? WHERE telegram_id=?", (new_bal, target_id))
     try:
-        await app_telegram.bot.send_message(
-            chat_id=int(telegram_id),
-            text=f"💵 Votre solde a été ajusté de {amount:+.2f} $ CAD. Nouveau solde : {new_balance:.2f} $ CAD."
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Impossible de notifier l'utilisateur {telegram_id} : {e}")
-    finally:
-        context.user_data.pop("target_user", None)
+        cur.execute("INSERT INTO transactions (user_id, amount, status, date) VALUES (?, ?, ?, ?)",
+                    (target_id, amount, 'completed', datetime.now()))
+    except: pass 
+    con.commit()
+    con.close()
+
+    # 5. Feedback
+    msg_conf = await update.message.reply_text(
+        f"✅ **Succès !**\n💰 Action : {sign}{amount}€\n🏦 Nouveau : **{new_bal:.2f}€**",
+        parse_mode="Markdown"
+    )
+    
+    # 6. DÉSACTIVATION DU MODE ÉDITION (Important !)
+    context.user_data["SOLDE_EDIT_MODE"] = False
+    
+    # 7. Nettoyage
+    await asyncio.sleep(2.5)
+    try:
+        await update.message.delete()
+        await msg_conf.delete()
+        prompt_id = context.user_data.get('prompt_msg_id')
+        if prompt_id:
+            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prompt_id)
+    except: pass
+
+    # 8. Retour Profil
+    # On remet target_user pour admin_adjust_user qui l'attend
+    context.user_data["target_user"] = target_id 
+    await admin_adjust_user(update, context)
 
     return ConversationHandler.END
 
 
-# REMPLACE la fonction admin_setstatut (ligne 1709) par CELLE-CI :
-
 async def admin_setstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Guard admin
     if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
         return
+    
     q = update.callback_query
-    try:
-        await q.answer()
+    await q.answer()
+
+    # Gestion pagination
+    page = 0
+    if ":page:" in q.data:
+        try: page = int(q.data.split(":page:")[1])
+        except: page = 0
+
+    # Récupération des données (10 par page)
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # Compte total
+    cur.execute("SELECT COUNT(*) FROM users")
+    total_count = cur.fetchone()[0]
+    total_pages = max(1, (total_count + 9) // 10)
+    page = max(0, min(page, total_pages - 1))
+    offset = page * 10
+
+    # Liste avec Username
+    cur.execute("""
+        SELECT telegram_id, username, forfait 
+        FROM users 
+        ORDER BY rowid DESC 
+        LIMIT 10 OFFSET ?
+    """, (offset,))
+    rows = cur.fetchall()
+    con.close()
+
+    if not rows:
+        await q.edit_message_text("Aucun utilisateur.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]]))
+        return
+
+    # Construction du clavier
+    kb = []
+    for uid, uname, tier in rows:
+        # Affichage propre : ID + @User + (Statut actuel)
+        label_tier = FORFAITS.get(tier, {}).get('label', tier)
+        # On raccourcit le username s'il est trop long
+        display_name = f"@{uname}" if uname else "Inconnu"
+        if len(display_name) > 10: display_name = display_name[:10] + ".."
         
-        # CORRIGÉ: Définit un clavier de retour au menu admin
-        kb_back_admin = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
+        btn_txt = f"{uid} | {display_name} | {label_tier}"
+        kb.append([InlineKeyboardButton(btn_txt, callback_data=f"admin_userstatut_{uid}")])
 
-        users = get_users()
-        keyboard = []
-        for u in users:
-            tid   = str(u[0])
-            tier  = (u[4] or 'bronze')
-            label_tier = FORFAITS.get(tier, {}).get('label', tier)
-            display = f"{tid[-5:]} {label_tier}"
-            keyboard.append([InlineKeyboardButton(display, callback_data=f"admin_userstatut_{tid}")])
+    # Navigation
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Préc.", callback_data=f"admin_setstatut:page:{page-1}"))
+    nav_row.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Suiv. ➡️", callback_data=f"admin_setstatut:page:{page+1}"))
+    if nav_row: kb.append(nav_row)
 
-        if not keyboard:
-            # CORRIGÉ: Utilise replace_view
-            await replace_view(q, "Aucun utilisateur trouvé / No user found.", reply_markup=kb_back_admin)
-            return
-        if len(keyboard) > 80:
-            keyboard = keyboard[:80]
+    # Boutons d'actions
+    kb.append([InlineKeyboardButton("🔍 Chercher un ID pour Statut", callback_data="admin_search_statut_start")])
+    kb.append([InlineKeyboardButton("⬅️ Retour Menu Admin", callback_data="admin_menu")])
 
-        # CORRIGÉ: Ajoute le bouton Retour
-        keyboard.append([InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")])
-
-        # CORRIGÉ: Utilise replace_view
-        await replace_view(
-            q,
-            "Sélectionner un utilisateur :",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-    except Exception as e:
-        log(f"admin_setstatut error: {e}", str(update.effective_user.id), "error")
-        try:
-            # CORRIGÉ: Utilise replace_view pour le message d'erreur
-            await replace_view(
-                q, 
-                "⚠️ Erreur lors du chargement de la liste.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
-            )
-        except: pass
-
-# REMPLACE la fonction admin_userstatut (ligne 1735) par CELLE-CI :
+    await q.edit_message_text(
+        f"🏷 **GESTION DES FORFAITS**\nPage {page+1}/{total_pages}\n\nSélectionnez un utilisateur pour changer son rang :", 
+        reply_markup=InlineKeyboardMarkup(kb), 
+        parse_mode="Markdown"
+    )
 
 async def admin_userstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
     if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
         return
     
-    q = update.callback_query # CORRIGÉ : Définit q
+    q = update.callback_query
     await q.answer()
 
-    cbdata = q.data # CORRIGÉ : Utilise q.data
-    telegram_id = cbdata.replace("admin_userstatut_", "")
-    keyboard = [
-        [InlineKeyboardButton(f"{FORFAITS['bronze']['label']}",   callback_data=f"admin_statut_{telegram_id}_bronze")],
-        [InlineKeyboardButton(f"{FORFAITS['silver']['label']}",   callback_data=f"admin_statut_{telegram_id}_silver")],
-        [InlineKeyboardButton(f"{FORFAITS['gold']['label']}",     callback_data=f"admin_statut_{telegram_id}_gold")],
-        [InlineKeyboardButton(f"{FORFAITS['platinum']['label']}", callback_data=f"admin_statut_{telegram_id}_platinum")],
-        [InlineKeyboardButton("⬅️ Retour", callback_data="admin_setstatut")] # CORRIGÉ : Bouton Retour
-    ]
+    # On récupère l'ID
+    target_id = q.data.replace("admin_userstatut_", "")
     
-    # CORRIGÉ: Utilise replace_view
-    await replace_view(
-        q,
-        "Nouveau statut :",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    # On récupère les infos
+    con = sqlite3.connect(DB_NAME)
+    row = con.execute("SELECT username, forfait, balance FROM users WHERE telegram_id=?", (target_id,)).fetchone()
+    con.close()
+    
+    if not row:
+        await q.message.reply_text("Utilisateur introuvable.")
+        return
+
+    uname, current_tier, bal = row
+    current_label = FORFAITS.get(current_tier, {}).get('label', current_tier)
+
+    # Menu de choix propre
+    kb = [
+        [InlineKeyboardButton(f"{FORFAITS['bronze']['label']}",   callback_data=f"admin_statut_{target_id}_bronze")],
+        [InlineKeyboardButton(f"{FORFAITS['silver']['label']}",   callback_data=f"admin_statut_{target_id}_silver")],
+        [InlineKeyboardButton(f"{FORFAITS['gold']['label']}",     callback_data=f"admin_statut_{target_id}_gold")],
+        [InlineKeyboardButton(f"{FORFAITS['platinum']['label']}", callback_data=f"admin_statut_{target_id}_platinum")],
+        [InlineKeyboardButton("⬅️ Retour Liste", callback_data="admin_setstatut")]
+    ]
+
+    await q.edit_message_text(
+        f"🏷 **MODIFIER LE STATUT**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👤 User : `{target_id}`\n"
+        f"📛 Nom : @{uname or 'Inconnu'}\n"
+        f"💰 Solde : {bal:.2f} $\n"
+        f"🏆 Actuel : **{current_label}**\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Sélectionnez le nouveau rang :",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
     )
 
 
 async def admin_setstatut_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Guard admin
-    if str(update.effective_user.id) not in ADMIN_IDS:
-        await update.callback_query.answer("Accès refusé / Access denied.")
-        return
-    await update.callback_query.answer()
-
-    cbdata = update.callback_query.data
-    _, _, telegram_id, statut = cbdata.split("_")
-    set_user_statut(telegram_id, statut)
-
-    await update.callback_query.message.reply_text(
-        f"✅ Statut modifié pour {telegram_id[-5:]} -> {FORFAITS[statut]['label']}"
-    )
-
+    q = update.callback_query
+    # Pas de await q.answer() ici car on va éditer le message tout de suite
+    
+    data = q.data.split("_")
+    target_id = data[2]
+    new_statut = data[3]
+    
+    # Mise à jour DB
+    set_user_statut(target_id, new_statut)
+    
+    # Notification Toast (message temporaire en haut de l'écran)
+    await q.answer(f"✅ Statut changé pour {new_statut.upper()} !", show_alert=False)
+    
+    # On modifie le q.data pour simuler un rappel de la fonction d'affichage du profil
+    # Cela va rafraîchir la page et montrer le nouveau statut instantanément
+    q.data = f"admin_userstatut_{target_id}"
+    await admin_userstatut(update, context)
 
 async def admin_hard_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
@@ -6367,38 +6494,60 @@ async def ticket_reject_physical(update: Update, context: ContextTypes.DEFAULT_T
 async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text):
     import asyncio
     q = update.callback_query
-    user_id = str(update.effective_user.id)
-    cat = context.user_data.get('ticket_cat')
+    user = update.effective_user
+    user_id = str(user.id)
+    # Valeur par défaut 'General' si la catégorie est perdue
+    cat = context.user_data.get('ticket_cat', 'General')
     
-    con = sqlite3.connect(DB_NAME); cur = con.cursor()
-    try: cur.execute("ALTER TABLE support_tickets ADD COLUMN dashboard_msg_id INTEGER")
-    except: pass
-    cur.execute("INSERT INTO support_tickets (user_id, category, message, status, username, dashboard_msg_id) VALUES (?,?,?,?,?,?)", (user_id, cat, message_text, 'open', update.effective_user.username, None))
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # 1. Sauvegarde du Ticket
+    cur.execute("INSERT INTO support_tickets (user_id, category, message, status, username, dashboard_msg_id) VALUES (?,?,?,?,?,?)", 
+                (user_id, cat, message_text, 'open', user.username or user.first_name, None))
     ticket_id = cur.lastrowid
-    cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'user', ?)", (ticket_id, message_text))
-    con.commit(); con.close()
     
-    # Notif Admin avec bouton FERMER
-    admin_txt = f"🚨 **TICKET #{ticket_id}**\n👤 {user_id}\n📂 {cat}\n📝 {message_text}"
-    kb_admin = InlineKeyboardMarkup([[InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{ticket_id}"), InlineKeyboardButton("🔒 Fermer", callback_data=f"adm_ticket_close_{ticket_id}")]])
-    try: await context.bot.send_message(chat_id=CHANNEL_LOGS, text=admin_txt, reply_markup=kb_admin, parse_mode="Markdown")
-    except: pass
+    # 2. Sauvegarde dans l'Historique (CRUCIAL pour que le client voie son propre message)
+    cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'user', ?)", 
+                (ticket_id, message_text))
+    
+    con.commit()
+    con.close()
+    
+    # 3. Notification Admin
+    # ⚠️ CORRECTION ICI : Ajout de _{user_id} pour que le bouton Répondre fonctionne
+    admin_txt = f"🚨 **TICKET #{ticket_id}**\n👤 {user_id} (@{user.username})\n📂 {cat}\n📝 `{message_text}`"
+    kb_admin = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{ticket_id}_{user_id}"), 
+         InlineKeyboardButton("🔒 Fermer", callback_data=f"adm_ticket_close_{ticket_id}")]
+    ])
+    
+    try: 
+        await context.bot.send_message(chat_id=CHANNEL_LOGS, text=admin_txt, reply_markup=kb_admin, parse_mode="Markdown")
+    except Exception as e: 
+        print(f"Erreur Log Admin: {e}")
 
-    # Clean Client
-    try: await q.edit_message_text(text=f"✅ **TICKET #{ticket_id} ENREGISTRÉ.**\n\n🗑️ _Nettoyage du terminal..._", parse_mode="Markdown", reply_markup=None)
-    except: pass
-    await asyncio.sleep(2.5)
-    try: await q.message.delete()
+    # 4. Feedback Client
+    try: 
+        await q.edit_message_text(text=f"✅ **TICKET #{ticket_id} ENREGISTRÉ.**\n\n🗑️ _Retour au menu..._", parse_mode="Markdown", reply_markup=None)
     except: pass
     
-    # Nettoyage profond
+    await asyncio.sleep(2.5)
+    
+    # 5. Nettoyage des messages (Clavier virtuel, etc.)
     if 'cleanup_ids' in context.user_data: 
         for mid in context.user_data['cleanup_ids']:
             try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
             except: pass
         context.user_data['cleanup_ids'] = []
 
-    await show_main_menu(int(user_id), clear=True)
+    # Retour au menu principal
+    try:
+        await show_main_menu(int(user_id), clear=True)
+    except:
+        # Fallback si show_main_menu n'est pas importé ou a une signature différente
+        await q.message.reply_text("Tapez /start pour revenir au menu.")
+
     return ConversationHandler.END
 
 # --- LOGIQUE ADMIN RÉPONSE ---
@@ -6553,6 +6702,7 @@ conv_handler = ConversationHandler(
 
         # --- TOOLS ---
         SELECT_TOOL: [
+            CallbackQueryHandler(start_verifier_main, pattern='^start_verifier_main$'),
             CallbackQueryHandler(tool_ask_hlr, pattern='^tool_hlr$'),
             CallbackQueryHandler(show_sms_menu, pattern='^tool_5sim$'),
             CallbackQueryHandler(handle_buy_sms, pattern='^buy_sms:'),
@@ -6796,6 +6946,45 @@ async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
                 print(f"[AUTO-LOCK ERROR] {e}")
 
 # ================= BOUCLE PRINCIPALE (MAIN) =================
+
+
+async def admin_clean_ghost_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Sécurité Admin
+    if str(update.effective_user.id) not in ADMIN_IDS:
+        return
+
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # On compte d'abord combien on va en supprimer
+    # Critères : username NULL ou vide ou 'None' ET solde = 0 (pour ne pas supprimer qqun qui a de l'argent)
+    cur.execute("""
+        SELECT COUNT(*) FROM users 
+        WHERE (username IS NULL OR username = '' OR username = 'None') 
+        AND balance = 0
+    """)
+    count = cur.fetchone()[0]
+    
+    if count == 0:
+        await update.message.reply_text("✅ Aucun utilisateur fantôme à supprimer.")
+        con.close()
+        return
+
+    # Suppression effective
+    cur.execute("""
+        DELETE FROM users 
+        WHERE (username IS NULL OR username = '' OR username = 'None') 
+        AND balance = 0
+    """)
+    con.commit()
+    con.close()
+    
+    await update.message.reply_text(f"🗑️ **Nettoyage terminé !**\n{count} utilisateurs fantômes (solde 0$) ont été supprimés.")
+
+
+
+
+
 if __name__ == "__main__":
     # --- INIT DB ---
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
@@ -6847,6 +7036,8 @@ if __name__ == "__main__":
     app_telegram.add_handler(admin_ticket_conv, group=9) # Admin Tickets
 
     # Handlers Admin Loose
+    
+    app_telegram.add_handler(CommandHandler("clean_users", admin_clean_ghost_users))
     app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_\d+$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
@@ -6854,9 +7045,8 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(admin_menu, pattern="^admin_menu$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern=r"^admin_users(:page:\d+)?$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_.*$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_adjust_value, pattern="^admin_adjval_.*$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_.*$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern=r"^admin_setstatut(:page:\d+)?$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_.*$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_.*$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
