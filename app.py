@@ -713,13 +713,14 @@ async def show_main_menu(user_id: int, clear: bool = True):
 
 def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=None):
     """
-    Moteur de recherche SQL V5 (Industriel).
+    Moteur de recherche SQL V6 (Précision Stricte).
+    Règle le problème de chevauchement des villes.
     """
     con = sqlite3.connect(DB_NAME)
-    con.row_factory = sqlite3.Row  # IMPORTANT pour éviter les erreurs d'accès
+    con.row_factory = sqlite3.Row
     cur = con.cursor()
     
-    # 1. Base
+    # 1. Base des conditions
     conditions = ["category=?", "is_active=1", "stock>0"]
     params = [category]
     
@@ -727,45 +728,52 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
         conditions.append("tier=?")
         params.append(tier)
         
-    # 2. Filtres
+    # 2. Application des filtres intelligents
     if filters:
-        # PRIX (Nettoyage automatique "2$" -> 2.0)
+        # PRIX : Filtrage numérique strict
         if filters.get('price'):
             try:
                 raw = str(filters['price']).replace(',', '.').replace('$', '').strip()
-                max_price = float(raw)
                 conditions.append("price <= ?")
-                params.append(max_price)
+                params.append(float(raw))
             except: pass 
 
-        # ANNÉE / NOM / VILLE (Recherche large)
-        for key in ['year', 'name', 'city', 'base']:
+        # VILLE : Recherche ciblée sur la colonne city uniquement
+        if filters.get('city'):
+            val = filters['city'].strip()
+            conditions.append("city LIKE ?")
+            params.append(f"%{val}%")
+
+        # BINS (Spécifique Cc's) : Recherche dans le contenu technique
+        if filters.get('bins'):
+             val = filters['bins'].strip()
+             conditions.append("content LIKE ?")
+             params.append(f"%{val}%")
+
+        # AUTRES (Année, Nom, Base) : Recherche textuelle large
+        # Note : 'city' a été retiré de cette boucle pour éviter les doublons
+        for key in ['year', 'name', 'base']:
             if filters.get(key):
                 val = filters[key].strip()
                 conditions.append("(title LIKE ? OR content LIKE ?)")
                 params.append(f"%{val}%")
                 params.append(f"%{val}%")
 
-        # BINS (Spécifique Cc's)
-        if filters.get('bins'):
-             val = filters['bins'].strip()
-             conditions.append("content LIKE ?")
-             params.append(f"%{val}%") # Cherche le BIN dans le contenu
-
     where_sql = " AND ".join(conditions)
 
     try:
-        # 3. Exécution
+        # 3. Comptage du total (pour la pagination)
         count_query = f"SELECT COUNT(*) FROM products WHERE {where_sql}"
         cur.execute(count_query, params)
         total_count = cur.fetchone()[0]
 
+        # 4. Récupération des données avec tri par ID descendant (plus récents en premier)
         data_query = f"SELECT * FROM products WHERE {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
         full_params = params + [per_page, page * per_page]
         rows = cur.execute(data_query, full_params).fetchall()
         con.close()
 
-        # 4. Conversion propre en dict
+        # 5. Formatage des résultats
         prods = []
         for row in rows:
             p = dict(row)
@@ -777,7 +785,9 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
                 "stock": p['stock'], 
                 "tier": p['tier'], 
                 "category": category, 
-                "content": p['content']
+                "content": p['content'],
+                "city": p.get('city', 'N/A'), # <-- AJOUTER CETTE LIGNE
+                "year": p.get('year', 'N/A')  # <-- AJOUTER CETTE LIGNE
             })
             
         return prods, total_count
@@ -805,7 +815,6 @@ def _build_products_keyboard(page, total_pages, tier=None):
     return InlineKeyboardMarkup([filt_row, nav_row, back_row])
 
 
-# REMPLACE la fonction show_products (ligne 607) par CELLE-CI :
 
 async def show_products(update, context, page=0, tier=None, from_filter=False):
     # Imports locaux pour garantir le fonctionnement
@@ -818,12 +827,7 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     # 1. UX : ON AFFICHE LE CHARGEMENT TOUT DE SUITE
     loading_msg = None
     try:
-        # On envoie le message AVANT de supprimer l'ancien menu
         loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Recherche en cours...")
-        
-        # --- ASTUCE UX : PETITE PAUSE ---
-        # On force une pause de 0.5s pour que l'utilisateur voie le message
-        # Sinon c'est trop rapide et ça fait "clignoter" l'écran
         await asyncio.sleep(0.5) 
     except: pass
 
@@ -856,7 +860,6 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         PER_PAGE = 2
         chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
     except Exception as e:
-        # Si ça plante, on le dit
         if loading_msg:
             try: await loading_msg.edit_text(f"⚠️ Erreur: {e}")
             except: pass
@@ -881,20 +884,39 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         else: CATALOG_MSGS[chat_id] = [m.message_id]
         return
 
-    # 7. Affichage des fiches
+    # 7. Affichage des fiches (VERSION AJUSTÉE)
     for p in chunk:
-        title = str(p.get('title', 'Unknown')).replace("*", "").replace("`", "")
+        # On extrait le nom proprement (en enlevant les points de séparation du titre)
+        raw_title = str(p.get('title', 'Unknown')).replace("*", "").replace("`", "")
+        name = raw_title.split('•')[0].strip()
+        
+        # On récupère les colonnes spécifiques
+        city = str(p.get('city', 'N/A')).replace("*", "")
+        year = str(p.get('year', 'N/A')).replace("*", "")
         base = str(p.get('tier', 'N/A')).replace("*", "")
         price = p.get('price', 0.0)
         
-        txt = f"📦 *PROPRO*\n━━━━━━━━━━━━━━━\n👤 **NOM** : `{title}`\n📂 **BASE** : `{base}`\n💰 **PRIX** : `{price:.2f} CAD`"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"), InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}") ]])
+        # Formatage de la fiche ultra-propre
+        txt = (
+            f"👤 **NOM** : `{name}`\n"
+            f"🏙️ **VILLE** : `{city}`\n"
+            f"📅 **ANNÉE** : `{year}`\n"
+            f"📂 **BASE** : `{base}`\n"
+            f"💰 **PRIX** : `{price:.2f} CAD`"
+        )
+        
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"), 
+            InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}") 
+        ]])
+        
         try:
             m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
             sent_ids.append(m.message_id)
         except: 
             try:
-                m = await context.bot.send_message(chat_id=chat_id, text=txt.replace('*',''), reply_markup=kb)
+                # Fallback si le Markdown pose problème
+                m = await context.bot.send_message(chat_id=chat_id, text=txt.replace('*','').replace('`',''), reply_markup=kb)
                 sent_ids.append(m.message_id)
             except: pass
 
@@ -907,7 +929,11 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     else:
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
-            [InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")],
+            [
+                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), 
+                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), 
+                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")
+            ],
             [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
         ])
         m = await context.bot.send_message(chat_id=chat_id, text=f"📊 Catalogue ({total_items} produits)", reply_markup=kb)
@@ -1017,8 +1043,7 @@ async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYP
         value = update.message.text.strip()
         context.user_data.setdefault('pending_filters', {})[key] = value
         
-        # 3. Suppression des anciens messages (Prompt + Réponse user)
-        # On le fait DANS un try pour ne pas bloquer si ça échoue
+
         try:
             prev_msg_id = context.user_data.get('filter_msgs', [])[0]
             await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
@@ -1028,15 +1053,8 @@ async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.delete()
         except: pass
             
-        # 4. Confirmation visuelle (Toast)
-        # On utilise try/except au cas où
-        try:
-            notif = await update.message.reply_text(f"✅ Filtre '{key}' = {value}", quote=False)
-            # Suppression différée (non bloquante)
-            asyncio.create_task(delete_later(notif, 2)) 
-        except: pass
+
         
-        # 5. Affichage du nouveau menu
         kb = _build_filter_menu(context)
         m = await update.message.reply_text("Filtres appliqués. Cliquez sur 'Search' :", reply_markup=kb)
         context.user_data['filter_msgs'] = [m.message_id] # Mise à jour de l'ID
@@ -1067,28 +1085,25 @@ async def filter_page_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         page = 0
         
-    # Appelle show_products, en lui disant qu'on vient du filtre
-    # et en passant le nouveau numéro de page.
-    # Les 'active_filters' sont toujours dans context.user_data
+
     await show_products(update, context, page=page, tier=None, from_filter=True)
-    
-    # On reste dans le menu principal du filtre
+ 
     return CATALOG_FILTER_MAIN
 
 async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Applique les filtres et lance la recherche."""
     q = update.callback_query
     
-    # 1. Transfère les filtres en attente vers les filtres actifs
+
     context.user_data['active_filters'] = context.user_data.get('pending_filters', {})
     
-    # 2. Appelle show_products, en lui disant qu'on vient du filtre
+ 
     await show_products(update, context, page=0, tier=None, from_filter=True)
     
-    # On reste dans le menu principal du filtre
+
     return CATALOG_FILTER_MAIN
 
-# REMPLACEZ la fonction filter_reset (lignes 1018-1035) par ceci :
+
 
 async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Réinitialise les filtres et nettoie les fiches produits."""
@@ -1119,24 +1134,17 @@ async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
-    # Vide les filtres
+
     context.user_data.pop('pending_filters', None)
     context.user_data.pop('active_filters', None)
-    
-    # Appelle show_products (qui va nettoyer le menu de filtre)
+ 
     await show_products(update, context, page=0, tier=None, from_filter=False) # from_filter=False pour recharger
     return ConversationHandler.END
 
-# ========================== CATALOGUE PRODUITS (CCS CLONE) ==========================
-#
-#   Ce bloc est un clone de 'show_products' et 'filter_...'
-#   dédié uniquement à la catégorie 'ccs'
-#
-# ====================================================================================
 
-CCS_CATALOG_MSGS = {} # Variable globale SÉPARÉE pour les messages CCS
+CCS_CATALOG_MSGS = {} 
 
-# --- AJOUTE CECI POUR QUE LE MENU CCS FONCTIONNE ---
+
 def _get_products(category, tier=None):
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
@@ -6156,10 +6164,10 @@ async def on_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data.split(":")[-1]
     
     if data == "ccs":
-        # On suppose que show_products_ccs est défini plus haut
+       
         return await show_products_ccs(update, context, page=0)
     elif data == "propro":
-        # On suppose que show_products est défini plus haut
+
         return await show_products(update, context, page=0)
     else:
         await q.message.reply_text(f"Catégorie : {data}")
@@ -6374,15 +6382,40 @@ async def acc_reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def get_virtual_keyboard(page='letters', prefix="vkey"):
     kb = []
     if page == 'letters':
-        rows = [['Q','W','E','R','T','Y','U','I','O','P'], ['A','S','D','F','G','H','J','K','L'], ['Z','X','C','V','B','N','M']]
-        for r in rows: kb.append([InlineKeyboardButton(char, callback_data=f"{prefix}:{char}") for char in r])
-        kb.append([InlineKeyboardButton("123..", callback_data=f"{prefix}:switch_num"), InlineKeyboardButton("␣ ESPACE", callback_data=f"{prefix}:SPACE"), InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")])
+        # Correction : Ajout des lettres manquantes si nécessaire (la liste semblait complète mais vérifions l'ordre AZERTY ou QWERTY)
+        # QWERTY standard
+        rows = [
+            ['Q','W','E','R','T','Y','U','I','O','P'], 
+            ['A','S','D','F','G','H','J','K','L'], 
+            ['Z','X','C','V','B','N','M']
+        ]
+        for r in rows: 
+            kb.append([InlineKeyboardButton(char, callback_data=f"{prefix}:{char}") for char in r])
+        
+        # Ajout des boutons de contrôle
+        kb.append([
+            InlineKeyboardButton("123..", callback_data=f"{prefix}:switch_num"), 
+            InlineKeyboardButton("␣ ESPACE", callback_data=f"{prefix}:SPACE"), 
+            InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")
+        ])
+    
     elif page == 'numbers':
-        kb = [[InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(1,4)], [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(4,7)], [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(7,10)]]
-        kb.append([InlineKeyboardButton("ABC..", callback_data=f"{prefix}:switch_let"), InlineKeyboardButton("0", callback_data=f"{prefix}:0"), InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")])
+        kb = [
+            [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(1,4)], 
+            [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(4,7)], 
+            [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(7,10)]
+        ]
+        kb.append([
+            InlineKeyboardButton("ABC..", callback_data=f"{prefix}:switch_let"), 
+            InlineKeyboardButton("0", callback_data=f"{prefix}:0"), 
+            InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")
+        ])
     
     cancel_cb = "admin_menu" if "adm" in prefix else "menu_accueil"
-    kb.append([InlineKeyboardButton("❌ ANNULER", callback_data=cancel_cb), InlineKeyboardButton("✅ ENVOYER", callback_data=f"{prefix}:SEND")])
+    kb.append([
+        InlineKeyboardButton("❌ ANNULER", callback_data=cancel_cb), 
+        InlineKeyboardButton("✅ ENVOYER", callback_data=f"{prefix}:SEND")
+    ])
     return InlineKeyboardMarkup(kb)
 
 def _generate_dashboard_text(cat, user_text, status_label, admin_reply=None):
@@ -6515,10 +6548,11 @@ async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYP
     con.close()
     
     # 3. Notification Admin
-    # ⚠️ CORRECTION ICI : Ajout de _{user_id} pour que le bouton Répondre fonctionne
     admin_txt = f"🚨 **TICKET #{ticket_id}**\n👤 {user_id} (@{user.username})\n📂 {cat}\n📝 `{message_text}`"
+    
+    # --- MODIFICATION ICI : "Ouvrir" au lieu de "Répondre" ---
     kb_admin = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{ticket_id}_{user_id}"), 
+        [InlineKeyboardButton("📂 Ouvrir", callback_data=f"adm_ticket_rep_{ticket_id}_{user_id}"), 
          InlineKeyboardButton("🔒 Fermer", callback_data=f"adm_ticket_close_{ticket_id}")]
     ])
     
@@ -6529,12 +6563,20 @@ async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # 4. Feedback Client
     try: 
+        # On affiche le message de succès
         await q.edit_message_text(text=f"✅ **TICKET #{ticket_id} ENREGISTRÉ.**\n\n🗑️ _Retour au menu..._", parse_mode="Markdown", reply_markup=None)
     except: pass
     
+    # Pause pour laisser le temps de lire
     await asyncio.sleep(2.5)
     
-    # 5. Nettoyage des messages (Clavier virtuel, etc.)
+    # --- CORRECTION : SUPPRESSION EXPLICITE DU MESSAGE ---
+    try:
+        await q.message.delete()
+    except:
+        pass
+    
+    # 5. Nettoyage des autres messages (Clavier virtuel, etc.)
     if 'cleanup_ids' in context.user_data: 
         for mid in context.user_data['cleanup_ids']:
             try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
@@ -6552,18 +6594,68 @@ async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # --- LOGIQUE ADMIN RÉPONSE ---
 async def admin_reply_start_virtual(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
+    
+    # Récupération de l'ID du ticket
     tid = q.data.split("_")[-1]
+    
+    # Initialisation du buffer de réponse
     context.user_data['current_ticket_id'] = tid
     context.user_data['admin_buffer'] = ""
     
-    con = sqlite3.connect(DB_NAME); cur = con.cursor()
-    cur.execute("SELECT message FROM support_tickets WHERE ticket_id=?", (tid,)); row = cur.fetchone()
-    con.close()
-    user_msg = row[0] if row else "???"
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
     
-    txt = f"👮‍♂️ **RÉPONSE TICKET #{tid}**\n━━━━━━━━━━━━━━━━━━\n📩 Client:\n_{user_msg}_\n━━━━━━━━━━━━━━━━━━\n⌨️ RÉPONSE:\n`_`"
-    await q.message.edit_text(text=txt, reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey"), parse_mode="Markdown")
+    # 1. On cherche le DERNIER message du client + la DATE
+    cur.execute("""
+        SELECT message, created_at 
+        FROM ticket_messages 
+        WHERE ticket_id=? AND sender_role='user' 
+        ORDER BY created_at DESC LIMIT 1
+    """, (tid,))
+    row_hist = cur.fetchone()
+    
+    # 2. Fallback sur la table principale si l'historique est vide (évite les ???)
+    if row_hist:
+        user_msg = row_hist[0]
+        raw_date = row_hist[1]
+    else:
+        cur.execute("SELECT message, created_at FROM support_tickets WHERE ticket_id=?", (tid,))
+        row_main = cur.fetchone()
+        user_msg = row_main[0] if row_main else "Message introuvable"
+        raw_date = row_main[1] if row_main else "Date inconnue"
+        
+    con.close()
+    
+    # Formatage de la date pour qu'elle soit lisible
+    try:
+        # On coupe les millisecondes si besoin et on formate
+        dt_str = str(raw_date).split(".")[0] 
+        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
+        date_display = dt.strftime("%d/%m à %H:%M")
+    except:
+        date_display = str(raw_date)
+
+    # On coupe le message s'il est trop long pour l'écran
+    if len(user_msg) > 150:
+        user_msg = user_msg[:147] + "..."
+    
+    # Construction de l'interface Dashboard
+    txt = (
+        f"👮‍♂️ **RÉPONSE TICKET #{tid}**\n"
+        f"🕒 {date_display}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📩 **Client :**\n_{user_msg}_\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"⌨️ **RÉPONSE :**\n`_`"
+    )
+    
+    await q.message.edit_text(
+        text=txt, 
+        reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey"), 
+        parse_mode="Markdown"
+    )
     return tickets.ADMIN_TICKET_REPLY
 
 async def admin_handle_virtual_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6589,13 +6681,63 @@ async def admin_handle_virtual_click(update: Update, context: ContextTypes.DEFAU
 async def admin_finalize_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_text):
     q = update.callback_query
     tid = context.user_data.get('current_ticket_id')
-    con = sqlite3.connect(DB_NAME); cur = con.cursor()
-    cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
-    con.commit(); con.close()
     
-    await q.edit_message_text(text=f"✅ **RÉPONSE ENREGISTRÉE.**\n\nLe client verra le badge 🔴 au menu.", parse_mode="Markdown", reply_markup=None)
-    await asyncio.sleep(1.5)
-    await admin_menu(update, context)
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    
+    # 1. Récupérer les infos du ticket pour l'envoi
+    cur.execute("SELECT user_id, category, username FROM support_tickets WHERE ticket_id=?", (tid,))
+    row = cur.fetchone()
+    
+    if row:
+        user_id, cat, username = row
+        
+        # 2. Envoyer la réponse au client (Notification générique)
+        try:
+            custom_message = f"⚠️ *Vous avez reçu un message, veuillez consulter le ticket #{tid}*"
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=custom_message,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"❌ Erreur envoi client: {e}")
+
+        # 3. Sauvegarder dans l'historique
+        cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", (tid, reply_text))
+        
+        # 4. Mettre à jour le statut
+        cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
+        con.commit()
+        
+        # 5. Mettre à jour le message Admin
+        cur.execute("SELECT message FROM ticket_messages WHERE ticket_id=? AND sender_role='user' ORDER BY id DESC LIMIT 1", (tid,))
+        last_user_msg = cur.fetchone()
+        user_msg_display = last_user_msg[0] if last_user_msg else "(Voir historique)"
+
+        log_text = (
+            f"🚨 **TICKET #{tid}**\n"
+            f"👤 {user_id} (@{username})\n"
+            f"📂 {cat}\n"
+            f"📝 `{user_msg_display}`\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"✅ **RÉPONSE ENVOYÉE :**\n"
+            f"`{reply_text}`"
+        )
+        
+        # --- MODIFICATION ICI : "Ouvrir" au lieu de "Répondre encore" ---
+        kb_admin = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 Ouvrir", callback_data=f"adm_ticket_rep_{tid}_{user_id}"), 
+             InlineKeyboardButton("🔒 Fermer", callback_data=f"adm_ticket_close_{tid}")]
+        ])
+        
+        try:
+            await q.edit_message_text(text=log_text, reply_markup=kb_admin, parse_mode="Markdown")
+        except Exception:
+            pass
+
+    con.close()
+    
     return ConversationHandler.END
 
 async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6703,6 +6845,8 @@ conv_handler = ConversationHandler(
         # --- TOOLS ---
         SELECT_TOOL: [
             CallbackQueryHandler(start_verifier_main, pattern='^start_verifier_main$'),
+            CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"),
+            CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"),
             CallbackQueryHandler(tool_ask_hlr, pattern='^tool_hlr$'),
             CallbackQueryHandler(show_sms_menu, pattern='^tool_5sim$'),
             CallbackQueryHandler(handle_buy_sms, pattern='^buy_sms:'),
@@ -6754,7 +6898,9 @@ id_docs_conv = ConversationHandler(
         ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
         ID_PROD_VIEW: [
             CallbackQueryHandler(id_view_product, pattern="^id_view:"),
-            CallbackQueryHandler(id_start_buy, pattern="^id_buy:")
+            CallbackQueryHandler(id_start_buy, pattern="^id_buy:"),
+            CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"),
+            CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"),
         ],
         # Quantité
         ID_ASK_QTY: [
@@ -6981,10 +7127,6 @@ async def admin_clean_ghost_users(update: Update, context: ContextTypes.DEFAULT_
     
     await update.message.reply_text(f"🗑️ **Nettoyage terminé !**\n{count} utilisateurs fantômes (solde 0$) ont été supprimés.")
 
-
-
-
-
 if __name__ == "__main__":
     # --- INIT DB ---
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
@@ -6992,24 +7134,25 @@ if __name__ == "__main__":
     init_db()
     
     # Patch DB Tickets (Important)
-    try: tickets.patch_db_tickets()
-    except: pass
+    try:
+        tickets.patch_db_tickets()
+    except:
+        pass
         
     ensure_verifications_table()
     ensure_payment_table()
 
-    # --- FLASK (IVR) ---
+    # --- FLASK (IVR SERVER) ---
     flask_thread = threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False),
         daemon=True
     )
     flask_thread.start()
 
-    # --- TELEGRAM ---
+    # --- TELEGRAM BOT ---
     app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
     
-    # === CORRECTION CRITIQUE (Ce qui manquait) ===
-    # On capture la boucle d'événement pour éviter le crash 'NoneType'
+    # Capture de la boucle d'événement pour les tâches asynchrones (SignalWire/Animation)
     import asyncio
     try:
         loop = asyncio.get_event_loop()
@@ -7018,12 +7161,23 @@ if __name__ == "__main__":
         asyncio.set_event_loop(loop)
     bot_loop = loop
 
+    # Middleware de sécurité (Enforcement & Auto-lock)
     app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
-
     app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
-    # ============================================
 
-    # Ajout des Handlers (Ordre CRITIQUE)
+    # ====================================================
+    #      AJOUT DES HANDLERS (ORDRE DE PRIORITÉ)
+    # ====================================================
+
+    # 1. BOUTIQUE ET PANIER (Priorité Haute pour éviter les conflits)
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
+    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
+
+    # 2. CONVERSATIONS COMPLEXES (États multiples)
     app_telegram.add_handler(admin_search_conv, group=8)
     app_telegram.add_handler(admin_csv_conv, group=6)
     app_telegram.add_handler(admin_ivr_conv, group=7)
@@ -7032,11 +7186,10 @@ if __name__ == "__main__":
     app_telegram.add_handler(ccs_catalog_filter_conv)
     app_telegram.add_handler(payment_conv)
     app_telegram.add_handler(id_docs_conv)
-    app_telegram.add_handler(conv_handler) # Main Router
-    app_telegram.add_handler(admin_ticket_conv, group=9) # Admin Tickets
+    app_telegram.add_handler(admin_ticket_conv, group=9)
+    app_telegram.add_handler(conv_handler) # Main Router (Start, Verif, Support)
 
-    # Handlers Admin Loose
-    
+    # 3. COMMANDES ET CALLBACKS ADMIN
     app_telegram.add_handler(CommandHandler("clean_users", admin_clean_ghost_users))
     app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_\d+$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
@@ -7051,22 +7204,12 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_.*$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
     app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
-    app_telegram.add_handler(CallbackQueryHandler(history_filter_reset, pattern=r"^history_filter_reset$"), group=5)
-    
+    app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:.*$"))
     app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive), group=21)
     app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_customamount_receive), group=22)
 
-    # Handlers Tickets (Simples)
-    app_telegram.add_handler(CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"))
-    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
-    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
-    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
-    app_telegram.add_handler(CallbackQueryHandler(ticket_view_reply_handler, pattern="^view_reply:"))
-
-    # Réponse Magique Admin
-    app_telegram.add_handler(MessageHandler(filters.Chat(chat_id=int(tickets.CHANNEL_LOGS)) & filters.REPLY, tickets.admin_reply_native))
-
-    # Callbacks Généraux
+    # 4. CALLBACKS GÉNÉRAUX ET NAVIGATION
+    app_telegram.add_handler(CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"))
     app_telegram.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_\d+$"))
     app_telegram.add_handler(CallbackQueryHandler(callback_show_my_id, pattern="^show_my_id$"))
     app_telegram.add_handler(CallbackQueryHandler(choose_lang, pattern="^choose_lang$"))
@@ -7076,8 +7219,6 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(callback_support, pattern="^support$"))
     app_telegram.add_handler(CallbackQueryHandler(callback_faq, pattern="^faq$"))
     app_telegram.add_handler(CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$"))
-    
-    app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:.*$"))
     app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
     app_telegram.add_handler(CallbackQueryHandler(on_category, pattern=r"^cat:.+$"))
     app_telegram.add_handler(CallbackQueryHandler(hist_view_callback, pattern=r"^hist:view$"))
@@ -7088,30 +7229,24 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(auth_logout, pattern="^auth_logout$"))
     app_telegram.add_handler(CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"))
     app_telegram.add_handler(CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"))
+    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
+    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
+    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
+    app_telegram.add_handler(CallbackQueryHandler(ticket_view_reply_handler, pattern="^view_reply:"))
+    app_telegram.add_handler(MessageHandler(filters.Chat(chat_id=int(tickets.CHANNEL_LOGS)) & filters.REPLY, tickets.admin_reply_native))
 
-    # Shop Helpers
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_preview_callback, pattern=r"^prod:preview:\d+$"), group=-1)
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"), group=-1)
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"), group=-1)
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"), group=-1)
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"), group=-1)
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"), group=-1)
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"), group=-1)
-    app_telegram.add_handler(CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), group=0)
+    # 5. EN DERNIER : Le menu_handler (Capturer les clics non gérés)
     app_telegram.add_handler(CallbackQueryHandler(menu_handler))
 
-    
-
-    # Attachement Globals
+    # Attachement des données globales à bot_data
     app_telegram.bot_data['db_conn'] = db_conn
     app_telegram.bot_data['db'] = db_conn
     app_telegram.bot_data['get_user_balance'] = get_user_balance
     app_telegram.bot_data['update_user_balance'] = update_user_balance
     app_telegram.bot_data['create_transaction'] = create_transaction
 
-
-    # 4. Run
-    print("✅ BOT DÉMARRÉ.")
+    # 6. Démarrage final
+    print("✅ NOMEN NESCIO : SYSTÈME OPÉRATIONNEL.")
     app_telegram.run_polling(close_loop=False)
 
     while True:
