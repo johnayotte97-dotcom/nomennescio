@@ -5136,33 +5136,34 @@ def analyze_response():
     def _maybe_finish_batch(add_result_text=None):
         async def _notify_serialized():
             br = batch_runs.get(batch_id)
-            if not br:
-                return
+            if not br: return
 
             async with br.setdefault("lock", asyncio.Lock()):
                 
-                # --- DÉBUT DES MODIFICATIONS ---
-                
-                # 1. Gère l'envoi du message de résultat (valide/invalide)
+                # 1. Envoi du résultat (Valide/Invalide)
                 if add_result_text:
-                    await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text)
+                    # PATCH : Si c'est une COMMANDE, on reste silencieux ici.
+                    if "ORDER" not in str(batch_id):
+                        await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text)
                 
-                # 2. Gère la mise à jour du compteur de permis résolus
-                #    (Se déclenche 1 fois par personne, soit si valide, soit si 10e échec)
+                # 2. Mise à jour du compteur
                 if not state["resolved"] and (add_result_text or state.get("total", 0) >= 10): 
                     state["resolved"] = True
-                    br["resolved"] += 1 # Incrémente le compteur global du batch
+                    br["resolved"] += 1 
                 
-                # 3. Gère la fin du batch complet
+                # 3. Fin du batch
                 if br["resolved"] >= br["total"] and not br["notified"]:
-                    br["notified"] = True # CELA VA ARRÊTER LA BOUCLE D'ANIMATION
+                    br["notified"] = True 
                     
-                    # On n'édite plus ou ne supprime plus le message d'ici.
-                    # La tâche d'animation s'arrêtera d'elle-même.
+                    # PATCH CRITIQUE : Si c'est une COMMANDE, on s'arrête LÀ.
+                    # Pas de message "Fin", pas de retour menu. Le formulaire gère la suite.
+                    if "ORDER" in str(batch_id):
+                        logger.info(f"✅ Batch Commande {batch_id} terminé en silence.")
+                        return
 
+                    # Comportement normal (/verifier)
                     await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
                     await show_main_menu(user_id)
-                # --- FIN DES MODIFICATIONS ---
                     
         asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
 
@@ -5609,10 +5610,12 @@ async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     return ID_ASK_QTY
 
+# --- DÉBUT BLOC FORMULAIRE AVEC RETOUR ---
+
 async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     
-    # 1. Vérification du solde (SANS DÉBITER)
+    # 1. Vérification du solde
     total = context.user_data['id_product']['price'] * context.user_data['id_qty']
     if get_user_balance(user_id) < total:
         await context.bot.send_message(
@@ -5622,25 +5625,29 @@ async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
     
-    # 2. Lancement du formulaire (Nouveau message propre)
+    # 2. Lancement du formulaire
     context.user_data['cleanup_ids'] = []
     
-    # On force un send_message pour éviter l'erreur "message to edit not found"
+    # Bouton Annuler pour la première question
+    kb = [[InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]]
+    
     m = await context.bot.send_message(
         chat_id=user_id, 
         text="✍️ **FORMULAIRE (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?", 
+        reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
     context.user_data['cleanup_ids'].append(m.message_id)
-    
     return ID_ASK_NAME
 
 async def id_save_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_firstname'] = update.message.text.strip()
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id) # Track réponse user
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     
-    m = await update.message.reply_text("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?")
-    context.user_data['cleanup_ids'].append(m.message_id) # Track question bot
+    # Bouton retour vers Prénom
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_NAME}")]]
+    m = await update.message.reply_text("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_LASTNAME
 
 async def id_save_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5648,77 +5655,115 @@ async def id_save_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_name'] = f"{context.user_data['form_firstname']} {context.user_data['form_lastname']}"
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
 
+    # Bouton retour vers Nom
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
+    
     if context.user_data.get('id_category') == 'document':
         context.user_data['form_dob'] = "N/A"
-        m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
+        m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_STREET
     else:
-        m = await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)")
+        m = await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_DOB
 
 async def id_save_dob(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     clean_date = parse_date_smart(update.message.text)
+    
+    # En cas d'erreur, on garde aussi le bouton retour
     if not clean_date:
-        m = await update.message.reply_text("⚠️ Format invalide. Réessayez (ex: 15/05/1995).")
+        kb_err = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
+        m = await update.message.reply_text("⚠️ Format invalide. Réessayez (ex: 15/05/1995).", reply_markup=InlineKeyboardMarkup(kb_err))
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_DOB
+        
     context.user_data['form_dob'] = clean_date
-    m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :")
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOB}")]]
+    m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_STREET
 
 async def id_save_street(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_street'] = update.message.text
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    m = await update.message.reply_text("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?")
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_STREET}")]]
+    m = await update.message.reply_text("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_CITY
 
 async def id_save_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_city'] = update.message.text
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    m = await update.message.reply_text("📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?")
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_CITY}")]]
+    m = await update.message.reply_text("📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_ZIP
 
 async def id_save_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # La logique de validation reste la même, on ajoute juste le bouton Retour au clavier de confirmation
     zip_code = update.message.text.upper().strip()
     context.user_data['addr_zip'] = zip_code
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     
     raw = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {zip_code}"
     m_wait = await update.message.reply_text("🔍 Validation Google Maps...")
-    context.user_data['cleanup_ids'].append(m_wait.message_id) # On track le msg "validation"
+    context.user_data['cleanup_ids'].append(m_wait.message_id)
     
     suggestions = validate_address_google(raw)
     context.user_data['addr_suggestions'] = suggestions or [raw]
     
     kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(context.user_data['addr_suggestions'])]
     kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
+    # Ajout du bouton Retour ici aussi
+    kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")])
     
-    # On édite le message d'attente, l'ID ne change pas, donc c'est déjà tracké
     await m_wait.edit_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
     return ID_CONFIRM_ADDR
 
+
 async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    # Pas besoin de tracker q.message car c'est celui de l'étape d'avant (déjà tracké)
+    q = update.callback_query
+    await q.answer()
     
+    # Cas du bouton "Réécrire"
     if "retry" in q.data:
-        await q.edit_message_text("📍 Entrez le **Numéro et la Rue** :"); return ID_ASK_STREET
+        # On retourne au début de l'adresse (Rue)
+        # On détermine le retour arrière selon le type (Doc ou ID)
+        prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{prev}")]]
+        
+        await q.edit_message_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
+        return ID_ASK_STREET
     
-    idx = int(q.data.split(":")[1])
-    context.user_data['form_address'] = context.user_data['addr_suggestions'][idx]
+    # Cas du choix d'une adresse (addr_pick:0)
+    try:
+        idx = int(q.data.split(":")[1])
+        # On récupère l'adresse choisie dans la liste
+        suggestions = context.user_data.get('addr_suggestions', [])
+        if suggestions and 0 <= idx < len(suggestions):
+            context.user_data['form_address'] = suggestions[idx]
+        else:
+            # Fallback
+            raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}, {context.user_data.get('addr_zip')}"
+            context.user_data['form_address'] = raw
+    except:
+        pass
     
+    # Passage à l'étape suivante
     if context.user_data.get('id_category') == 'document':
-        await q.edit_message_text("🏢 **Nom de l'Employeur** ?")
+        # Si Document -> Employeur
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
+        await q.edit_message_text("🏢 **Nom de l'Employeur** ?", reply_markup=InlineKeyboardMarkup(kb))
         return ID_ASK_DOC_EMPLOYER
     else:
-        await q.edit_message_text("📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)")
+        # Si ID -> Date Émission
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
+        await q.edit_message_text("📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)", reply_markup=InlineKeyboardMarkup(kb))
         return ID_ASK_ISSUE
+
+# --- Note: id_confirm_addr_handler n'a pas besoin d'être modifié car il mène à Issue ---
 
 async def id_save_issue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
@@ -5729,71 +5774,57 @@ async def id_save_issue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_date = parse_date_smart(txt)
     
     if not clean_date:
-        m = await update.message.reply_text("⚠️ Date invalide.")
+        # En cas d'erreur, retour vers Confirmation Adresse
+        kb_err = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
+        m = await update.message.reply_text("⚠️ Date invalide.", reply_markup=InlineKeyboardMarkup(kb_err))
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_ISSUE
+        
     context.user_data['form_issue'] = clean_date
-    m = await update.message.reply_text("📅 **Quelle est l'Année d'Expiration ?**\n(Le jour/mois seront ceux de la naissance)\nEx: **2028**")
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ISSUE}")]]
+    m = await update.message.reply_text("📅 **Quelle est l'Année d'Expiration ?**\nEx: **2028**", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_EXPIRY
 
 async def id_save_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     
-    # 1. Validation Année
     year = update.message.text.strip()
     if not year.isdigit() or len(year) != 4:
-        m = await update.message.reply_text("⚠️ Entrez juste l'année (ex: 2029).")
+        kb_err = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ISSUE}")]]
+        m = await update.message.reply_text("⚠️ Entrez juste l'année (ex: 2029).", reply_markup=InlineKeyboardMarkup(kb_err))
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_EXPIRY
     
-    # 2. Enregistrement Date Expiration
     dob = context.user_data.get('form_dob', '2000-01-01')
     context.user_data['form_expiry'] = f"{year}-{dob[5:]}"
 
-    # 3. Génération de la Base du Permis (Algorithme SAAQ)
-    # On convertit YYYY-MM-DD vers DD-MM-YYYY pour ton algo
     try:
         d = datetime.strptime(dob, "%Y-%m-%d")
         date_fmt = d.strftime("%d-%m-%Y")
-        
-        prenom = context.user_data.get('form_firstname', '')
-        nom = context.user_data.get('form_lastname', '')
-        
-        # Appel à ta fonction existante
-        formatted, base = generer_permis(nom, prenom, date_fmt)
-        
-        # On stocke la base SANS les étoiles (ex: G1234123456)
-        clean_base = base[:11] # Les 11 premiers caractères (LLLL FDD MM YY)
+        formatted, base = generer_permis(context.user_data.get('form_lastname',''), context.user_data.get('form_firstname',''), date_fmt)
+        clean_base = base[:11]
         context.user_data['dl_base_code'] = clean_base
-        
-        # Format d'affichage (ex: G1234-123456-XX)
-        display_base = f"{formatted[:-2]}XX" 
-        
-    except Exception as e:
-        print(f"Erreur Génération DL: {e}")
-        # Fallback si l'algo échoue (noms bizarres etc)
-        await update.message.reply_text("🆔 **Numéro de Permis ?**")
-        return ID_ASK_DL_NUM
+        display_base = f"{formatted[:-2]}XX"
+    except:
+        display_base = "Erreur"
 
-    # 4. Affichage du Menu de Choix
     text = (
         "💳 **NUMÉRO DE PERMIS**\n\n"
-        f"Le système a calculé cette base : `{display_base}`\n\n"
-        "Que voulez-vous faire ?\n"
-        "1️⃣ **Vérifier SAAQ** : Le bot trouve les 2 derniers chiffres (Auto).\n"
-        "2️⃣ **Manuel** : Vous connaissez les 2 chiffres manquants."
+        f"Base : `{display_base}`\n\n"
+        "Que voulez-vous faire ?"
     )
-    
     kb = [
         [InlineKeyboardButton("🔍 Vérifier via SAAQ (Auto)", callback_data="dl_mode:saaq")],
-        [InlineKeyboardButton("✍️ Entrer les 2 chiffres", callback_data="dl_mode:manual")]
+        [InlineKeyboardButton("✍️ Entrer les 2 chiffres", callback_data="dl_mode:manual")],
+        # Bouton retour vers Expiration
+        [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")] 
     ]
-    
     m = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     context.user_data['cleanup_ids'].append(m.message_id)
-    
     return ID_ASK_DL_NUM
+
+# --- FIN BLOC FORMULAIRE ---
 
 async def id_handle_dl_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -6310,13 +6341,15 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💳 Permis : {api_data['form_dl_number']}\n"
             f"📛 Nom : {api_data['form_lastname']}\n"
             f"📛 Prénom : {api_data['form_firstname']}\n"
-            f"                                    🎂 DDN : {api_data['form_dob']}\n\n"
+            f"🎂 DDN : {api_data['form_dob']}\n"
             f"📍 Adresse : {api_data['form_street']}\n"
             f"🏙️ Ville: {api_data['form_city']}\n"
-            f"📨 CP: {api_data['form_zip']}                                    📏 Taille (cm): {api_data['form_height']}\n"
-            f"                                    🧬 Sexe: {api_data['form_sex']}\n\n"
+            f"📨 CP: {api_data['form_zip']}\n"
+            f"📏 Taille (cm): {api_data['form_height']}\n"
+            f" 🧬 Sexe: {api_data['form_sex']}\n"
             f"🔢 Référence : {api_data['form_ref_number']}\n"
-            f"📅 Valide : {api_data['form_issue']}                                 📅 Expiration : {api_data['form_expiry']}"
+            f"📅 Valide : {api_data['form_issue']}\n"
+            f"📅 Expiration : {api_data['form_expiry']}\n"
         )
 
         target_id = "-1003589564052" # Channel Logs
@@ -6350,6 +6383,130 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # 9. Retour Menu
     await show_main_menu(user.id)
+    return ConversationHandler.END
+
+async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le clic sur le bouton Retour dans le formulaire."""
+    q = update.callback_query
+    await q.answer()
+    
+    # On récupère l'étape cible via le callback_data (ex: "form_back:3005")
+    try:
+        target_state = int(q.data.split(":")[1])
+    except:
+        return # Sécurité
+        
+    # Helper pour ré-afficher la question avec le bon bouton Retour
+    async def show(text, kb_back_state=None):
+        kb = []
+        if kb_back_state is not None:
+            # S'il y a une étape avant, on met le bouton Retour vers celle-ci
+            kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{kb_back_state}")])
+        else:
+            # Si c'est la toute première étape, le bouton "Retour" est "Annuler"
+            kb.append([InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")])
+            
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+    # --- ROUTAGE DES RETOURS ---
+    
+    if target_state == ID_ASK_NAME:
+        await show("✍️ **FORMULAIRE (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?", kb_back_state=None)
+        return ID_ASK_NAME
+        
+    elif target_state == ID_ASK_LASTNAME:
+        await show("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?", kb_back_state=ID_ASK_NAME)
+        return ID_ASK_LASTNAME
+        
+    elif target_state == ID_ASK_DOB:
+        await show("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", kb_back_state=ID_ASK_LASTNAME)
+        return ID_ASK_DOB
+        
+    elif target_state == ID_ASK_STREET:
+        # Si c'est un document, on n'a pas demandé la DDN avant, mais le Nom. Sinon DDN.
+        prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
+        await show("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", kb_back_state=prev)
+        return ID_ASK_STREET
+        
+    elif target_state == ID_ASK_CITY:
+        await show("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?", kb_back_state=ID_ASK_STREET)
+        return ID_ASK_CITY
+        
+    elif target_state == ID_ASK_ZIP:
+        await show("📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?", kb_back_state=ID_ASK_CITY)
+        return ID_ASK_ZIP
+        
+    elif target_state == ID_CONFIRM_ADDR:
+        # On restaure les suggestions (ou on affiche l'adresse brute si pas de suggestion)
+        suggs = context.user_data.get('addr_suggestions', [])
+        raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}"
+        if not suggs: suggs = [raw]
+        
+        kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(suggs)]
+        kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
+        kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")])
+        
+        await q.edit_message_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
+        return ID_CONFIRM_ADDR
+        
+    elif target_state == ID_ASK_ISSUE:
+        await show("📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)", kb_back_state=ID_CONFIRM_ADDR)
+        return ID_ASK_ISSUE
+        
+    elif target_state == ID_ASK_EXPIRY:
+        await show("📅 **Quelle est l'Année d'Expiration ?**\n(Le jour/mois seront ceux de la naissance)\nEx: **2028**", kb_back_state=ID_ASK_ISSUE)
+        return ID_ASK_EXPIRY
+        
+    elif target_state == ID_ASK_DL_NUM:
+        # Pour le permis, on réaffiche le menu SAAQ vs Manuel
+        base = context.user_data.get('dl_base_code', 'Permis')
+        text = (
+            "💳 **NUMÉRO DE PERMIS**\n\n"
+            f"Base calculée : `{base}`\n\n"
+            "Que voulez-vous faire ?\n"
+            "1️⃣ **Vérifier SAAQ** (Auto)\n"
+            "2️⃣ **Manuel** (Saisie des 2 derniers chiffres)"
+        )
+        kb = [
+            [InlineKeyboardButton("🔍 Vérifier via SAAQ (Auto)", callback_data="dl_mode:saaq")],
+            [InlineKeyboardButton("✍️ Entrer les 2 chiffres", callback_data="dl_mode:manual")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")]
+        ]
+        await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return ID_ASK_DL_NUM
+        
+    elif target_state == ID_ASK_REF_NUM:
+        # On relance le générateur interactif qui gère son propre affichage
+        return await ask_ref_number_interactive(update, context)
+        
+    elif target_state == ID_ASK_SEX:
+        kb_sex = [
+            [InlineKeyboardButton("Homme (Male)", callback_data="sex:1"), 
+             InlineKeyboardButton("Femme (Female)", callback_data="sex:2")],
+            [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_REF_NUM}")]
+        ]
+        await q.edit_message_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb_sex))
+        return ID_ASK_SEX
+        
+    elif target_state == ID_ASK_HEIGHT:
+        await show("📏 **Quelle est votre taille ?**\n_(Entrez uniquement les chiffres en cm, ex: 175)_", kb_back_state=ID_ASK_SEX)
+        return ID_ASK_HEIGHT
+        
+    elif target_state == ID_ASK_EYES:
+        kb = [
+            [InlineKeyboardButton("Brun (Brown)", callback_data="eye:BRO"), InlineKeyboardButton("Bleu (Blue)", callback_data="eye:BLU")],
+            [InlineKeyboardButton("Vert (Green)", callback_data="eye:GRN"), InlineKeyboardButton("Noisette (Hazel)", callback_data="eye:HZL")],
+            [InlineKeyboardButton("Gris (Grey)", callback_data="eye:GRY"), InlineKeyboardButton("Noir (Black)", callback_data="eye:BLK")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_HEIGHT}")]
+        ]
+        await q.edit_message_text("👁️ **Couleur des yeux ?**", reply_markup=InlineKeyboardMarkup(kb))
+        return ID_ASK_EYES
+        
+    elif target_state == ID_ASK_PHOTO:
+        await show("📸 **Envoyez votre photo (Selfie)**", kb_back_state=ID_ASK_EYES)
+        return ID_ASK_PHOTO
+
     return ConversationHandler.END
 
 async def id_save_employer(u,c): 
@@ -7423,33 +7580,70 @@ id_docs_conv = ConversationHandler(
         ],
         ID_CONFIRM_BUY: [CallbackQueryHandler(id_start_form, pattern="^id_confirm_pay$")],
         
-        # Formulaire - Identité & Dates
-        ID_ASK_NAME: [MessageHandler(filters.TEXT, id_save_firstname)],
-        ID_ASK_LASTNAME: [MessageHandler(filters.TEXT, id_save_lastname)],
-        ID_ASK_DOB: [MessageHandler(filters.TEXT, id_save_dob)],
-        ID_ASK_STREET: [MessageHandler(filters.TEXT, id_save_street)],
-        ID_ASK_CITY: [MessageHandler(filters.TEXT, id_save_city)],
-        ID_ASK_ZIP: [MessageHandler(filters.TEXT, id_save_zip)],
-        ID_CONFIRM_ADDR: [CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
-        ID_ASK_ISSUE: [MessageHandler(filters.TEXT, id_save_issue)],
-        ID_ASK_EXPIRY: [MessageHandler(filters.TEXT, id_save_expiry)],
-        
-        # --- MODIFICATION 1 : Système SAAQ (Choix Auto/Manuel) ---
+        # --- FORMULAIRE (AVEC BOUTON RETOUR PARTOUT) ---
+        ID_ASK_NAME: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"), # Retour
+            MessageHandler(filters.TEXT, id_save_firstname)
+        ],
+        ID_ASK_LASTNAME: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_lastname)
+        ],
+        ID_ASK_DOB: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_dob)
+        ],
+        ID_ASK_STREET: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_street)
+        ],
+        ID_ASK_CITY: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_city)
+        ],
+        ID_ASK_ZIP: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_zip)
+        ],
+        ID_CONFIRM_ADDR: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")
+        ],
+        ID_ASK_ISSUE: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_issue)
+        ],
+        ID_ASK_EXPIRY: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_expiry)
+        ],
         ID_ASK_DL_NUM: [
-            CallbackQueryHandler(id_handle_dl_method, pattern="^dl_mode:"), # Choix du mode
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_manual_digits) # Saisie des 2 chiffres
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(id_handle_dl_method, pattern="^dl_mode:"), 
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_manual_digits)
         ],
-        
-        # --- MODIFICATION 2 : Système de Référence Interactif ---
         ID_ASK_REF_NUM: [
-            CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"), # Boutons (Générer/Accepter)
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)   # Saisie manuelle si besoin
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"), 
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)
         ], 
-
-        # Formulaire - Physique
-        ID_ASK_SEX: [CallbackQueryHandler(id_save_sex, pattern="^sex:")],
-        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT, id_save_height)],
-        ID_ASK_EYES: [CallbackQueryHandler(id_save_eyes, pattern="^eye:"), MessageHandler(filters.TEXT, id_save_eyes)],
+        ID_ASK_SEX: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(id_save_sex, pattern="^sex:")
+        ],
+        ID_ASK_HEIGHT: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.TEXT, id_save_height)
+        ],
+        ID_ASK_EYES: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(id_save_eyes, pattern="^eye:"), 
+            MessageHandler(filters.TEXT, id_save_eyes)
+        ],
+        ID_ASK_PHOTO: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            MessageHandler(filters.PHOTO, id_save_photo)
+        ],
         
         # Résumé & Edition
         ID_CONFIRM_SUMMARY: [
@@ -7464,8 +7658,6 @@ id_docs_conv = ConversationHandler(
             MessageHandler(filters.TEXT, id_receive_new_value), 
             CallbackQueryHandler(id_open_edit_menu, pattern="^cancel_edit_input$")
         ],
-        
-        ID_ASK_PHOTO: [MessageHandler(filters.PHOTO, id_save_photo)],
         
         # Docs Extras
         ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT, id_save_employer)],
@@ -7484,74 +7676,6 @@ id_docs_conv = ConversationHandler(
     name="id_docs_conversation"
 )
 
-# ID/DOCS CONVERSATION (MANQUANT)
-# ==============================================================================
-id_docs_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
-    states={
-        ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
-        ID_PROD_VIEW: [
-            CallbackQueryHandler(id_view_product, pattern="^id_view:"),
-            CallbackQueryHandler(id_start_buy, pattern="^id_buy:"),
-            CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"),
-            CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"),
-        ],
-        # Quantité
-        ID_ASK_QTY: [
-            CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_"),
-            CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
-        ],
-        ID_CONFIRM_BUY: [CallbackQueryHandler(id_start_form, pattern="^id_confirm_pay$")],
-        
-        # Formulaire
-        ID_ASK_NAME: [MessageHandler(filters.TEXT, id_save_firstname)],
-        ID_ASK_LASTNAME: [MessageHandler(filters.TEXT, id_save_lastname)],
-        ID_ASK_DOB: [MessageHandler(filters.TEXT, id_save_dob)],
-        ID_ASK_STREET: [MessageHandler(filters.TEXT, id_save_street)],
-        ID_ASK_CITY: [MessageHandler(filters.TEXT, id_save_city)],
-        ID_ASK_ZIP: [MessageHandler(filters.TEXT, id_save_zip)],
-        ID_CONFIRM_ADDR: [CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
-        ID_ASK_ISSUE: [MessageHandler(filters.TEXT, id_save_issue)],
-        ID_ASK_EXPIRY: [MessageHandler(filters.TEXT, id_save_expiry)],
-        ID_ASK_DL_NUM: [MessageHandler(filters.TEXT, id_save_dl_num)],
-        ID_ASK_REF_NUM: [MessageHandler(filters.TEXT, id_save_ref_num)], 
-        ID_ASK_SEX: [CallbackQueryHandler(id_save_sex, pattern="^sex:")],
-        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT, id_save_height)],
-        ID_ASK_EYES: [CallbackQueryHandler(id_save_eyes, pattern="^eye:"), MessageHandler(filters.TEXT, id_save_eyes)],
-        
-        # Résumé & Edition
-        ID_CONFIRM_SUMMARY: [
-            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"),
-            CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$")
-        ],
-        ID_EDIT_MENU: [
-            CallbackQueryHandler(id_handle_edit_choice, pattern="^do_edit:"), 
-            CallbackQueryHandler(id_show_summary, pattern="^back_to_summary$")
-        ],
-        ID_EDIT_INPUT: [
-            MessageHandler(filters.TEXT, id_receive_new_value), 
-            CallbackQueryHandler(id_open_edit_menu, pattern="^cancel_edit_input$")
-        ],
-        
-        ID_ASK_PHOTO: [MessageHandler(filters.PHOTO, id_save_photo)],
-        
-        # Docs Extras
-        ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT, id_save_employer)],
-        ID_ASK_DOC_JOB: [MessageHandler(filters.TEXT, id_save_job)],
-        ID_ASK_DOC_ADDR: [MessageHandler(filters.TEXT, id_save_emp_addr)],
-        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")],
-        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT, id_save_hours)],
-        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT, id_save_rate)],
-        ID_ASK_DOC_SIN: [CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"), MessageHandler(filters.TEXT, id_save_sin_or_range)],
-    },
-    fallbacks=[
-        CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
-        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", goto_menu)
-    ],
-    name="id_docs_conversation"
-)
 
 # ==============================================================================
 # 🧩 SYSTÈME DE VERROUILLAGE AUTO (INACTIVITÉ)
@@ -7697,6 +7821,96 @@ async def admin_clean_ghost_users(update: Update, context: ContextTypes.DEFAULT_
     con.close()
     
     await update.message.reply_text(f"🗑️ **Nettoyage terminé !**\n{count} utilisateurs fantômes (solde 0$) ont été supprimés.")
+
+# 1. GESTIONNAIRE DES TICKETS (Correction: "tickets." retiré devant la fonction)
+admin_ticket_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")], 
+    states={
+        tickets.ADMIN_TICKET_REPLY: [
+            CallbackQueryHandler(admin_handle_virtual_click, pattern="^adm_vkey:"),
+            CallbackQueryHandler(admin_menu, pattern="^admin_menu$")
+        ]
+    },
+    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
+)
+
+# 2. ROUTEUR PRINCIPAL (Start, Vérif, Outils, Compte)
+conv_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("start", start),
+        CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
+        CallbackQueryHandler(show_tools_menu, pattern="^section_tools$"),
+        CallbackQueryHandler(auth_import_start, pattern="^auth_import_start$"),
+        CallbackQueryHandler(auth_create_start, pattern="^auth_create$"),
+        CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"),
+        # 👇 CORRECTION ICI : Ajout de "tickets." devant start_support
+        CallbackQueryHandler(tickets.start_support, pattern="^support$"),
+    ],
+    states={
+        # --- AUTHENTIFICATION ---
+        ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT, auth_create_pin_save)],
+        ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
+        ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT, auth_import_verify)],
+        
+        # --- BOÎTE À OUTILS ---
+        SELECT_TOOL: [
+            CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
+            CallbackQueryHandler(tool_ask_hlr, pattern="^tool_hlr$"),
+            CallbackQueryHandler(show_sms_menu, pattern="^tool_5sim$"),
+            CallbackQueryHandler(tool_placeholder, pattern="^tool_cc_checker$"),
+            CallbackQueryHandler(acc_ask_pin, pattern="^acc_change_pin$"),
+            CallbackQueryHandler(acc_timeout_menu, pattern="^acc_timeout_menu$"),
+            CallbackQueryHandler(acc_ask_user, pattern="^acc_set_user$"),
+            CallbackQueryHandler(acc_ask_jabber, pattern="^acc_set_jabber$"),
+            CallbackQueryHandler(acc_reset_ask, pattern="^acc_reset_seed$"),
+            CallbackQueryHandler(handle_buy_sms, pattern="^buy_sms:"), 
+            CallbackQueryHandler(sms_control_callback, pattern="^sms_ban_"),
+            CallbackQueryHandler(acc_set_timeout, pattern="^set_timeout_"),
+            CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")
+        ],
+        WAIT_HLR_NUMBER: [MessageHandler(filters.TEXT, tool_process_hlr)],
+        
+        # --- GESTION COMPTE ---
+        ACC_WAIT_NEW_PIN: [MessageHandler(filters.TEXT, acc_save_pin)],
+        ACC_WAIT_USERNAME: [MessageHandler(filters.TEXT, acc_save_user)],
+        ACC_WAIT_JABBER: [MessageHandler(filters.TEXT, acc_save_jabber)],
+        ACC_WAIT_RESET_CONFIRM: [CallbackQueryHandler(acc_reset_confirm, pattern="^confirm_reset_seed$")],
+
+        # --- VÉRIFICATION PERMIS (MULTI & UNIQUE) ---
+        ASK_QTY: [MessageHandler(filters.TEXT, ask_qty)],
+        ASK_MODE: [
+            CallbackQueryHandler(choose_mode_manual, pattern="^mode_manual$"),
+            CallbackQueryHandler(choose_mode_csv, pattern="^mode_csv$")
+        ],
+        MANUAL_PRENOM: [MessageHandler(filters.TEXT, manual_receive_prenom)],
+        MANUAL_NOM: [MessageHandler(filters.TEXT, manual_receive_nom)],
+        MANUAL_DATE: [MessageHandler(filters.TEXT, manual_receive_date)],
+        CSV_WAIT: [MessageHandler(filters.Document.ALL, csv_receive_file)],
+        BULK_CONFIRM: [MessageHandler(filters.TEXT, bulk_confirm)],
+        
+        ASK_PRENOM: [MessageHandler(filters.TEXT, receive_prenom)],
+        ASK_NOM: [MessageHandler(filters.TEXT, receive_nom)],
+        ASK_DATE: [MessageHandler(filters.TEXT, receive_date)],
+        CONFIRM_VERIF: [MessageHandler(filters.TEXT, confirm_permis)],
+        
+        # --- SUPPORT CLIENT ---
+        # 👇 CORRECTION ICI : Ajout de "tickets." devant save_category
+        tickets.WAIT_CATEGORY: [CallbackQueryHandler(tickets.save_category, pattern="^ticket_cat:")],
+        # 👇 CORRECTION ICI : Ajout de "tickets." devant handle_ticket_msg
+        tickets.WAIT_TICKET_MSG: [MessageHandler(filters.TEXT, tickets.handle_ticket_msg)],
+        
+        TICKET_DRAFT: [
+            CallbackQueryHandler(ticket_handle_virtual_click, pattern="^vkey:"),
+            MessageHandler(filters.TEXT, ticket_reject_physical)
+        ]
+    },
+    fallbacks=[
+        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
+        CommandHandler("start", goto_menu),
+        CallbackQueryHandler(ticket_resume, pattern="^ticket_resume:")
+    ],
+    name="main_conversation"
+)
 
 if __name__ == "__main__":
     # --- INIT DB ---
