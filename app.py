@@ -1807,7 +1807,7 @@ async def goto_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
 
     # affiche le menu principal proprement
-    # On utilise clear=True pour que show_main_menu nettoie les messages de 'bot_messages' (sécurité)
+    # On utilise clear=True pour que show_main_ nettoie les messages de 'bot_messages' (sécurité)
     await show_main_menu(user_id, clear=True) 
 
     # stoppe toute attente de réponse (empêche "1 ou 2")
@@ -2117,11 +2117,55 @@ async def hist_menu(update, context):
     q = update.callback_query
     await q.answer()
     kb = [
+        [InlineKeyboardButton("🆔 IDs & Physical", callback_data="hist:ids")],
         [InlineKeyboardButton("👥 Pro's",  callback_data="hist:pros"),
          InlineKeyboardButton("🚗 Permis", callback_data="hist:permis")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     ]
     await replace_view(q, "📜 Choisissez une section :", reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_ids_history(update, context):
+    """Affiche l'historique filtré pour ID et PHYSICAL"""
+    q = update.callback_query
+    await q.answer()
+    user_id = str(update.effective_user.id)
+    
+    con = sqlite3.connect(DB_NAME)
+    cursor = con.cursor()
+    
+    # On cherche tout ce qui contient 'ID' ou 'PHYSICAL' dans la catégorie
+    cursor.execute("""
+        SELECT ticket_id, category, status, created_at 
+        FROM support_tickets 
+        WHERE user_id = ? AND (category LIKE '%ID%' OR category LIKE '%PHYSICAL%')
+        ORDER BY ticket_id DESC LIMIT 10
+    """, (user_id,))
+    
+    rows = cursor.fetchall()
+    con.close()
+
+    if not rows:
+        kb_vide = [[InlineKeyboardButton("⬅️ Retour", callback_data="hist_view")]] 
+        await replace_view(q, "🆔 **Aucune commande d'ID trouvée.**", reply_markup=InlineKeyboardMarkup(kb_vide))
+        return
+
+    # Création de la liste
+    kb = []
+    for row in rows:
+        tid, cat, status, date = row
+        
+        # Petite icône de statut
+        icon = "🟢" if status == 'closed' else "🟡"
+        if status == 'rejected': icon = "🔴"
+        
+        btn_txt = f"{icon} {cat} ({date.split()[0]})"
+        # On redirige vers ta vue de détail (usr_ord_...)
+        kb.append([InlineKeyboardButton(btn_txt, callback_data=f"usr_ord_{tid}")])
+
+    # Bouton retour vers le menu historique (pas l'accueil)
+    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="hist_view")])
+
+    await replace_view(q, "🆔 **VOS COMMANDES D'IDs :**", reply_markup=InlineKeyboardMarkup(kb))
 
 # CODE À COLLER À LA LIGNE 1056
 async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2282,10 +2326,6 @@ async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Ajouter tous les messages (fiches + nav) à la liste pour suppression future
     context.user_data["hist_msgs"] = sent_messages + [pagination_msg.message_id]
-
-
-
-
 
 
 
@@ -7407,6 +7447,7 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
     app_telegram.add_handler(CallbackQueryHandler(on_category, pattern=r"^cat:.+$"))
     app_telegram.add_handler(CallbackQueryHandler(hist_view_callback, pattern=r"^hist:view$"))
+    app_telegram.add_handler(CallbackQueryHandler(show_ids_history, pattern="^hist:ids$"))
     app_telegram.add_handler(CallbackQueryHandler(hist_pros, pattern=r"^hist:pros(:page:\d+)?$"))
     app_telegram.add_handler(CallbackQueryHandler(hist_permis, pattern=r"^hist:permis(:page:\d+)?$"))
     app_telegram.add_handler(CallbackQueryHandler(close_history, pattern=r"^close_history$"))
