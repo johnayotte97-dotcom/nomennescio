@@ -125,7 +125,15 @@ async def admin_view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await admin_list_tickets(update, context)
     
     uid, uname, cat, msg_content, date = row
-    txt = f"🎫 **TICKET #{tid}**\n👤 {uname or 'Inconnu'} (`{uid}`)\n📂 {cat}\n📅 {date}\n\n📝 `{msg_content}`"
+
+    clean_date = str(date).strip()
+
+    txt = (
+                f"🎫 **TICKET #{tid}**\n"
+                f"👤 {uname or 'Inconnu'} (`{uid}`)\n"
+                f"📂 {cat}\n"
+                f"📅 {clean_date}"
+            )
     
     kb = [
         [InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{tid}_{uid}")],
@@ -137,13 +145,39 @@ async def admin_view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_ask_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    
+    # On récupère les infos depuis le bouton (format: adm_ticket_rep_TICKETID_USERID)
     data = q.data.split("_")
-    context.user_data['reply_tid'] = data[3]
-    context.user_data['reply_uid'] = data[4]
+    tid = data[3]
+    uid = data[4]
+    
+    # Sauvegarde dans le contexte pour la suite
+    context.user_data['reply_tid'] = tid
+    context.user_data['reply_uid'] = uid
+    
+    # --- AJOUT : Récupération du message original pour l'afficher ---
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT message, username FROM support_tickets WHERE ticket_id=?", (tid,))
+    row = cur.fetchone()
+    con.close()
+    
+    user_msg = row[0] if row else "(Message introuvable)"
+    username = row[1] if row and row[1] else "Client"
+    # ---------------------------------------------------------------
+    
+    # Affichage propre
+    text = (
+        f"✍️ **RÉPONSE AU TICKET #{tid}**\n"
+        f"👤 Client : {username}\n"
+        f"💬 Message : `{user_msg}`\n\n"
+        "👉 **Écrivez votre réponse maintenant :**"
+    )
     
     await q.message.reply_text(
-        f"✍️ **Réponse pour le ticket #{data[3]} :**\nÉcrivez votre message :",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Annuler", callback_data="admin_tickets_list")]])
+        text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Annuler", callback_data="admin_tickets_list")]]),
+        parse_mode="Markdown"
     )
     return ADMIN_TICKET_REPLY
 
@@ -152,38 +186,28 @@ async def admin_send_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = context.user_data.get('reply_uid')
     msg_resp = update.message.text
     
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
     try:
-        # 1. Envoi du message direct au client via le bot
+        # 1. On insère la réponse dans l'historique (Table ticket_messages)
+        cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", (tid, msg_resp))
+        
+        # 2. ✅ CRUCIAL : On met le statut à 'replied' (et PAS 'closed')
+        # C'est ce statut spécifique qui fait apparaître le bouton rouge chez le client.
+        cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
+        con.commit()
+
+        # 3. Envoi de la notif
         await context.bot.send_message(
             chat_id=uid,
             text=f"👨‍💻 **SUPPORT (Ticket #{tid}) :**\n━━━━━━━━━━━━━━━━━━\n{msg_resp}",
             parse_mode="Markdown"
         )
-        
-        # 2. Connexion à la base de données pour l'historique et le statut
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        
-        # Enregistrement dans la table d'historique pour le fil de discussion client
-        cur.execute(
-            "INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", 
-            (tid, msg_resp)
-        )
-        
-        # Mise à jour du statut en 'replied' pour déclencher l'affichage du bouton chez le client
-        cur.execute(
-            "UPDATE support_tickets SET status='replied' WHERE ticket_id=?", 
-            (tid,)
-        )
-        
-        con.commit()
-        con.close()
-        
-        await update.message.reply_text("✅ Réponse envoyée et historique mis à jour.")
-        
+        await update.message.reply_text("✅ Réponse envoyée et ticket mis à jour (replied).")
     except Exception as e:
-        # Log de l'erreur en cas de problème SQL ou d'envoi
-        await update.message.reply_text(f"⚠️ Échec de l'opération : {e}")
+        await update.message.reply_text(f"⚠️ Erreur SQL : {e}")
+    finally:
+        con.close()
         
     return ConversationHandler.END
 
@@ -197,31 +221,55 @@ async def admin_close_no_reply(update: Update, context: ContextTypes.DEFAULT_TYP
     await admin_list_tickets(update, context)
 
 async def admin_reply_native(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Réponse rapide via Reply dans le canal de logs."""
-    if not update.message.reply_to_message: return
+    """
+    Réponse rapide depuis le canal de logs.
+    Sauvegarde le message mais envoie seulement une notification générique au client.
+    """
+    # On vérifie que c'est bien une réponse à un message
+    if not update.message.reply_to_message:
+        return
+
+    # On récupère le texte du message auquel on répond pour trouver l'ID du ticket
     orig = update.message.reply_to_message.text or ""
     match = re.search(r"TICKET #(\d+)", orig)
+    
     if match:
-        tid = match.group(1)
+        tid = match.group(1) # L'ID dynamique (ex: 124)
+        
         con = sqlite3.connect(DB_NAME)
         cur = con.cursor()
+        
+        # On récupère l'ID du client propriétaire du ticket
         cur.execute("SELECT user_id FROM support_tickets WHERE ticket_id=?", (tid,))
         row = cur.fetchone()
         
         if row:
             uid = row[0]
+            msg_text = update.message.text # Votre vrai message (ex: "C'est fait merci")
+            
             try:
-                msg_text = update.message.text
-                await context.bot.send_message(chat_id=uid, text=f"👨‍💻 **SUPPORT :**\n{msg_text}", parse_mode="Markdown")
+                # 1. SAUVEGARDE EN BASE (Crucial pour que le client puisse lire le message plus tard)
                 cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", (tid, msg_text))
                 cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
                 con.commit()
-                await update.message.set_reaction("👍")
-            except Exception as e:
-                await update.message.reply_text(f"❌ Erreur: {e}")
-        con.close()
 
-# --- PARTIE CLIENT ---
+                # 2. ENVOI DE LA NOTIFICATION GÉNÉRIQUE (Ce que vous avez demandé)
+                custom_message = f"⚠️ *Vous avez reçu un message, veuillez consulter le ticket #{tid}*"
+                
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=custom_message,
+                    parse_mode="Markdown"
+                )
+                
+                # Petit feedback pour vous dire que c'est envoyé
+                await update.message.set_reaction("👍")
+                
+            except Exception as e:
+                await update.message.reply_text(f"❌ Erreur d'envoi : {e}")
+        
+        con.close()
+        
 async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q: await q.answer()
@@ -243,29 +291,40 @@ async def save_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAIT_TICKET_MSG
 
 async def handle_ticket_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Crée le ticket et insère le premier message dans l'historique."""
+    """Crée le ticket et envoie la notif Admin avec le bouton 'Ouvrir'."""
     user = update.effective_user
     msg = update.message.text
     cat = context.user_data.get('ticket_cat', 'GENERAL')
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    # 1. Ticket principal
+    
+    # 1. Création Ticket
     cur.execute("INSERT INTO support_tickets (user_id, username, category, message, status) VALUES (?,?,?,?,?)",
                 (str(user.id), user.username or user.first_name, cat, msg, 'open'))
     tid = cur.lastrowid
     
-    # 2. Premier message dans l'historique
+    # 2. Historique
     cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'user', ?)", (tid, msg))
     
-    con.commit(); con.close()
+    con.commit()
+    con.close()
     
+    # Confirmation au client
     await update.message.reply_text(f"✅ **Ticket #{tid} créé.**\nOn vous répond bientôt.")
+    
     try:
-        # Notif admin optimisée
-        kb_admin = InlineKeyboardMarkup([[InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{tid}_{user.id}")]])
-        await context.bot.send_message(chat_id=CHANNEL_LOGS, text=f"🚨 **NOUVEAU TICKET # {tid}**\n👤 {user.id} (@{user.username})\n📂 {cat}\n📝 {msg}", reply_markup=kb_admin)
+        # Notif admin
+        # 👇 CHANGEMENT ICI : "📂 Ouvrir" au lieu de "✍️ Répondre"
+        kb_admin = InlineKeyboardMarkup([[InlineKeyboardButton("📂 Ouvrir", callback_data=f"adm_ticket_rep_{tid}_{user.id}")]])
+        
+        await context.bot.send_message(
+            chat_id=CHANNEL_LOGS, 
+            text=f"🚨 **NOUVEAU TICKET # {tid}**\n👤 {user.id} (@{user.username})\n📂 {cat}\n📝 {msg}", 
+            reply_markup=kb_admin
+        )
     except: pass
+    
     return ConversationHandler.END
 
 # Fonctions dummy pour compatibilité app.py
