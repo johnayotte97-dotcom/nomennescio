@@ -5610,116 +5610,192 @@ async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
     return ID_ASK_QTY
 
+async def cleanup_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Supprime tous les messages de l'historique sauf le dernier."""
+    cleanup_list = context.user_data.get('cleanup_ids', [])
+    if len(cleanup_list) > 1: # On garde au moins 1 message (le dernier bot msg)
+        for msg_id in cleanup_list[:-1]:
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except: pass
+        context.user_data['cleanup_ids'] = [cleanup_list[-1]]
+
 # --- DÉBUT BLOC FORMULAIRE AVEC RETOUR ---
+
+async def clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Supprime tous les messages enregistrés (Question précédente + Réponse utilisateur)
+    pour garder l'écran propre.
+    """
+    chat_id = update.effective_chat.id
+    
+    # 1. On ajoute le message que l'utilisateur vient d'envoyer (ex: "Benjamin") à la liste
+    if update.message:
+        context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+        
+    # 2. On supprime TOUT ce qu'il y a dans la liste
+    ids_to_delete = context.user_data.get('cleanup_ids', [])
+    for mid in ids_to_delete:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except:
+            pass # Si déjà supprimé ou introuvable, on ignore
+            
+    # 3. On remet la liste à zéro pour la prochaine étape
+    context.user_data['cleanup_ids'] = []
 
 async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     
-    # 1. Vérification du solde
+    # Vérif solde... (inchangé)
     total = context.user_data['id_product']['price'] * context.user_data['id_qty']
     if get_user_balance(user_id) < total:
-        await context.bot.send_message(
-            chat_id=user_id, 
-            text=f"❌ **Solde insuffisant.**\nRequis : {total:.2f}$ CAD.", 
-            reply_markup=kb_back_to_menu()
-        )
+        await context.bot.send_message(chat_id=user_id, text=f"❌ Solde insuffisant.", reply_markup=kb_back_to_menu())
         return ConversationHandler.END
     
-    # 2. Lancement du formulaire
+    # On initialise la liste
     context.user_data['cleanup_ids'] = []
     
-    # Bouton Annuler pour la première question
+    # On envoie la première question
     kb = [[InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]]
-    
     m = await context.bot.send_message(
         chat_id=user_id, 
         text="✍️ **FORMULAIRE (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?", 
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
+    # On sauvegarde l'ID de ce message pour le supprimer plus tard
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_NAME
 
 async def id_save_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1. Sauvegarde la donnée
     context.user_data['form_firstname'] = update.message.text.strip()
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     
-    # Bouton retour vers Prénom
+    # 2. NETTOYAGE (Supprime la question d'avant et la réponse "Benjamin")
+    await clean_chat(update, context)
+    
+    # 3. Envoie la nouvelle question
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_NAME}")]]
-    m = await update.message.reply_text("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?", reply_markup=InlineKeyboardMarkup(kb))
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    
+    # 4. On track le nouveau message
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_LASTNAME
 
 async def id_save_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_lastname'] = update.message.text.strip()
-    context.user_data['form_name'] = f"{context.user_data['form_firstname']} {context.user_data['form_lastname']}"
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    
+    # NETTOYAGE
+    await clean_chat(update, context)
 
-    # Bouton retour vers Nom
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
     
     if context.user_data.get('id_category') == 'document':
         context.user_data['form_dob'] = "N/A"
-        m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", 
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_STREET
     else:
-        m = await update.message.reply_text("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", reply_markup=InlineKeyboardMarkup(kb))
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", 
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_DOB
 
 async def id_save_dob(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     clean_date = parse_date_smart(update.message.text)
     
-    # En cas d'erreur, on garde aussi le bouton retour
+    # Si erreur, on ne nettoie PAS tout de suite pour laisser l'utilisateur voir son erreur, 
+    # ou alors on nettoie et on réaffiche le message d'erreur proprement.
+    # Option "Propre" :
+    await clean_chat(update, context) 
+    
     if not clean_date:
         kb_err = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
-        m = await update.message.reply_text("⚠️ Format invalide. Réessayez (ex: 15/05/1995).", reply_markup=InlineKeyboardMarkup(kb_err))
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ **Format invalide.**\nRéessayez (ex: 15/05/1995).",
+            reply_markup=InlineKeyboardMarkup(kb_err),
+            parse_mode="Markdown"
+        )
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_DOB
         
     context.user_data['form_dob'] = clean_date
+    
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOB}")]]
-    m = await update.message.reply_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_STREET
 
 async def id_save_street(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_street'] = update.message.text
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    await clean_chat(update, context)
+    
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_STREET}")]]
-    m = await update.message.reply_text("🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?", reply_markup=InlineKeyboardMarkup(kb))
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_CITY
 
 async def id_save_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_city'] = update.message.text
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    await clean_chat(update, context)
+    
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_CITY}")]]
-    m = await update.message.reply_text("📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?", reply_markup=InlineKeyboardMarkup(kb))
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
     context.user_data['cleanup_ids'].append(m.message_id)
     return ID_ASK_ZIP
 
 async def id_save_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # La logique de validation reste la même, on ajoute juste le bouton Retour au clavier de confirmation
     zip_code = update.message.text.upper().strip()
     context.user_data['addr_zip'] = zip_code
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    
+    await clean_chat(update, context)
     
     raw = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {zip_code}"
-    m_wait = await update.message.reply_text("🔍 Validation Google Maps...")
-    context.user_data['cleanup_ids'].append(m_wait.message_id)
+    # Message temporaire de chargement
+    m_wait = await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 Validation Google Maps...")
     
     suggestions = validate_address_google(raw)
     context.user_data['addr_suggestions'] = suggestions or [raw]
     
     kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(context.user_data['addr_suggestions'])]
     kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
-    # Ajout du bouton Retour ici aussi
     kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")])
     
+    # On édite le message de chargement (ou on le remplace)
+    # Comme c'est le seul message à l'écran, on le track
     await m_wait.edit_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'].append(m_wait.message_id)
+    
     return ID_CONFIRM_ADDR
 
 
@@ -6386,30 +6462,43 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère le clic sur le bouton Retour dans le formulaire."""
+    """Gère le clic sur le bouton Retour dans le formulaire et NETTOIE l'écran."""
     q = update.callback_query
     await q.answer()
     
-    # On récupère l'étape cible via le callback_data (ex: "form_back:3005")
+    # --- NETTOYAGE (SUPPRESSION DES ANCIENS MESSAGES) ---
+    chat_id = update.effective_chat.id
+    cleanup_list = context.user_data.get('cleanup_ids', [])
+    
+    # On garde seulement le message actuel (celui du bouton cliqué) pour l'éditer plus tard
+    # On supprime tout le reste (les réponses précédentes du user, les vieilles questions...)
+    if len(cleanup_list) > 1:
+        for msg_id in cleanup_list[:-1]: # Tout sauf le dernier
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except:
+                pass # Si déjà supprimé, on ignore
+        
+        # On ne garde que le dernier ID (le message actuel) dans la liste
+        context.user_data['cleanup_ids'] = [cleanup_list[-1]]
+    # ----------------------------------------------------
+
     try:
         target_state = int(q.data.split(":")[1])
     except:
         return # Sécurité
         
-    # Helper pour ré-afficher la question avec le bon bouton Retour
     async def show(text, kb_back_state=None):
         kb = []
         if kb_back_state is not None:
-            # S'il y a une étape avant, on met le bouton Retour vers celle-ci
             kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{kb_back_state}")])
         else:
-            # Si c'est la toute première étape, le bouton "Retour" est "Annuler"
             kb.append([InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")])
             
+        # On édite le message actuel (qui est maintenant le seul restant)
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-    # --- ROUTAGE DES RETOURS ---
-    
+    # --- ROUTAGE DES RETOURS (Rien ne change ici) ---
     if target_state == ID_ASK_NAME:
         await show("✍️ **FORMULAIRE (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?", kb_back_state=None)
         return ID_ASK_NAME
@@ -6417,13 +6506,15 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif target_state == ID_ASK_LASTNAME:
         await show("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?", kb_back_state=ID_ASK_NAME)
         return ID_ASK_LASTNAME
-        
+    
+    # ... (Le reste de votre routage reste identique, ne changez rien en dessous) ...
+    # Copiez juste le bloc de nettoyage au début de la fonction.
+    
     elif target_state == ID_ASK_DOB:
         await show("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", kb_back_state=ID_ASK_LASTNAME)
         return ID_ASK_DOB
         
     elif target_state == ID_ASK_STREET:
-        # Si c'est un document, on n'a pas demandé la DDN avant, mais le Nom. Sinon DDN.
         prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
         await show("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", kb_back_state=prev)
         return ID_ASK_STREET
@@ -6437,7 +6528,6 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ID_ASK_ZIP
         
     elif target_state == ID_CONFIRM_ADDR:
-        # On restaure les suggestions (ou on affiche l'adresse brute si pas de suggestion)
         suggs = context.user_data.get('addr_suggestions', [])
         raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}"
         if not suggs: suggs = [raw]
@@ -6458,7 +6548,6 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ID_ASK_EXPIRY
         
     elif target_state == ID_ASK_DL_NUM:
-        # Pour le permis, on réaffiche le menu SAAQ vs Manuel
         base = context.user_data.get('dl_base_code', 'Permis')
         text = (
             "💳 **NUMÉRO DE PERMIS**\n\n"
@@ -6476,7 +6565,6 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ID_ASK_DL_NUM
         
     elif target_state == ID_ASK_REF_NUM:
-        # On relance le générateur interactif qui gère son propre affichage
         return await ask_ref_number_interactive(update, context)
         
     elif target_state == ID_ASK_SEX:
