@@ -256,6 +256,7 @@ MESSAGES = {
             "💰 Solde : {balance:.2f} CAD\n"
             "{statut_label}\n"
             "\n\n🔑 Appuyez simplement sur la touche de votre choix."
+            
         ),
         'en': (
             "👋 Welcome to Nomen Nescio!\n\n"
@@ -275,8 +276,8 @@ MESSAGES = {
         'en': "Your current balance is: {balance:.2f} CAD."
     },
     'enter_bulk_qty': {
-        'fr': "Combien de permis voulez-vous valider ? (ex: 1, 3, 6)",
-        'en': "How many licenses do you want to validate? (e.g., 1, 3, 6)"
+        'fr': "Combien de permis voulez-vous valider ? (3 Max.)",
+        'en': "How many licenses do you want to validate? (3 Max.)"
     },
     'bulk_choice': {
         'fr': "Voulez-vous saisir manuellement maintenant, ou envoyer un fichier CSV ?",
@@ -2163,7 +2164,7 @@ async def show_ids_history(update, context):
         kb.append([InlineKeyboardButton(btn_txt, callback_data=f"usr_ord_{tid}")])
 
     # Bouton retour vers le menu historique (pas l'accueil)
-    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="hist_view")])
+    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")])
 
     await replace_view(q, "🆔 **VOS COMMANDES D'IDs :**", reply_markup=InlineKeyboardMarkup(kb))
 
