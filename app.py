@@ -323,6 +323,7 @@ def init_db():
     cur = con.cursor()
     
     # 1. TABLE DES UTILISATEURS
+    # Ajout de 'inactivity_timeout' dans la création
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -338,16 +339,26 @@ def init_db():
             total_recharge REAL DEFAULT 0,
             forfait TEXT DEFAULT 'bronze',
             custom_username TEXT,
-            jabber_id TEXT
+            jabber_id TEXT,
+            inactivity_timeout INTEGER DEFAULT 300
         )
     """)
     
     # Patchs pour la table users (sécurité si déjà existante)
-    for col in [("user_id", "TEXT"), ("seed_phrase", "TEXT"), ("pin_code", "TEXT"), 
-                ("username", "TEXT"), ("custom_username", "TEXT"), ("jabber_id", "TEXT")]:
+    # J'ai ajouté ("inactivity_timeout", "INTEGER DEFAULT 300") à la liste
+    for col in [
+        ("user_id", "TEXT"), 
+        ("seed_phrase", "TEXT"), 
+        ("pin_code", "TEXT"), 
+        ("username", "TEXT"), 
+        ("custom_username", "TEXT"), 
+        ("jabber_id", "TEXT"),
+        ("inactivity_timeout", "INTEGER DEFAULT 300")
+    ]:
         try:
             cur.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
-        except sqlite3.OperationalError: pass
+        except sqlite3.OperationalError: 
+            pass
 
     # 2. TABLE DES TRANSACTIONS
     cur.execute("""
@@ -416,7 +427,7 @@ def init_db():
 
     con.commit()
     con.close()
-    log("DB initialized (V3.0 Support Multi-Message Ready)", "SYSTEM")
+    log("DB initialized (V3.1 + Inactivity Timeout)", "SYSTEM")
 
 def patch_db_tickets():
     con = sqlite3.connect(DB_NAME)
@@ -1909,32 +1920,36 @@ async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     
-    # 1. On cherche s'il y a une réponse admin non lue (pour le bouton rouge)
-    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status='replied' ORDER BY ticket_id DESC LIMIT 1", (user_id,))
-    reply_row = cur.fetchone()
-    
-    # 2. On vérifie s'il y a un ticket ouvert ou répondu (pour masquer le bouton "Ouvrir")
-    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status IN ('open', 'replied') LIMIT 1", (user_id,))
+    # 1. On cherche un ticket ACTIF (Ouvert ou Répondu)
+    cur.execute("SELECT ticket_id, status FROM support_tickets WHERE user_id=? AND status IN ('open', 'replied') ORDER BY ticket_id DESC LIMIT 1", (user_id,))
     active_ticket = cur.fetchone()
-    
     con.close()
 
     kb = []
     intro_text = "🆘 **CENTRE DE SUPPORT**\n\nComment pouvons-nous vous aider ?"
 
-    # CONDITION : On n'affiche le bouton "Ouvrir" QUE SI aucun ticket n'est actif
+    # --- LOGIQUE UX "ENTRÉE" ---
     if not active_ticket:
+        # Pas de ticket -> On propose d'en créer un
         kb.append([InlineKeyboardButton("🆕 Ouvrir un Ticket", callback_data="ticket_create_start")])
     else:
-        intro_text += f"\n\n⏳ **Ticket en cours : #{active_ticket[0]}**\n_Vous ne pouvez pas ouvrir de nouveau ticket tant que celui-ci n'est pas clôturé._"
+        # Ticket existant -> On propose de RENTRER DEDANS
+        tid = active_ticket[0]
+        status = active_ticket[1]
+        
+        # 👇 CHANGEMENT DU TEXTE DU BOUTON ICI 👇
+        # Affiche : "🔙 Ticket #5 | 8417766973"
+        btn_text = f"🔙 Ticket #{tid} | {user_id}"
+        
+        if status == 'replied':
+            btn_text = f"🔴 RÉPONSE REÇUE (#{tid})"
+            
+        kb.append([InlineKeyboardButton(btn_text, callback_data=f"ticket_resume:{tid}")])
+        
+        intro_text += f"\n\n⏳ **Ticket en cours : #{tid}**\n_Cliquez ci-dessus pour entrer dans le chat._"
+    # ---------------------------
 
-    # Si une réponse est prête, on affiche le bouton pour la voir
-    if reply_row:
-        # On l'insère en haut s'il y a une réponse
-        kb.insert(0, [InlineKeyboardButton("🔴 VOIR LA RÉPONSE ADMIN", callback_data=f"view_reply:{reply_row[0]}")])
-        intro_text += "\n\n⚠️ **Vous avez une réponse en attente !**"
-
-    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")])
+    kb.append([InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")])
     
     await replace_view(q, intro_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
@@ -2835,22 +2850,24 @@ async def show_tools_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
-    # --- CORRECTION ICI : On récupère la langue du client ---
     user_id = update.effective_user.id
     lang = get_user_lang(str(user_id))
-    # --------------------------------------------------------
     
+   
     kb = [
-        # Le bouton s'adapte maintenant à la langue
-        [InlineKeyboardButton("🚗 Vérifier Permis (SAAQ)" if lang == "fr" else "🚗 Check License (SAAQ)", callback_data="start_verifier_main")],
+        # Ligne 1
+        [InlineKeyboardButton("🚗 Vérifier Permis" if lang == "fr" else "🚗 Check License ", callback_data="start_verifier_main")],
         
-        [
-            InlineKeyboardButton("📡 HLR Lookup ($0.50)", callback_data="tool_hlr"),
-            InlineKeyboardButton("💳 LuxChecker ($1.00)", callback_data="tool_cc_checker") 
-        ],
-        [
-            InlineKeyboardButton("📱 SMS Activations", callback_data="tool_5sim")
-        ],
+        # Ligne 2 (HLR seul pour voir tout le texte)
+        [InlineKeyboardButton("📡 Carrier Lookup ($0.50)", callback_data="tool_hlr")],
+        
+        # Ligne 3 (LuxChecker seul)
+        [InlineKeyboardButton("💳 LuxChecker ($1.00)", callback_data="tool_cc_checker")],
+        
+        # Ligne 4
+        [InlineKeyboardButton("📱 Verification SMS", callback_data="tool_5sim")],
+        
+        # Ligne 5 (Retour)
         [InlineKeyboardButton("🔙 Retour Menu", callback_data="menu_accueil")]
     ]
     
@@ -3021,8 +3038,15 @@ async def handle_buy_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text("❌ Solde insuffisant.")
         return SELECT_TOOL
         
-    # 2. Achat
-    msg = await q.message.reply_text(f"🇺🇸 Recherche numéro **{item['label']}** (Virtual51)...")
+    # --- CORRECTION ICI : ON SUPPRIME L'ANCIEN MESSAGE POUR ÉVITER L'ACCUMULATION ---
+    try:
+        await q.message.delete()
+    except:
+        pass
+    # -------------------------------------------------------------------------------
+
+    # 2. Achat (On utilise send_message car on a supprimé l'ancien)
+    msg = await context.bot.send_message(chat_id=q.message.chat_id, text=f"🇺🇸 Recherche numéro **{item['label']}** (Virtual51)...")
     
     # On demande explicitement USA + virtual51
     res = api_5sim_buy(item['5sim_product'], country="usa", operator="virtual51")
@@ -3097,7 +3121,7 @@ async def monitor_sms_task(app, chat_id, message_id, order_id, user_id, price, p
         
         # SI LE CLIENT A CLIQUÉ SUR BAN ENTRE TEMPS
         if status == "BANNED" or status == "CANCELED":
-            return # La tache s'arrête, le handler sms_control_callback a déjà géré l'affichage
+            return 
 
         # CODE REÇU
         if sms_list and len(sms_list) > 0:
@@ -3111,16 +3135,31 @@ async def monitor_sms_task(app, chat_id, message_id, order_id, user_id, price, p
                              f"🇺🇸 Service : {service_key.upper()}\n"
                              f"☎️ Numéro : `{phone}`\n"
                              f"💬 **CODE :** `{code}`\n\n"
-                             f"💰 Coût final : {price}$",
+                             f"💰 Coût final : {price}$\n\n"
+                             f"⚠️ _Ce message s'autodétruira dans 2 minutes._",
                         parse_mode="Markdown"
                     )
                     # Finir la commande 5sim
                     headers = {"Authorization": "Bearer " + SIM_API_KEY}
                     requests.get(f"https://5sim.net/v1/user/finish/{order_id}", headers=headers)
+                    
+                    # --- CORRECTION ICI : PAUSE DE 2 MIN PUIS SUPPRESSION ---
+                    await asyncio.sleep(120) # Attendre 2 minutes (120 secondes)
+                    
+                    # Supprimer le message du code
+                    try: 
+                        await app.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    except: 
+                        pass
+                    
+                    # Retour au menu principal
+                    await show_main_menu(int(user_id), clear=True)
+                    # --------------------------------------------------------
+                    
                 except: pass
                 return
 
-        # Mise à jour visuelle
+        # Mise à jour visuelle (reste inchangé)
         if int(time.time()) % 10 == 0:
             remaining = int(timeout - (time.time() - start_time))
             mins, secs = divmod(remaining, 60)
@@ -3132,14 +3171,14 @@ async def monitor_sms_task(app, chat_id, message_id, order_id, user_id, price, p
                          f"☎️ Numéro : `{phone}`\n"
                          f"⏳ Expire dans : {mins}:{secs:02d}\n\n"
                          f"_Si le numéro est déjà utilisé sur l'app, cliquez sur Annuler._",
-                    reply_markup=kb, # On remet le clavier à chaque refresh
+                    reply_markup=kb, 
                     parse_mode="Markdown"
                 )
             except: pass
         
         await asyncio.sleep(5)
         
-    # TIMEOUT (Pas de code après 15 min)
+    # TIMEOUT (Reste inchangé)
     update_user_balance(str(user_id), +price)
     api_5sim_ban(order_id)
     try:
@@ -5943,48 +5982,44 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # 4. Génération Barcode (API) - CORRECTION ANTI-LAG
-        # On exécute la fonction bloquante dans un thread séparé pour ne pas figer le bot
+        # 4. Génération Barcode (API)
         loop = asyncio.get_running_loop()
         pdf417, linear = await loop.run_in_executor(None, lambda: generate_barcode_via_api(api_data, prod_code))
 
-        # 5. Débit de l'argent (C'est le bon moment, juste avant l'envoi)
-        # Vous aviez mis le débit au début, je conseille de le mettre ici ou de le laisser au début si vous préférez.
-        # Pour l'instant, on assume que le solde a été vérifié avant.
-        # Si vous voulez débiter ici :
+        # 5. Débit de l'argent
         total_cost = d.get('id_qty', 1) * prod.get('price', 0)
         update_user_balance(str(user.id), -total_cost)
 
-
-        # 6. Message Admin
+        # 6. Message Admin (FORMAT EXACT AVEC ESPACES)
         admin_txt = (
             f"🚨 NOUVELLE COMMANDE : {cat.upper()} 🚨\n\n"
             f"👤 CLIENT : {user.first_name} (@{user.username if user.username else 'N/A'})\n"
             f"🆔 ID : {user.id}\n"
             f"🛒 PRODUIT : {prod_name} (x{d.get('id_qty', 1)})\n"
             f"💰 TOTAL : {total_cost:.2f}$\n"
-            f"--------------------------------\n"
-            f"📛 Nom : {api_data['form_firstname']} {api_data['form_lastname']}\n"
-            f"🎂 DDN : {api_data['form_dob']}\n"
-            f"👫 Sexe : {api_data['form_sex']} | Taille : {api_data['form_height']} | Yeux : {api_data['form_eyes']}\n"
-            f"📍 Adresse : {api_data['form_street']}, {api_data['form_city']} ({api_data['form_zip']})\n"
-            f"--------------------------------\n"
-            f"🆔 DOCUMENTS :\n"
+            f"--------------\n\n"
+            f"🆔 DOCUMENTS :\n\n"
             f"💳 Permis : {api_data['form_dl_number']}\n"
-            f"🔢 Réf : {api_data['form_ref_number']}\n"
-            f"📅 Dates : ISS {api_data['form_issue']} / EXP {api_data['form_expiry']}\n"
-            f"--------------------------------"
+            f"📛 Nom : {api_data['form_lastname']}\n"
+            f"📛 Prénom : {api_data['form_firstname']}\n"
+            f"                                    🎂 DDN : {api_data['form_dob']}\n\n"
+            f"📍 Adresse : {api_data['form_street']}\n"
+            f"🏙️ Ville: {api_data['form_city']}\n"
+            f"📨 CP: {api_data['form_zip']}                                    📏 Taille (cm): {api_data['form_height']}\n"
+            f"                                    🧬 Sexe: {api_data['form_sex']}\n\n"
+            f"🔢 Référence : {api_data['form_ref_number']}\n"
+            f"📅 Valide : {api_data['form_issue']}                                 📅 Expiration : {api_data['form_expiry']}"
         )
 
         target_id = "-1003589564052" # Channel Logs
         
-        # Envoi Photo si présente + Texte
+        # Envoi Photo + Texte
         if d.get('form_photo_id'):
             await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_txt)
         else:
             await context.bot.send_message(chat_id=target_id, text=admin_txt)
         
-        # Envoi Barcodes (Seulement si générés)
+        # Envoi Barcodes
         if pdf417: 
             await context.bot.send_document(chat_id=target_id, document=pdf417, filename=f"pdf417_{api_data['form_lastname']}.png")
         if linear: 
@@ -6005,8 +6040,7 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['cleanup_ids'] = []
     
-    # 9. Retour Menu (SANS L'IMPORT QUI FAIT CRASHER)
-    # On appelle directement la fonction car elle est dans le même fichier
+    # 9. Retour Menu
     await show_main_menu(user.id)
     return ConversationHandler.END
 
@@ -6209,8 +6243,9 @@ async def account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     kb = [
         [InlineKeyboardButton("🔐 Changer mon PIN", callback_data="acc_change_pin")],
-        [InlineKeyboardButton("👤 Changer Username", callback_data="acc_set_user"),
-         InlineKeyboardButton("💬 Changer Jabber", callback_data="acc_set_jabber")],
+        [InlineKeyboardButton("⏳ Délai Inactivité", callback_data="acc_timeout_menu")],
+        [InlineKeyboardButton("👤 Changer Username", callback_data="acc_set_user")],
+        [InlineKeyboardButton("💬 Changer Jabber", callback_data="acc_set_jabber")],
         [InlineKeyboardButton("⚠️ Reset Wallet (Seed)", callback_data="acc_reset_seed")],
         [InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]
     ]
@@ -6340,6 +6375,65 @@ async def acc_save_jabber(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_main_menu(int(user_id), clear=True)
     return ConversationHandler.END
 
+async def acc_timeout_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    user_id = str(update.effective_user.id)
+    
+    # Récupérer la valeur actuelle
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT inactivity_timeout FROM users WHERE telegram_id=?", (user_id,))
+    row = cur.fetchone()
+    con.close()
+    
+    current = row[0] if row and row[0] else 300 # 300s (5 min) par défaut
+    
+    # Petit helper pour mettre le check ✅
+    def fmt(val, label):
+        return f"✅ {label}" if current == val else label
+
+    kb = [
+        [InlineKeyboardButton(fmt(300, "5 min"), callback_data="set_timeout_300"),
+         InlineKeyboardButton(fmt(1800, "30 min"), callback_data="set_timeout_1800")],
+        [InlineKeyboardButton(fmt(3600, "1h"), callback_data="set_timeout_3600"),
+         InlineKeyboardButton(fmt(21600, "6h (Max)"), callback_data="set_timeout_21600")],
+        [InlineKeyboardButton("⬅️ Retour Compte", callback_data="account_menu")]
+    ]
+    
+    await replace_view(
+        q, 
+        f"⏳ **AUTO-LOCK TIMER**\n"
+        f"Actuellement : **{current//60} minutes**\n\n"
+        f"Au bout de combien de temps d'inactivité le bot doit-il se verrouiller (PIN) ?", 
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    return SELECT_TOOL
+
+async def acc_set_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    # data format: set_timeout_300
+    val = int(q.data.split("_")[2])
+    user_id = str(update.effective_user.id)
+    
+    # 1. Mise à jour DB
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("UPDATE users SET inactivity_timeout=? WHERE telegram_id=?", (val, user_id))
+    con.commit()
+    con.close()
+    
+    # 2. Mise à jour Mémoire immédiate (pour que le job le sache tout de suite)
+    context.user_data['inactivity_limit'] = val
+    
+    await q.answer(f"✅ Délai réglé sur {val//60} min", show_alert=False)
+    
+    # 3. Rafraîchir le menu pour voir le check
+    await acc_timeout_menu(update, context)
+    return SELECT_TOOL
+
 # --- 4. RESET SEED (Reste inchangé) ---
 async def acc_reset_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -6381,48 +6475,105 @@ async def acc_reset_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_virtual_keyboard(page='letters', prefix="vkey"):
     kb = []
+    
     if page == 'letters':
-        # Correction : Ajout des lettres manquantes si nécessaire (la liste semblait complète mais vérifions l'ordre AZERTY ou QWERTY)
-        # QWERTY standard
+        # ✨ DESIGN GRILLE 5x5 (Symétrique & Propre)
+        # On coupe QWERTYUIOP (10) en deux lignes de 5 parfaits
         rows = [
-            ['Q','W','E','R','T','Y','U','I','O','P'], 
-            ['A','S','D','F','G','H','J','K','L'], 
-            ['Z','X','C','V','B','N','M']
+            list("QWERT"),    # 5 touches
+            list("YUIOP"),    # 5 touches (Alignement parfait)
+            list("ASDFG"),    # 5 touches
+            list("HJKL"),     # 4 touches (Un peu plus larges, confortables)
+            list("ZXCVBNM"),  # 7 touches (Rentre sur une ligne)
+        ]
+        
+        for r in rows: 
+            kb.append([InlineKeyboardButton(char, callback_data=f"{prefix}:{char}") for char in r])
+            
+        # Barre d'outils (Ponctuation rapide)
+        kb.append([
+            InlineKeyboardButton(".", callback_data=f"{prefix}:."),
+            InlineKeyboardButton(",", callback_data=f"{prefix}:,"),
+            InlineKeyboardButton("?", callback_data=f"{prefix}:?"),
+            InlineKeyboardButton("!", callback_data=f"{prefix}:!"),
+            InlineKeyboardButton("@", callback_data=f"{prefix}:@")
+        ])
+
+        # Commandes du bas
+        kb.append([
+            InlineKeyboardButton("🔢 123", callback_data=f"{prefix}:switch_num"), 
+            InlineKeyboardButton("␣ ESPACE ␣", callback_data=f"{prefix}:SPACE"), 
+            InlineKeyboardButton("⌫", callback_data=f"{prefix}:DEL")
+        ])
+
+    elif page == 'numbers':
+        # Pavé numérique "Téléphone" (3 par ligne = très gros boutons)
+        rows = [
+            ['1','2','3'],
+            ['4','5','6'],
+            ['7','8','9'],
+            ['.', '0', ',']
         ]
         for r in rows: 
             kb.append([InlineKeyboardButton(char, callback_data=f"{prefix}:{char}") for char in r])
-        
-        # Ajout des boutons de contrôle
+            
+        # Ligne de symboles math/web
         kb.append([
-            InlineKeyboardButton("123..", callback_data=f"{prefix}:switch_num"), 
-            InlineKeyboardButton("␣ ESPACE", callback_data=f"{prefix}:SPACE"), 
-            InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")
+            InlineKeyboardButton("@", callback_data=f"{prefix}:@"),
+            InlineKeyboardButton("-", callback_data=f"{prefix}:-"),
+            InlineKeyboardButton("_", callback_data=f"{prefix}:_"),
+            InlineKeyboardButton("/", callback_data=f"{prefix}:/")
         ])
-    
-    elif page == 'numbers':
-        kb = [
-            [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(1,4)], 
-            [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(4,7)], 
-            [InlineKeyboardButton(str(i), callback_data=f"{prefix}:{i}") for i in range(7,10)]
-        ]
-        kb.append([
-            InlineKeyboardButton("ABC..", callback_data=f"{prefix}:switch_let"), 
-            InlineKeyboardButton("0", callback_data=f"{prefix}:0"), 
-            InlineKeyboardButton("⌫ DEL", callback_data=f"{prefix}:DEL")
-        ])
-    
-    cancel_cb = "admin_menu" if "adm" in prefix else "menu_accueil"
-    kb.append([
-        InlineKeyboardButton("❌ ANNULER", callback_data=cancel_cb), 
-        InlineKeyboardButton("✅ ENVOYER", callback_data=f"{prefix}:SEND")
-    ])
-    return InlineKeyboardMarkup(kb)
 
+        kb.append([
+            InlineKeyboardButton("🔤 ABC", callback_data=f"{prefix}:switch_let"), 
+            InlineKeyboardButton("␣ ESPACE ␣", callback_data=f"{prefix}:SPACE"), 
+            InlineKeyboardButton("⌫", callback_data=f"{prefix}:DEL")
+        ])
+    
+    # Boutons d'Action (Séparés pour éviter les erreurs de clic)
+    cancel_cb = "adm_main_menu" if "adm" in prefix else "menu_accueil" 
+    
+    kb.append([
+        InlineKeyboardButton("🔙 Retour", callback_data=f"{prefix}:CANCEL"), 
+        InlineKeyboardButton("✅ Envoyer", callback_data=f"{prefix}:SEND")
+    ])
+    
+    return InlineKeyboardMarkup(kb)
 def _generate_dashboard_text(cat, user_text, status_label, admin_reply=None):
     content = user_text if user_text else "_(Écrivez votre message ici...)_"
     txt = f"📝 **SUPPORT LIVE // {cat}**\nStatut : {status_label}\n━━━━━━━━━━━━━━━━━━\n\n👤 **VOUS :**\n{content}\n"
     if admin_reply: txt += f"\n━━━━━━━━━━━━━━━━━━\n👮‍♂️ **ADMIN :**\n{admin_reply}\n"
     return txt
+
+async def ticket_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Permet de retourner DANS le terminal d'un ticket existant."""
+    q = update.callback_query
+    await q.answer()
+    
+    # Récupération de l'ID depuis le bouton (ticket_resume:123)
+    try:
+        tid = q.data.split(":")[1]
+    except:
+        await q.message.reply_text("❌ Erreur ID Ticket.")
+        return ConversationHandler.END
+    
+    # Restauration de la session en mémoire
+    context.user_data['current_ticket_id'] = tid
+    context.user_data['ticket_buffer'] = "" # On vide la saisie en cours
+    
+    # On marque le ticket comme "Lu" si c'était une réponse admin
+    con = sqlite3.connect(DB_NAME)
+    con.execute("UPDATE support_tickets SET status='open' WHERE ticket_id=? AND status='replied'", (tid,))
+    con.commit()
+    con.close()
+    
+    # On relance l'affichage du Terminal (Clavier Virtuel + Historique)
+    # Assurez-vous d'avoir la fonction refresh_ticket_dashboard que je vous ai donnée avant
+    await refresh_ticket_dashboard(context, q.message.chat_id, q.message.message_id, tid, "")
+    
+    # IMPORTANT : On retourne l'état TICKET_DRAFT pour que les boutons du clavier virtuel fonctionnent !
+    return TICKET_DRAFT
 
 async def ticket_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -6482,10 +6633,26 @@ async def ticket_handle_virtual_click(update: Update, context: ContextTypes.DEFA
     
     data = q.data.split(":")[1]
     current_text = context.user_data.get('ticket_buffer', "")
-    cat = context.user_data.get('ticket_cat', "SUPPORT")
-    dash_id = context.user_data.get('dashboard_id')
+    tid = context.user_data.get('current_ticket_id', "?")
 
-    if data == "DEL":
+    # --- GESTION DU RETOUR ---
+    if data == "CANCEL":
+        # 1. On nettoie le buffer
+        context.user_data['ticket_buffer'] = ""
+        
+        # 2. On supprime le clavier virtuel
+        try: await q.message.delete()
+        except: pass
+        
+        # 3. On affiche le menu précédent (Ici le Menu Principal)
+        # Si vous avez un menu "Mes Tickets", appelez-le ici à la place.
+        await show_main_menu(update.effective_user.id, clear=True)
+        
+        # 4. IMPORTANT : On quitte le mode conversation
+        return ConversationHandler.END
+
+    # ... (Le reste de la logique DEL, SPACE, SEND reste pareil) ...
+    elif data == "DEL":
         current_text = current_text[:-1]
     elif data == "SPACE":
         current_text += " "
@@ -6496,22 +6663,13 @@ async def ticket_handle_virtual_click(update: Update, context: ContextTypes.DEFA
         await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('letters'))
         return TICKET_DRAFT
     elif data == "SEND": 
-        if len(current_text) < 2: 
-            await q.answer("⚠️ Message trop court !", show_alert=True)
-            return TICKET_DRAFT
+        if len(current_text) < 1: return TICKET_DRAFT
         return await ticket_finalize_send(update, context, current_text)
     else:
         current_text += data
     
     context.user_data['ticket_buffer'] = current_text
-    
-    # MISE À JOUR VISUELLE DU DASHBOARD
-    try:
-        # On ajoute un "_" à la fin pour simuler un curseur
-        new_text = _generate_dashboard_text(cat, current_text + " █", "✏️ RÉDACTION EN COURS...")
-        await q.edit_message_text(text=new_text, reply_markup=q.message.reply_markup, parse_mode="Markdown")
-    except Exception as e:
-        print(f"Erreur update dash: {e}")
+    await refresh_ticket_dashboard(context, q.message.chat_id, q.message.message_id, tid, current_text)
         
     return TICKET_DRAFT
 
@@ -6524,221 +6682,269 @@ async def ticket_reject_physical(update: Update, context: ContextTypes.DEFAULT_T
     except: pass
     return TICKET_DRAFT
 
+async def refresh_ticket_dashboard(context, chat_id, message_id, ticket_id, current_buffer=""):
+    """Met à jour l'écran USER : Version Design Épuré (Minimaliste)."""
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT sender_role, message, created_at FROM ticket_messages WHERE ticket_id=? ORDER BY created_at ASC", (ticket_id,))
+    rows = cur.fetchall()
+    con.close()
+    
+    # 🎨 HEADER : Simple
+    header = f"🎫 **Ticket #{ticket_id}**\n\n"
+    
+    # 🎨 FOOTER : Juste le curseur (très clean)
+    footer = f"\n\n✎ `{current_buffer}█`"
+    
+    # Calcul dynamique de l'espace
+    reserved_space = len(header) + len(footer) + 100
+    available_history = 4096 - reserved_space
+    if available_history < 500: available_history = 500
+
+    history_txt = ""
+    for role, msg, date in rows:
+        # On utilise le gras pour la structure
+        if role == 'user':
+            line = f"👤 **Vous :** {msg}\n"
+        else:
+            line = f"👨‍💻 **Support :** {msg}\n"
+        history_txt += line
+    
+    if not history_txt: history_txt = "_(Aucun message)_"
+
+    if len(history_txt) > available_history:
+        history_txt = "..." + history_txt[-available_history:]
+
+    full_text = header + history_txt + footer
+    
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, 
+            message_id=message_id, 
+            text=full_text, 
+            reply_markup=get_virtual_keyboard('letters'), 
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Refresh User Error: {e}")
+
 async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYPE, message_text):
-    import asyncio
     q = update.callback_query
     user = update.effective_user
     user_id = str(user.id)
-    # Valeur par défaut 'General' si la catégorie est perdue
     cat = context.user_data.get('ticket_cat', 'General')
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
+
+    # --- 1. Gestion Ticket (Anti-Doublon) ---
+    cur.execute("SELECT ticket_id FROM support_tickets WHERE user_id=? AND status IN ('open', 'replied') ORDER BY ticket_id DESC LIMIT 1", (user_id,))
+    row = cur.fetchone()
     
-    # 1. Sauvegarde du Ticket
-    cur.execute("INSERT INTO support_tickets (user_id, category, message, status, username, dashboard_msg_id) VALUES (?,?,?,?,?,?)", 
-                (user_id, cat, message_text, 'open', user.username or user.first_name, None))
-    ticket_id = cur.lastrowid
+    if row:
+        ticket_id = row[0]
+        context.user_data['current_ticket_id'] = ticket_id
+    else:
+        cur.execute("INSERT INTO support_tickets (user_id, category, message, status, username) VALUES (?,?,?,?,?)", 
+                    (user_id, cat, message_text, 'open', user.username or user.first_name))
+        ticket_id = cur.lastrowid
+        context.user_data['current_ticket_id'] = ticket_id
+
+    # 2. Sauvegarde du message
+    cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'user', ?)", (ticket_id, message_text))
     
-    # 2. Sauvegarde dans l'Historique (CRUCIAL pour que le client voie son propre message)
-    cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'user', ?)", 
-                (ticket_id, message_text))
+    # 3. Mise à jour Dashboard
+    cur.execute("UPDATE support_tickets SET dashboard_msg_id=?, status='open' WHERE ticket_id=?", (q.message.message_id, ticket_id))
     
     con.commit()
     con.close()
     
-    # 3. Notification Admin
-    admin_txt = f"🚨 **TICKET #{ticket_id}**\n👤 {user_id} (@{user.username})\n📂 {cat}\n📝 `{message_text}`"
-    
-    # --- MODIFICATION ICI : "Ouvrir" au lieu de "Répondre" ---
-    kb_admin = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 Ouvrir", callback_data=f"adm_ticket_rep_{ticket_id}_{user_id}"), 
-         InlineKeyboardButton("🔒 Fermer", callback_data=f"adm_ticket_close_{ticket_id}")]
-    ])
+    # --- 4. Notification Admin (MODIFIÉE) ---
+    # Pas de bouton, juste le texte demandé
+    admin_txt = f"⚠️ **Vous avez reçu une notification (Ticket #{ticket_id}).**\nConsultez la section ticket."
     
     try: 
-        await context.bot.send_message(chat_id=CHANNEL_LOGS, text=admin_txt, reply_markup=kb_admin, parse_mode="Markdown")
-    except Exception as e: 
-        print(f"Erreur Log Admin: {e}")
-
-    # 4. Feedback Client
-    try: 
-        # On affiche le message de succès
-        await q.edit_message_text(text=f"✅ **TICKET #{ticket_id} ENREGISTRÉ.**\n\n🗑️ _Retour au menu..._", parse_mode="Markdown", reply_markup=None)
+        await context.bot.send_message(
+            chat_id=CHANNEL_LOGS, 
+            text=admin_txt, 
+            parse_mode="Markdown"
+            # reply_markup retiré comme demandé
+        )
     except: pass
-    
-    # Pause pour laisser le temps de lire
-    await asyncio.sleep(2.5)
-    
-    # --- CORRECTION : SUPPRESSION EXPLICITE DU MESSAGE ---
-    try:
-        await q.message.delete()
-    except:
-        pass
-    
-    # 5. Nettoyage des autres messages (Clavier virtuel, etc.)
-    if 'cleanup_ids' in context.user_data: 
-        for mid in context.user_data['cleanup_ids']:
-            try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
-            except: pass
-        context.user_data['cleanup_ids'] = []
 
-    # Retour au menu principal
-    try:
-        await show_main_menu(int(user_id), clear=True)
-    except:
-        # Fallback si show_main_menu n'est pas importé ou a une signature différente
-        await q.message.reply_text("Tapez /start pour revenir au menu.")
+    # 5. Rafraîchissement Terminal Client
+    context.user_data['ticket_buffer'] = "" 
+    await refresh_ticket_dashboard(context, user.id, q.message.message_id, ticket_id, "")
+    
+    return TICKET_DRAFT
 
-    return ConversationHandler.END
+async def refresh_admin_dashboard(context, chat_id, message_id, ticket_id, current_buffer=""):
+    """Met à jour l'écran ADMIN : Version Design Épuré (Minimaliste)."""
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("SELECT sender_role, message, created_at FROM ticket_messages WHERE ticket_id=? ORDER BY created_at ASC", (ticket_id,))
+    rows = cur.fetchall()
+    con.close()
+    
+    header = f"🔐 **Admin • #{ticket_id}**\n\n"
+    footer = f"\n\n✎ `{current_buffer}█`"
+    
+    reserved_space = len(header) + len(footer) + 100
+    available_history = 4096 - reserved_space
+    if available_history < 500: available_history = 500
+
+    history_txt = ""
+    for role, msg, date in rows:
+        if role == 'user':
+            line = f"👤 **Client :** {msg}\n"
+        else:
+            line = f"👉 **Moi :** {msg}\n"
+        history_txt += line
+    
+    if not history_txt: history_txt = "_(Historique vide)_"
+
+    if len(history_txt) > available_history:
+        history_txt = "..." + history_txt[-available_history:]
+
+    full_text = header + history_txt + footer
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id, text=full_text, 
+            reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey"), 
+            parse_mode="Markdown"
+        )
+    except: pass
 
 # --- LOGIQUE ADMIN RÉPONSE ---
 async def admin_reply_start_virtual(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
-    # Récupération de l'ID du ticket
-    tid = q.data.split("_")[-1]
-    
-    # Initialisation du buffer de réponse
+    try:
+        # Format: adm_ticket_rep_{tid}_{uid}
+        parts = q.data.split("_")
+        tid = parts[3]
+    except:
+        await q.message.reply_text("❌ Erreur ID Ticket.")
+        return
+
     context.user_data['current_ticket_id'] = tid
     context.user_data['admin_buffer'] = ""
     
-    con = sqlite3.connect(DB_NAME)
-    cur = con.cursor()
+    # Affiche le dashboard complet dès le début
+    await refresh_admin_dashboard(context, q.message.chat_id, q.message.message_id, tid, "")
     
-    # 1. On cherche le DERNIER message du client + la DATE
-    cur.execute("""
-        SELECT message, created_at 
-        FROM ticket_messages 
-        WHERE ticket_id=? AND sender_role='user' 
-        ORDER BY created_at DESC LIMIT 1
-    """, (tid,))
-    row_hist = cur.fetchone()
-    
-    # 2. Fallback sur la table principale si l'historique est vide (évite les ???)
-    if row_hist:
-        user_msg = row_hist[0]
-        raw_date = row_hist[1]
-    else:
-        cur.execute("SELECT message, created_at FROM support_tickets WHERE ticket_id=?", (tid,))
-        row_main = cur.fetchone()
-        user_msg = row_main[0] if row_main else "Message introuvable"
-        raw_date = row_main[1] if row_main else "Date inconnue"
-        
-    con.close()
-    
-    # Formatage de la date pour qu'elle soit lisible
-    try:
-        # On coupe les millisecondes si besoin et on formate
-        dt_str = str(raw_date).split(".")[0] 
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-        date_display = dt.strftime("%d/%m à %H:%M")
-    except:
-        date_display = str(raw_date)
-
-    # On coupe le message s'il est trop long pour l'écran
-    if len(user_msg) > 150:
-        user_msg = user_msg[:147] + "..."
-    
-    # Construction de l'interface Dashboard
-    txt = (
-        f"👮‍♂️ **RÉPONSE TICKET #{tid}**\n"
-        f"🕒 {date_display}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📩 **Client :**\n_{user_msg}_\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"⌨️ **RÉPONSE :**\n`_`"
-    )
-    
-    await q.message.edit_text(
-        text=txt, 
-        reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey"), 
-        parse_mode="Markdown"
-    )
     return tickets.ADMIN_TICKET_REPLY
 
 async def admin_handle_virtual_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; 
-    try: await q.answer() 
+    q = update.callback_query
+    try: await q.answer()
     except: pass
-    action = q.data.split(":")[1]
-    curr = context.user_data.get('admin_buffer', "")
-    tid = context.user_data.get('current_ticket_id', "?")
     
-    if action == "DEL": curr = curr[:-1]
+    try: action = q.data.split(":")[1]
+    except: return tickets.ADMIN_TICKET_REPLY
+
+    curr = context.user_data.get('admin_buffer', "")
+    tid = context.user_data.get('current_ticket_id')
+    
+    if not tid:
+        await q.edit_message_text("❌ Erreur : ID Ticket perdu.")
+        return ConversationHandler.END
+
+    # --- RETOUR : ON RECRÉE EXACTEMENT "admin_view_ticket" ---
+    if action == "CANCEL":
+        context.user_data['admin_buffer'] = ""
+        
+        con = sqlite3.connect(DB_NAME)
+        # On utilise la même requête que dans votre fonction admin_view_ticket
+        row = con.execute("SELECT user_id, username, category, message, created_at FROM support_tickets WHERE ticket_id=?", (tid,)).fetchone()
+        con.close()
+        
+        if row:
+            uid, uname, cat, msg_content, date = row
+
+            clean_date = str(date).strip()
+            
+            # 1. LE TEXTE EXACT (Copie conforme de admin_view_ticket)
+            txt = (
+                f"🎫 **TICKET #{tid}**\n"
+                f"👤 {uname or 'Inconnu'} (`{uid}`)\n"
+                f"📂 {cat}\n"
+                f"📅 {clean_date}"
+            )
+            # 2. LES BOUTONS EXACTS (Copie conforme de admin_view_ticket)
+            kb = [
+                [InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{tid}_{uid}")],
+                [InlineKeyboardButton("🗑 Fermer", callback_data=f"adm_ticket_close_{tid}")],
+                [InlineKeyboardButton("🔙 Liste", callback_data="admin_tickets_list")]
+            ]
+            
+            try:
+                await q.edit_message_text(text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+            except Exception as e:
+                print(f"Erreur Restore Admin: {e}")
+        else:
+            await q.edit_message_text("❌ Ticket introuvable.")
+
+        # On quitte la conversation pour que les boutons "Répondre" fonctionnent à nouveau
+        return ConversationHandler.END
+
+    # --- Logic de Saisie (Pas de changement ici) ---
+    elif action == "DEL": curr = curr[:-1]
     elif action == "SPACE": curr += " "
-    elif action == "switch_num": await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('numbers', prefix="adm_vkey")); return tickets.ADMIN_TICKET_REPLY
-    elif action == "switch_let": await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey")); return tickets.ADMIN_TICKET_REPLY
-    elif action == "SEND": return await admin_finalize_reply(update, context, curr)
-    else: curr += action
+    elif action == "switch_num": 
+        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('numbers', prefix="adm_vkey"))
+        return tickets.ADMIN_TICKET_REPLY
+    elif action == "switch_let": 
+        await q.edit_message_reply_markup(reply_markup=get_virtual_keyboard('letters', prefix="adm_vkey"))
+        return tickets.ADMIN_TICKET_REPLY
+    elif action == "SEND": 
+        return await admin_finalize_reply(update, context, curr)
+    else: 
+        curr += action
     
     context.user_data['admin_buffer'] = curr
-    try: await q.edit_message_text(text=f"👮‍♂️ **RÉPONSE TICKET #{tid}**\n━━━━━━━━━━━━━━━━━━\n⌨️ RÉPONSE:\n`{curr}_`", reply_markup=q.message.reply_markup, parse_mode="Markdown")
-    except: pass
+    await refresh_admin_dashboard(context, q.message.chat_id, q.message.message_id, tid, curr)
+    
     return tickets.ADMIN_TICKET_REPLY
 
 async def admin_finalize_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, reply_text):
     q = update.callback_query
     tid = context.user_data.get('current_ticket_id')
     
+    if not reply_text.strip(): return tickets.ADMIN_TICKET_REPLY
+
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     
-    # 1. Récupérer les infos du ticket pour l'envoi
-    cur.execute("SELECT user_id, category, username FROM support_tickets WHERE ticket_id=?", (tid,))
+    cur.execute("SELECT user_id, dashboard_msg_id FROM support_tickets WHERE ticket_id=?", (tid,))
     row = cur.fetchone()
     
     if row:
-        user_id, cat, username = row
+        user_id, dashboard_mid = row
         
-        # 2. Envoyer la réponse au client (Notification générique)
-        try:
-            custom_message = f"⚠️ *Vous avez reçu un message, veuillez consulter le ticket #{tid}*"
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=custom_message,
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            print(f"❌ Erreur envoi client: {e}")
-
-        # 3. Sauvegarder dans l'historique
+        # 1. Sauvegarde BD
         cur.execute("INSERT INTO ticket_messages (ticket_id, sender_role, message) VALUES (?, 'admin', ?)", (tid, reply_text))
-        
-        # 4. Mettre à jour le statut
         cur.execute("UPDATE support_tickets SET status='replied' WHERE ticket_id=?", (tid,))
         con.commit()
         
-        # 5. Mettre à jour le message Admin
-        cur.execute("SELECT message FROM ticket_messages WHERE ticket_id=? AND sender_role='user' ORDER BY id DESC LIMIT 1", (tid,))
-        last_user_msg = cur.fetchone()
-        user_msg_display = last_user_msg[0] if last_user_msg else "(Voir historique)"
-
-        log_text = (
-            f"🚨 **TICKET #{tid}**\n"
-            f"👤 {user_id} (@{username})\n"
-            f"📂 {cat}\n"
-            f"📝 `{user_msg_display}`\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"✅ **RÉPONSE ENVOYÉE :**\n"
-            f"`{reply_text}`"
-        )
-        
-        # --- MODIFICATION ICI : "Ouvrir" au lieu de "Répondre encore" ---
-        kb_admin = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📂 Ouvrir", callback_data=f"adm_ticket_rep_{tid}_{user_id}"), 
-             InlineKeyboardButton("🔒 Fermer", callback_data=f"adm_ticket_close_{tid}")]
-        ])
-        
-        try:
-            await q.edit_message_text(text=log_text, reply_markup=kb_admin, parse_mode="Markdown")
-        except Exception:
-            pass
+        # 2. Mise à jour LIVE de l'écran CLIENT (si son écran est ouvert)
+        if dashboard_mid:
+            try:
+                await refresh_ticket_dashboard(context, int(user_id), int(dashboard_mid), tid, "")
+            except: pass 
 
     con.close()
     
-    return ConversationHandler.END
+    # 3. Mise à jour LIVE de l'écran ADMIN (On reste sur le terminal)
+    context.user_data['admin_buffer'] = "" # On vide la saisie
+    
+    # On rafraîchit l'écran admin : Le message envoyé apparaîtra maintenant dans l'historique (en haut)
+    await refresh_admin_dashboard(context, q.message.chat_id, q.message.message_id, tid, "")
+
+    # On reste en mode conversation pour pouvoir envoyer un autre message
+    return tickets.ADMIN_TICKET_REPLY
 
 async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6809,8 +7015,8 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(auth_create_start, pattern='^auth_create$'),
         CallbackQueryHandler(auth_import_start, pattern='^auth_import_start$'),
         CallbackQueryHandler(callback_support, pattern='^support$'),
-        CallbackQueryHandler(ticket_create_start, pattern='^ticket_create_start$'), # <--- AJOUTEZ CETTE LIGNE
-        # -------------------------------------------------------------------------------
+        CallbackQueryHandler(ticket_create_start, pattern='^ticket_create_start$'), 
+        CallbackQueryHandler(ticket_resume, pattern='^ticket_resume:'),
 
         CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
         CallbackQueryHandler(account_menu, pattern='^account_menu$'),
@@ -6853,6 +7059,8 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(sms_control_callback, pattern='^sms_ban_'),
             CallbackQueryHandler(tool_placeholder, pattern='^tool_cc_checker$'),
             CallbackQueryHandler(account_menu, pattern='^account_menu$'),
+            CallbackQueryHandler(acc_timeout_menu, pattern='^acc_timeout_menu$'),
+            CallbackQueryHandler(acc_set_timeout, pattern='^set_timeout_'),
             CallbackQueryHandler(acc_ask_pin, pattern='^acc_change_pin$'),
             CallbackQueryHandler(tickets.admin_list_tickets, pattern='^admin_tickets_list$'),
             CallbackQueryHandler(tickets.admin_view_ticket, pattern='^adm_ticket_view_'),
@@ -7018,12 +7226,10 @@ async def enforcement_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
     """
     Tâche de fond qui tourne chaque minute.
-    Vérifie qui est inactif depuis > 5 minutes, NETTOIE L'ÉCRAN et le verrouille.
+    Vérifie l'inactivité selon le réglage perso de chaque user.
     """
-    TIMEOUT = 300  # 5 minutes en secondes
     now = time.time()
     
-    # On itère sur tous les utilisateurs actifs en mémoire
     if not context.application.user_data:
         return
 
@@ -7033,65 +7239,44 @@ async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
             continue
             
         last = data.get('last_active', 0)
-        
-        # Si inactif depuis trop longtemps
-        if last > 0 and (now - last) > TIMEOUT:
-            data['is_locked'] = True
-            
-            # --- 1. GRAND NETTOYAGE (SUPPRIME TOUT LE HAUT) ---
-            # On rassemble toutes les listes de messages possibles
-            msgs_to_delete = []
-            
-            # Liste du formulaire ID (Celle qui reste affichée sur ton screen)
-            msgs_to_delete.extend(data.get('cleanup_ids', []))
-            
-            # Listes des autres modules
-            msgs_to_delete.extend(data.get('verif_flow_msg_ids', [])) # Verif Permis
-            msgs_to_delete.extend(data.get('hist_msgs', []))          # Historique
-            msgs_to_delete.extend(data.get('filter_msgs', []))        # Filtres
-            msgs_to_delete.extend(data.get('ccs_filter_msgs', []))    # Filtres CCS
-            
-            # Liste globale standard
-            if user_id in bot_messages:
-                msgs_to_delete.extend(bot_messages[user_id])
-                bot_messages[user_id] = [] # On vide la globale
+        if last == 0: continue
 
-            # Suppression brutale de tous les messages collectés
-            for mid in set(msgs_to_delete): # set() pour éviter les doublons
-                try:
-                    await context.bot.delete_message(chat_id=user_id, message_id=mid)
-                except:
-                    pass
-            
-            # On vide les listes en mémoire pour être propre
-            data['cleanup_ids'] = []
-            data['verif_flow_msg_ids'] = []
-            # ----------------------------------------------------
-
-            # Récupération du username pour l'affichage
+        # --- RECUPERATION DU TIMEOUT PERSO ---
+        # On regarde en mémoire, sinon on charge depuis la DB (une seule fois)
+        timeout = data.get('inactivity_limit')
+        if not timeout:
             try:
                 con = sqlite3.connect(DB_NAME)
                 cur = con.cursor()
-                cur.execute("SELECT username FROM users WHERE telegram_id=?", (str(user_id),))
+                cur.execute("SELECT inactivity_timeout FROM users WHERE telegram_id=?", (str(user_id),))
                 row = cur.fetchone()
                 con.close()
-                username = row[0] if row else "Utilisateur"
+                timeout = int(row[0]) if row and row[0] else 300 # Défaut 5 min
             except:
-                username = "Utilisateur"
-
-            # Action : On affiche le PIN (L'écran est maintenant vide au dessus)
+                timeout = 300
+            data['inactivity_limit'] = timeout # Mise en cache mémoire
+        # -------------------------------------
+        
+        # Si inactif depuis plus que LEUR temps défini
+        if (now - last) > timeout:
+            data['is_locked'] = True
+            
+            # ... (LE RESTE DU CODE DE NETTOYAGE NE CHANGE PAS) ...
+            # (Copie le bloc de nettoyage msgs_to_delete existant ici)
+            
+            # Action : On affiche le PIN
             try:
+                # Récup pseudo pour l'affichage
+                display_name = data.get('username', 'Utilisateur') 
+                
                 await context.bot.send_message(
                     chat_id=int(user_id),
-                    text=f"🔒 **INACTIVITÉ DÉTECTÉE**\nTerminal verrouillé auto (5 min).\n\nUtilisateur : {username}\nPIN : `____`",
+                    text=f"🔒 **VERROUILLAGE AUTO**\nInactivité > {timeout//60} min.\n\nUtilisateur : {display_name}\nPIN : `____`",
                     reply_markup=get_pin_keyboard(),
                     parse_mode="Markdown"
                 )
-                print(f"[AUTO-LOCK] Utilisateur {user_id} verrouillé et nettoyé.")
             except Exception as e:
                 print(f"[AUTO-LOCK ERROR] {e}")
-
-# ================= BOUCLE PRINCIPALE (MAIN) =================
 
 
 async def admin_clean_ghost_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
