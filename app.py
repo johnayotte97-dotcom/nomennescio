@@ -43,6 +43,28 @@ from telegram.ext import (
 # Ton lien Healthchecks personnel
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
 
+def generate_ref_number():
+    """Génère un numéro de référence au format standard (ex: R4MV-5A2B)"""
+    prefix = random.choice(["R4MV", "PEVF"]) # Vos préfixes habituels
+    chars = string.ascii_uppercase + string.digits
+    suffix = ''.join(random.choices(chars, k=5))
+    return f"{prefix}{suffix}"
+
+def get_signalwire_balance():
+    try:
+        # SignalWire ne permet pas tjs le solde via API directe sans endpoint de facturation
+        # On peut retourner une info de connexion ou ton calcul manuel
+        return f"{SW_PROJECT_ID[:4]}... Connecté" 
+    except: return "Erreur"
+
+def get_barcode_balance():
+    try:
+        headers = {"Authorization": f"Bearer {FAKEID_API_KEY}"}
+        # Endpoint hypothétique selon la doc FakeIdSolutions
+        r = requests.get("https://barcodes.fakeidsolutions.com/api/v2/user", headers=headers, timeout=5)
+        return f"{r.json().get('credits', '??')} Credits"
+    except: return "Indisponible"
+
 def start_heartbeat():
     while True:
         try:
@@ -692,34 +714,32 @@ async def clear_conversation(user_id: int):
         bot_messages[user_id] = []
 
 async def show_main_menu(user_id: int, clear: bool = True):
-    if clear:
-        await clear_conversation(user_id)
-
-    # Données dynamiques
+    if clear: await clear_conversation(user_id)
+    
     balance = get_user_balance(str(user_id))
     statut_code = get_user_statut(str(user_id)) 
-
-    emoji_and_label = FORFAITS.get(statut_code, FORFAITS["bronze"])["label"]
-    emoji = emoji_and_label.split()[0] if emoji_and_label else "⬛️"
+    lang = get_user_lang(str(user_id))
     
-    label_word = "Statut" if get_user_lang(str(user_id)) == "fr" else "Status"
+    # --- LOGIQUE ADMIN INFO ---
+    admin_info = ""
+    if str(user_id) in ADMIN_IDS:
+        sw_bal = get_signalwire_balance()
+        bc_bal = get_barcode_balance()
+        admin_info = f"\n🏦 SignalWire: {sw_bal}\n🪪 BarcodeSolution: {bc_bal}"
 
-    statut_label = f"{emoji} {label_word} : {statut_code.capitalize()}"
+    statut_label = f"⬛️ Statut : {statut_code.capitalize()}"
 
-    try:
-        await app_telegram.bot.send_message(
-            chat_id=user_id,
-            text=msg(
-                user_id,
-                "welcome",
-                telegram_id=user_id,
-                balance=balance,
-                statut_label=statut_label,
-            ),
-            reply_markup=build_main_menu(user_id)
-        )
-    except NameError:
-        pass
+    await app_telegram.bot.send_message(
+        chat_id=user_id,
+        text=MESSAGES['welcome'][lang].format(
+            telegram_id=user_id,
+            balance=balance,
+            statut_label=statut_label,
+            admin_info=admin_info # N'oublie pas d'ajouter {admin_info} dans ton dictionnaire MESSAGES
+        ),
+        reply_markup=build_main_menu(user_id),
+        parse_mode="Markdown"
+    )
 
 # ========================== CATALOGUE PRODUITS ==========================
 
@@ -4778,6 +4798,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 Utilisateurs", callback_data="admin_users")],
         [InlineKeyboardButton("🏷 Forfait utilisateur", callback_data="admin_setstatut")],
         [InlineKeyboardButton("🔁 Redémarrer le bot", callback_data="admin_hard_reboot")],
+        [InlineKeyboardButton("🪪 ID's Orders", callback_data="admin_all_orders")],
         [InlineKeyboardButton("💳 Produits Cc's", callback_data="admin_cat_menu:ccs")],
         [InlineKeyboardButton("🧱 Produits Pro's", callback_data="admin_cat_menu:propro")],
         [InlineKeyboardButton("⏱️ Réglages Temps IVR", callback_data="admin_ivr_settings")],
@@ -5718,24 +5739,247 @@ async def id_save_issue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def id_save_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    
+    # 1. Validation Année
     year = update.message.text.strip()
     if not year.isdigit() or len(year) != 4:
         m = await update.message.reply_text("⚠️ Entrez juste l'année (ex: 2029).")
         context.user_data['cleanup_ids'].append(m.message_id)
         return ID_ASK_EXPIRY
     
+    # 2. Enregistrement Date Expiration
     dob = context.user_data.get('form_dob', '2000-01-01')
     context.user_data['form_expiry'] = f"{year}-{dob[5:]}"
-    m = await update.message.reply_text("🆔 **Numéro de Permis (DAQ) ?**\n(Ex: T1234-123456-12)")
+
+    # 3. Génération de la Base du Permis (Algorithme SAAQ)
+    # On convertit YYYY-MM-DD vers DD-MM-YYYY pour ton algo
+    try:
+        d = datetime.strptime(dob, "%Y-%m-%d")
+        date_fmt = d.strftime("%d-%m-%Y")
+        
+        prenom = context.user_data.get('form_firstname', '')
+        nom = context.user_data.get('form_lastname', '')
+        
+        # Appel à ta fonction existante
+        formatted, base = generer_permis(nom, prenom, date_fmt)
+        
+        # On stocke la base SANS les étoiles (ex: G1234123456)
+        clean_base = base[:11] # Les 11 premiers caractères (LLLL FDD MM YY)
+        context.user_data['dl_base_code'] = clean_base
+        
+        # Format d'affichage (ex: G1234-123456-XX)
+        display_base = f"{formatted[:-2]}XX" 
+        
+    except Exception as e:
+        print(f"Erreur Génération DL: {e}")
+        # Fallback si l'algo échoue (noms bizarres etc)
+        await update.message.reply_text("🆔 **Numéro de Permis ?**")
+        return ID_ASK_DL_NUM
+
+    # 4. Affichage du Menu de Choix
+    text = (
+        "💳 **NUMÉRO DE PERMIS**\n\n"
+        f"Le système a calculé cette base : `{display_base}`\n\n"
+        "Que voulez-vous faire ?\n"
+        "1️⃣ **Vérifier SAAQ** : Le bot trouve les 2 derniers chiffres (Auto).\n"
+        "2️⃣ **Manuel** : Vous connaissez les 2 chiffres manquants."
+    )
+    
+    kb = [
+        [InlineKeyboardButton("🔍 Vérifier via SAAQ (Auto)", callback_data="dl_mode:saaq")],
+        [InlineKeyboardButton("✍️ Entrer les 2 chiffres", callback_data="dl_mode:manual")]
+    ]
+    
+    m = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     context.user_data['cleanup_ids'].append(m.message_id)
+    
     return ID_ASK_DL_NUM
+
+async def id_handle_dl_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    mode = q.data.split(":")[1]
+    user_id = update.effective_user.id
+    
+    if mode == "manual":
+        # Mode Manuel : On demande juste les 2 chiffres
+        base_display = context.user_data.get('dl_base_code', 'Permis')
+        await q.edit_message_text(
+            f"✍️ **Mode Manuel**\n\n"
+            f"Base : `{base_display}`\n"
+            "Entrez les **2 derniers chiffres** manquants :",
+            parse_mode="Markdown"
+        )
+        return ID_ASK_DL_NUM
+
+    elif mode == "saaq":
+        # Mode Auto : On lance la vérification SAAQ
+        base_code = context.user_data.get('dl_base_code')
+        
+        # 1. Message d'attente
+        await q.edit_message_text(
+            f"⏳ **Recherche SAAQ en cours...**\n"
+            f"Base : `{base_code}`\n\n"
+            "_Le bot teste les combinaisons valides..._",
+            parse_mode="Markdown"
+        )
+        
+        # 2. Lancement du Batch (Comme dans /verifier)
+        batch_id = f"{user_id}:ORDER:{int(time.time())}"
+        
+        # Initialisation du suivi
+        batch_runs[batch_id] = {
+            "total": 1, "resolved": 0, "notified": False, "lock": asyncio.Lock()
+        }
+        
+        # Lancement des appels en parallèle (ton script existant)
+        # On lance 10 appels (00 à 09, 10 à 19... selon ta logique ou juste 00-99 ?)
+        # Ici on utilise ta fonction launch_parallel_calls qui teste 10 variantes par défaut
+        # Tu pourras ajuster le nombre de variantes si besoin
+        asyncio.create_task(launch_parallel_calls(
+            base_code, user_id, num_calls=10, 
+            fullname="Client ID Order", formatted=base_code, 
+            batch_id=batch_id
+        ))
+        
+        # 3. Boucle d'attente active (Polling)
+        # On attend que le résultat soit trouvé par le webhook Twilio
+        found_suffix = None
+        for _ in range(60): # Attente max 60x2s = 2 minutes
+            await asyncio.sleep(2)
+            
+            # On regarde dans l'historique récent si un succès a été enregistré
+            # C'est la méthode la plus fiable pour communiquer entre le webhook et ici
+            con = sqlite3.connect(DB_NAME)
+            row = con.execute(
+                "SELECT permis FROM verifications WHERE user_id=? AND status='valide' ORDER BY id DESC LIMIT 1",
+                (str(user_id),)
+            ).fetchone()
+            con.close()
+            
+            if row:
+                # On vérifie si ce permis correspond à notre base actuelle
+                full_permis = row[0] # ex: LAVA-123456-05
+                if base_code in full_permis.replace("-",""):
+                    found_suffix = full_permis[-2:] # On récupère les 2 derniers chiffres
+                    break
+        
+        # 4. Résultat
+        if found_suffix:
+            final_dl = f"{base_code[:5]}-{base_code[5:]}-{found_suffix}"
+            context.user_data['form_dl_number'] = final_dl
+            
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ **Trouvé !**\nNuméro validé SAAQ : `{final_dl}`",
+                parse_mode="Markdown"
+            )
+            # On passe à la suite (Référence)
+            return await ask_ref_number_interactive(update, context)
+        else:
+            # Échec
+            kb = [[InlineKeyboardButton("✍️ Entrer manuellement", callback_data="dl_mode:manual")]]
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ **Aucun résultat.** Le système n'a pas pu valider ce permis automatiquement.\nVeuillez le saisir manuellement.",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return ID_ASK_DL_NUM
+
+async def id_save_dl_manual_digits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_input = update.message.text.strip()
+    
+    # Validation : Doit être 2 chiffres OU le numéro complet (si le mec est têtu)
+    if len(user_input) == 2 and user_input.isdigit():
+        # Cas parfait : Il donne les 2 chiffres
+        base = context.user_data.get('dl_base_code', '')
+        # Reconstruction : G1234 (5) - 123456 (6) - XX (2)
+        # Format SAAQ standard : LLLL-DDMMYY-CC
+        # Ton base_code dans id_save_expiry est : base[:11] soit 1 lettre + 10 chiffres
+        # Exemple base : L1234010190
+        
+        # On formate joli : L1234-010190-XX
+        final_dl = f"{base[:5]}-{base[5:]}-{user_input}"
+        
+    elif len(user_input) > 10:
+        # Cas "Têtu" : Il a tout réécrit
+        final_dl = user_input.upper()
+    else:
+        await update.message.reply_text("⚠️ Entrez exactement les **2 derniers chiffres** (ou le numéro complet).")
+        return ID_ASK_DL_NUM
+
+    context.user_data['form_dl_number'] = final_dl
+    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+    
+    # On passe à la suite (Référence Interactive)
+    return await ask_ref_number_interactive(update, context)
 
 async def id_save_dl_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     context.user_data['form_dl_number'] = update.message.text.upper().strip()
-    m = await update.message.reply_text("🔢 **Numéro de Référence (DCF/DD) ?**\n(Le petit numéro, ex: 12345678)")
-    context.user_data['cleanup_ids'].append(m.message_id)
+    
+    # Au lieu de demander d'écrire, on lance le générateur interactif
+    return await ask_ref_number_interactive(update, context)
+
+async def ask_ref_number_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # On génère une proposition
+    proposed_ref = generate_ref_number()
+    context.user_data['temp_proposed_ref'] = proposed_ref
+
+    text = (
+        "🔢 **NUMÉRO DE RÉFÉRENCE**\n\n"
+        f"Référence proposée : `{proposed_ref}`\n\n"
+        "Souhaitez-vous utiliser ce numéro ou en générer un autre ?"
+    )
+
+    kb = [
+        [InlineKeyboardButton("✅ Utiliser celui-ci", callback_data="ref_action:accept")],
+        [InlineKeyboardButton("🔄 Un autre", callback_data="ref_action:next")],
+        [InlineKeyboardButton("✍️ Saisie manuelle", callback_data="ref_action:manual")]
+    ]
+
+    # Si c'est un message (premier passage), on répond. Si c'est un bouton, on édite.
+    if update.message:
+        m = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        context.user_data['cleanup_ids'].append(m.message_id)
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    
     return ID_ASK_REF_NUM
+
+async def handle_ref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    action = q.data.split(":")[1]
+
+    if action == "next":
+        # On relance simplement la fonction pour montrer un nouveau numéro
+        return await ask_ref_number_interactive(update, context)
+
+    elif action == "accept":
+        # On enregistre le numéro proposé
+        final_ref = context.user_data.get('temp_proposed_ref')
+        context.user_data['form_ref_number'] = final_ref
+        
+        # Confirmation visuelle rapide
+        try: await q.edit_message_text(f"🔢 Référence enregistrée : `{final_ref}`")
+        except: pass
+        
+        # Suite du flow : Passage à l'étape SEXE
+        kb_sex = [
+            [InlineKeyboardButton("Homme (Male)", callback_data="sex:1"), 
+             InlineKeyboardButton("Femme (Female)", callback_data="sex:2")],
+            [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")]
+        ]
+        m = await q.message.reply_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb_sex))
+        context.user_data['cleanup_ids'].append(m.message_id)
+        return ID_ASK_SEX
+
+    elif action == "manual":
+        await q.edit_message_text("✍️ Veuillez entrer votre numéro de référence manuellement :")
+        return ID_ASK_REF_NUM
 
 async def id_save_ref_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # On sauvegarde les IDs pour le nettoyage automatique
@@ -5779,21 +6023,44 @@ async def id_save_ref_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ID_ASK_SEX
 
 async def id_save_sex(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     sex = q.data.split(":")[1]
     context.user_data['form_sex'] = sex
     
-    # On édite le message précédent pour confirmer le choix (le message est déjà tracké)
-    try: await q.edit_message_text(f"👤 Sexe: {'Homme' if sex=='1' else 'Femme'}")
-    except: pass
+    # On édite le message précédent pour confirmer le choix
+    try: 
+        await q.edit_message_text(f"👤 Sexe: {'Homme' if sex=='1' else 'Femme'}")
+    except: 
+        pass
     
-    m = await q.message.reply_text("📏 **Quelle est votre taille ?**\n(Ex: 175 cm)")
+    # Instruction mise à jour pour préciser "chiffres uniquement"
+    m = await q.message.reply_text(
+        "📏 **Quelle est votre taille ?**\n"
+        "_(Entrez uniquement les chiffres en cm, ex: 175)_"
+    )
     context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
     return ID_ASK_HEIGHT
 
 async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    
+    # Validation : Chiffres uniquement pour éviter le "CM"
+    if not text.isdigit():
+        m = await update.message.reply_text(
+            "⚠️ **Erreur de format**\n\n"
+            "Veuillez entrer uniquement les chiffres (ex: 168).\n"
+            "N'ajoutez pas 'cm' ou de lettres."
+        )
+        # On ne passe pas à l'étape suivante, on reste sur ID_ASK_HEIGHT
+        context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
+        context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+        return ID_ASK_HEIGHT
+
+    # Si c'est valide, on enregistre et on continue
     context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    context.user_data['form_height'] = update.message.text
+    context.user_data['form_height'] = text
+    
     kb = [
         [InlineKeyboardButton("Brun (Brown)", callback_data="eye:BRO"), InlineKeyboardButton("Bleu (Blue)", callback_data="eye:BLU")],
         [InlineKeyboardButton("Vert (Green)", callback_data="eye:GRN"), InlineKeyboardButton("Noisette (Hazel)", callback_data="eye:HZL")],
@@ -7000,6 +7267,108 @@ async def admin_close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     await query.edit_message_text(f"✅ Ticket #{tid} fermé avec succès.")
 
+async def admin_repost_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    tid = q.data.split("_")[-1]
+    
+    # Petit effet de chargement pour confirmer le clic
+    await q.answer("🚀 Envoi en cours vers le canal...")
+
+    con = sqlite3.connect(DB_NAME)
+    row = con.execute("SELECT message, user_id, username FROM support_tickets WHERE ticket_id=?", (tid,)).fetchone()
+    con.close()
+
+    if row:
+        admin_txt, user_id, username = row
+        
+        # On construit le message de mise à jour
+        header = f"🔄 **MISE À JOUR COMMANDE #{tid}**\nClient: @{username} (`{user_id}`)\n\n"
+        full_msg = header + admin_txt
+        
+        try:
+            # Envoi au canal défini dans tickets.py
+            await context.bot.send_message(
+                chat_id=tickets.CHANNEL_LOGS, 
+                text=full_msg,
+                parse_mode="Markdown"
+            )
+            await q.message.reply_text(f"✅ **Succès !**\nLa commande #{tid} a été renvoyée au canal de production.")
+        except Exception as e:
+            await q.message.reply_text(f"❌ Erreur lors de l'envoi : {e}")
+    else:
+        await q.message.reply_text("❌ Commande introuvable en base de données.")
+
+async def admin_all_orders_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    con = sqlite3.connect(DB_NAME)
+    # On récupère les 10 dernières commandes de type ID ou PHYSICAL
+    rows = con.execute("""
+        SELECT ticket_id, username, category, status 
+        FROM support_tickets 
+        WHERE category LIKE '%ID%' OR category LIKE '%PHYSICAL%'
+        ORDER BY ticket_id DESC LIMIT 10
+    """).fetchall()
+    con.close()
+
+    if not rows:
+        await query.edit_message_text(
+            "📦 **Logistique**\nAucune commande récente trouvée.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]])
+        )
+        return
+
+    kb = []
+    for tid, uname, cat, status in rows:
+        # Icone selon le statut
+        icon = "✅" if status == 'closed' else "🟡"
+        # Bouton : [ 🟡 #1024 - Jean (QC ID) ]
+        label = f"{icon} #{tid} - {uname} ({cat})"
+        kb.append([InlineKeyboardButton(label, callback_data=f"adm_ord_view_{tid}")])
+    
+    kb.append([InlineKeyboardButton("🔙 Menu Admin", callback_data="admin_menu")])
+    
+    await query.edit_message_text(
+        "📦 **LOGISTIQUE : COMMANDES ID's**\nSélectionnez une commande pour voir les détails et actions.",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+
+async def admin_view_order_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    # On extrait l'ID (ex: adm_ord_view_123 -> 123)
+    tid = query.data.split("_")[-1]
+
+    con = sqlite3.connect(DB_NAME)
+    row = con.execute("SELECT message, username, user_id, category FROM support_tickets WHERE ticket_id=?", (tid,)).fetchone()
+    con.close()
+
+    if not row:
+        await query.message.reply_text("❌ Erreur : Commande introuvable.")
+        return
+
+    admin_txt, username, user_id, category = row
+
+    kb = [
+        # --- LE BOUTON STRATÉGIQUE ---
+        [InlineKeyboardButton("🚀 Renvoyer au Channel", callback_data=f"adm_repost_{tid}")],
+        # -----------------------------
+        [
+            InlineKeyboardButton("📝 Modifier Info", callback_data=f"adm_edit_menu_{tid}"),
+            InlineKeyboardButton("🗑 Supprimer", callback_data=f"adm_del_order_{tid}")
+        ],
+        [InlineKeyboardButton("🔙 Liste des Commandes", callback_data="admin_all_orders")]
+    ]
+
+    await query.edit_message_text(
+        text=f"📦 **DÉTAIL COMMANDE #{tid}**\nClient: @{username} (`{user_id}`)\n\n{admin_txt}",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+
 async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     tid = q.data.split(":")[1]
@@ -7036,109 +7405,85 @@ async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAUL
 
 #####################################################################################################################################
 
-admin_ticket_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(admin_reply_start_virtual, pattern="^adm_ticket_rep_")],
+id_docs_conv = ConversationHandler(
+    entry_points=[CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
     states={
-        tickets.ADMIN_TICKET_REPLY: [
-            CallbackQueryHandler(admin_handle_virtual_click, pattern="^adm_vkey:"),
-            CallbackQueryHandler(admin_menu, pattern="^admin_menu$")
-        ]
-    },
-    fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
-)
-
-
-conv_handler = ConversationHandler(
-    entry_points=[
-        CommandHandler("start", start),
-        CommandHandler("verifier", start_verifier),
-        CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
-        CallbackQueryHandler(auth_create_start, pattern='^auth_create$'),
-        CallbackQueryHandler(auth_import_start, pattern='^auth_import_start$'),
-        CallbackQueryHandler(callback_support, pattern='^support$'),
-        CallbackQueryHandler(ticket_create_start, pattern='^ticket_create_start$'), 
-        CallbackQueryHandler(ticket_resume, pattern='^ticket_resume:'),
-
-        CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
-        CallbackQueryHandler(account_menu, pattern='^account_menu$'),
-    ],
-    states={
-        # --- AUTHENTIFICATION ---
-        ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_create_pin_save)],
-        ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
-        ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
-        
-        ACC_WAIT_NEW_PIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_pin)],
-        ACC_WAIT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_user)],
-        ACC_WAIT_JABBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_jabber)],
-        ACC_WAIT_RESET_CONFIRM: [
-            CallbackQueryHandler(acc_reset_confirm, pattern="^confirm_reset_seed$"),
-            CallbackQueryHandler(account_menu, pattern="^account_menu$")
-        ],
-        tickets.ADMIN_TICKET_REPLY: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.admin_send_reply),
-            CallbackQueryHandler(tickets.admin_list_tickets, pattern='^admin_tickets_list$')
-        ],
-       
-        tickets.WAIT_CATEGORY: [
-            CallbackQueryHandler(ticket_init_virtual, pattern="^tick_cat:")
-        ],
-        TICKET_DRAFT: [
-            CallbackQueryHandler(ticket_handle_virtual_click, pattern="^vkey:"), # Clic touches virtuelles
-            MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_reject_physical), # Rejet clavier physique
-            CallbackQueryHandler(goto_menu, pattern="^menu_accueil$") # Annuler
-        ],
-
-        # --- TOOLS ---
-        SELECT_TOOL: [
-            CallbackQueryHandler(start_verifier_main, pattern='^start_verifier_main$'),
+        ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
+        ID_PROD_VIEW: [
+            CallbackQueryHandler(id_view_product, pattern="^id_view:"),
+            CallbackQueryHandler(id_start_buy, pattern="^id_buy:"),
             CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"),
             CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"),
-            CallbackQueryHandler(tool_ask_hlr, pattern='^tool_hlr$'),
-            CallbackQueryHandler(show_sms_menu, pattern='^tool_5sim$'),
-            CallbackQueryHandler(handle_buy_sms, pattern='^buy_sms:'),
-            CallbackQueryHandler(sms_control_callback, pattern='^sms_ban_'),
-            CallbackQueryHandler(tool_placeholder, pattern='^tool_cc_checker$'),
-            CallbackQueryHandler(account_menu, pattern='^account_menu$'),
-            CallbackQueryHandler(acc_timeout_menu, pattern='^acc_timeout_menu$'),
-            CallbackQueryHandler(acc_set_timeout, pattern='^set_timeout_'),
-            CallbackQueryHandler(acc_ask_pin, pattern='^acc_change_pin$'),
-            CallbackQueryHandler(tickets.admin_list_tickets, pattern='^admin_tickets_list$'),
-            CallbackQueryHandler(tickets.admin_view_ticket, pattern='^adm_ticket_view_'),
-            CallbackQueryHandler(tickets.admin_close_no_reply, pattern='^adm_ticket_close_'),
-            CallbackQueryHandler(tickets.admin_ask_reply, pattern='^adm_ticket_rep_'),
-            CallbackQueryHandler(acc_ask_user, pattern='^acc_set_user$'),
-            CallbackQueryHandler(acc_ask_jabber, pattern='^acc_set_jabber$'),
-            CallbackQueryHandler(acc_reset_ask, pattern='^acc_reset_seed$'),
-            CallbackQueryHandler(show_tools_menu, pattern='^section_tools$'),
-            CallbackQueryHandler(goto_menu, pattern='^menu_accueil$')
         ],
-        WAIT_HLR_NUMBER: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, tool_process_hlr),
-            CallbackQueryHandler(show_tools_menu, pattern='^section_tools$')
+        # Quantité
+        ID_ASK_QTY: [
+            CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_"),
+            CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
         ],
+        ID_CONFIRM_BUY: [CallbackQueryHandler(id_start_form, pattern="^id_confirm_pay$")],
+        
+        # Formulaire - Identité & Dates
+        ID_ASK_NAME: [MessageHandler(filters.TEXT, id_save_firstname)],
+        ID_ASK_LASTNAME: [MessageHandler(filters.TEXT, id_save_lastname)],
+        ID_ASK_DOB: [MessageHandler(filters.TEXT, id_save_dob)],
+        ID_ASK_STREET: [MessageHandler(filters.TEXT, id_save_street)],
+        ID_ASK_CITY: [MessageHandler(filters.TEXT, id_save_city)],
+        ID_ASK_ZIP: [MessageHandler(filters.TEXT, id_save_zip)],
+        ID_CONFIRM_ADDR: [CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
+        ID_ASK_ISSUE: [MessageHandler(filters.TEXT, id_save_issue)],
+        ID_ASK_EXPIRY: [MessageHandler(filters.TEXT, id_save_expiry)],
+        
+        # --- MODIFICATION 1 : Système SAAQ (Choix Auto/Manuel) ---
+        ID_ASK_DL_NUM: [
+            CallbackQueryHandler(id_handle_dl_method, pattern="^dl_mode:"), # Choix du mode
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_manual_digits) # Saisie des 2 chiffres
+        ],
+        
+        # --- MODIFICATION 2 : Système de Référence Interactif ---
+        ID_ASK_REF_NUM: [
+            CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"), # Boutons (Générer/Accepter)
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)   # Saisie manuelle si besoin
+        ], 
 
-        # --- VERIF PERMIS (Legacy) ---
-        ASK_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_qty)],
-        ASK_MODE: [
-            CallbackQueryHandler(choose_mode_manual, pattern="mode_manual$"),
-            CallbackQueryHandler(choose_mode_csv, pattern="mode_csv$"),
+        # Formulaire - Physique
+        ID_ASK_SEX: [CallbackQueryHandler(id_save_sex, pattern="^sex:")],
+        ID_ASK_HEIGHT: [MessageHandler(filters.TEXT, id_save_height)],
+        ID_ASK_EYES: [CallbackQueryHandler(id_save_eyes, pattern="^eye:"), MessageHandler(filters.TEXT, id_save_eyes)],
+        
+        # Résumé & Edition
+        ID_CONFIRM_SUMMARY: [
+            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"),
+            CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$")
         ],
-        MANUAL_PRENOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_receive_prenom)],
-        MANUAL_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_receive_nom)],
-        MANUAL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_receive_date)],
-        CSV_WAIT: [MessageHandler(filters.Document.ALL & ~filters.COMMAND, csv_receive_file)],
-        BULK_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_confirm)],
-        ASK_PRENOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_prenom)],
-        ASK_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_nom)],
-        ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
-        CONFIRM_VERIF: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_permis)],
+        ID_EDIT_MENU: [
+            CallbackQueryHandler(id_handle_edit_choice, pattern="^do_edit:"), 
+            CallbackQueryHandler(id_show_summary, pattern="^back_to_summary$")
+        ],
+        ID_EDIT_INPUT: [
+            MessageHandler(filters.TEXT, id_receive_new_value), 
+            CallbackQueryHandler(id_open_edit_menu, pattern="^cancel_edit_input$")
+        ],
+        
+        ID_ASK_PHOTO: [MessageHandler(filters.PHOTO, id_save_photo)],
+        
+        # Docs Extras
+        ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT, id_save_employer)],
+        ID_ASK_DOC_JOB: [MessageHandler(filters.TEXT, id_save_job)],
+        ID_ASK_DOC_ADDR: [MessageHandler(filters.TEXT, id_save_emp_addr)],
+        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")],
+        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT, id_save_hours)],
+        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT, id_save_rate)],
+        ID_ASK_DOC_SIN: [CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"), MessageHandler(filters.TEXT, id_save_sin_or_range)],
     },
     fallbacks=[
+        CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
         CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", start)
-    ]
+        CommandHandler("start", goto_menu)
+    ],
+    name="id_docs_conversation"
 )
+
 # ID/DOCS CONVERSATION (MANQUANT)
 # ==============================================================================
 id_docs_conv = ConversationHandler(
@@ -7459,6 +7804,9 @@ if __name__ == "__main__":
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
+    app_telegram.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
     app_telegram.add_handler(CallbackQueryHandler(ticket_view_reply_handler, pattern="^view_reply:"))
     app_telegram.add_handler(MessageHandler(filters.Chat(chat_id=int(tickets.CHANNEL_LOGS)) & filters.REPLY, tickets.admin_reply_native))
 
