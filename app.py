@@ -5516,34 +5516,50 @@ async def id_view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ID_PROD_VIEW
 
 
-# ==============================================================================
-# BLOC DE GESTION QUANTITÉ (CORRIGÉ & OPTIMISÉ)
-# ==============================================================================
-
 async def id_start_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Initialise le produit et demande la quantité avant le formulaire."""
     q = update.callback_query
     await q.answer()
     
-    # 1. Initialisation du produit
-    pid = int(q.data.split(":")[1])
+    # 1. On extrait l'ID du produit depuis le bouton (ex: id_buy:12)
+    try:
+        pid = int(q.data.split(":")[1])
+    except (IndexError, ValueError):
+        await q.message.reply_text("❌ Erreur de sélection du produit.")
+        return ConversationHandler.END
+
+    # 2. Récupération des infos en base de données
     con = sqlite3.connect(DB_NAME)
     row = con.execute("SELECT title, price, tier FROM products WHERE id=?", (pid,)).fetchone()
     con.close()
     
-    context.user_data['id_product'] = {'id': pid, 'name': row[0], 'price': row[1], 'code': row[2]}
+    if not row:
+        await q.message.reply_text("❌ Produit introuvable.")
+        return ConversationHandler.END
+    
+    # 3. Stockage dans la session utilisateur
+    context.user_data['id_product'] = {
+        'id': pid, 
+        'name': row[0], 
+        'price': row[1], 
+        'code': row[2]
+    }
     context.user_data['current_qty'] = 1 
     
-    # 2. Suppression de la photo pour afficher le menu textuel
-    try: await q.message.delete()
-    except: pass
+    # 4. Nettoyage de la photo/menu précédent pour afficher proprement la sélection de quantité
+    try:
+        await q.message.delete()
+    except:
+        pass
     
-    # 3. Affichage du menu quantité
+    # 5. Appel de l'affichage de quantité (Assurez-vous que update_qty_display existe)
     await update_qty_display(update, context, new_message=True)
     return ID_ASK_QTY
 
 async def update_qty_display(update: Update, context: ContextTypes.DEFAULT_TYPE, new_message=False):
+    """Gère l'affichage visuel du sélecteur de quantité."""
     qty = context.user_data.get('current_qty', 1)
-    prod = context.user_data['id_product']
+    prod = context.user_data.get('id_product', {'name': 'Produit', 'price': 0})
     total_price = prod['price'] * qty
     
     kb = [
@@ -5556,7 +5572,6 @@ async def update_qty_display(update: Update, context: ContextTypes.DEFAULT_TYPE,
             InlineKeyboardButton("+5", callback_data="qty_add_5"), 
             InlineKeyboardButton("+10", callback_data="qty_add_10")
         ],
-        # Ce bouton déclenche 'qty_confirm'
         [InlineKeyboardButton(f"✅ Confirmer ({total_price:.2f}$)", callback_data="qty_confirm")],
         [InlineKeyboardButton("⬅️ Annuler", callback_data="id_menu_entry")]
     ]
@@ -5565,18 +5580,19 @@ async def update_qty_display(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if new_message:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
-        try: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        except: pass
+        try:
+            await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        except:
+            pass
 
 async def id_handle_qty_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère les clics sur les boutons Plus/Moins/Confirmer."""
     q = update.callback_query
     data = q.data
     
-    # --- PATCH CRITIQUE : Redirection du bouton Confirmer ---
-    # Le pattern regex "^qty_" capture aussi "qty_confirm", donc on doit gérer la redirection ici.
+    # Redirection si clic sur confirmer
     if data == "qty_confirm":
         return await id_save_qty(update, context)
-    # --------------------------------------------------------
 
     current = context.user_data.get('current_qty', 1)
     
@@ -5590,72 +5606,66 @@ async def id_handle_qty_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     return ID_ASK_QTY
 
 async def id_save_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Cas A : Clic sur "✅ Confirmer"
+    """Sauvegarde finale de la quantité et passage au formulaire avec nettoyage."""
+    chat_id = update.effective_chat.id
+    
+    # 1. On récupère la quantité validée
     if update.callback_query:
-        # On valide la quantité actuelle
-        context.user_data['id_qty'] = context.user_data.get('current_qty', 1)
-        return await id_start_form(update, context)
-        
-    # Cas B : Texte écrit manuellement (ex: "50")
-    if update.message and update.message.text:
+        qty = context.user_data.get('current_qty', 1)
+        # SUPPRESSION PHYSIQUE DU MENU QUANTITÉ
+        try:
+            await update.callback_query.message.delete()
+        except:
+            pass
+    elif update.message and update.message.text:
         text = update.message.text.strip()
         if text.isdigit() and int(text) > 0:
-            context.user_data['current_qty'] = int(text)
-            # On réaffiche pour confirmation visuelle
-            await update_qty_display(update, context, new_message=True)
-            return ID_ASK_QTY
+            qty = int(text)
+            # SUPPRESSION DE LA RÉPONSE CHIFFRÉE DE L'USER
+            try: await update.message.delete()
+            except: pass
         else:
             await update.message.reply_text("⚠️ Chiffre invalide.")
             return ID_ASK_QTY
-            
-    return ID_ASK_QTY
+    else:
+        return ID_ASK_QTY
 
-async def cleanup_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Supprime tous les messages de l'historique sauf le dernier."""
-    cleanup_list = context.user_data.get('cleanup_ids', [])
-    if len(cleanup_list) > 1: # On garde au moins 1 message (le dernier bot msg)
-        for msg_id in cleanup_list[:-1]:
-            try: await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except: pass
-        context.user_data['cleanup_ids'] = [cleanup_list[-1]]
+    # 2. Sauvegarde dans la session
+    context.user_data['id_qty'] = qty
+    
+    # 3. Lancement du formulaire (Nouveau message propre)
+    return await id_start_form(update, context)
 
-# --- DÉBUT BLOC FORMULAIRE AVEC RETOUR ---
+# ==============================================================================
+# 🧩 MODULE ID/DOCS COMPLET (LOGIQUE DE NETTOYAGE INCLUSE)
+# ==============================================================================
 
 async def clean_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Supprime tous les messages enregistrés (Question précédente + Réponse utilisateur)
-    pour garder l'écran propre.
-    """
+    """Nettoyeur physique : Supprime la question précédente et la réponse client."""
     chat_id = update.effective_chat.id
+    cleanup_list = context.user_data.get('cleanup_ids', [])
     
-    # 1. On ajoute le message que l'utilisateur vient d'envoyer (ex: "Benjamin") à la liste
+    # On ajoute le message texte que l'utilisateur vient d'envoyer (ex: Benjamin)
     if update.message:
-        context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
+        cleanup_list.append(update.message.message_id)
         
-    # 2. On supprime TOUT ce qu'il y a dans la liste
-    ids_to_delete = context.user_data.get('cleanup_ids', [])
-    for mid in ids_to_delete:
+    for msg_id in cleanup_list:
         try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except:
-            pass # Si déjà supprimé ou introuvable, on ignore
+            pass # Déjà supprimé ou trop vieux
             
-    # 3. On remet la liste à zéro pour la prochaine étape
     context.user_data['cleanup_ids'] = []
 
 async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    
-    # Vérif solde... (inchangé)
     total = context.user_data['id_product']['price'] * context.user_data['id_qty']
+    
     if get_user_balance(user_id) < total:
-        await context.bot.send_message(chat_id=user_id, text=f"❌ Solde insuffisant.", reply_markup=kb_back_to_menu())
+        await context.bot.send_message(chat_id=user_id, text=f"❌ **Solde insuffisant.**", reply_markup=kb_back_to_menu())
         return ConversationHandler.END
     
-    # On initialise la liste
     context.user_data['cleanup_ids'] = []
-    
-    # On envoie la première question
     kb = [[InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]]
     m = await context.bot.send_message(
         chat_id=user_id, 
@@ -5663,543 +5673,170 @@ async def id_start_form(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
-    # On sauvegarde l'ID de ce message pour le supprimer plus tard
-    context.user_data['cleanup_ids'].append(m.message_id)
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_NAME
 
 async def id_save_firstname(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1. Sauvegarde la donnée
     context.user_data['form_firstname'] = update.message.text.strip()
-    
-    # 2. NETTOYAGE (Supprime la question d'avant et la réponse "Benjamin")
     await clean_chat(update, context)
     
-    # 3. Envoie la nouvelle question
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_NAME}")]]
-    m = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
-    
-    # 4. On track le nouveau message
-    context.user_data['cleanup_ids'].append(m.message_id)
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_LASTNAME
 
 async def id_save_lastname(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_lastname'] = update.message.text.strip()
-    
-    # NETTOYAGE
     await clean_chat(update, context)
-
-    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
     
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
     if context.user_data.get('id_category') == 'document':
         context.user_data['form_dob'] = "N/A"
-        m = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", 
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown"
-        )
-        context.user_data['cleanup_ids'].append(m.message_id)
-        return ID_ASK_STREET
+        text, state = "📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", ID_ASK_STREET
     else:
-        m = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", 
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown"
-        )
-        context.user_data['cleanup_ids'].append(m.message_id)
-        return ID_ASK_DOB
+        text, state = "📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", ID_ASK_DOB
+
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
+    return state
 
 async def id_save_dob(update: Update, context: ContextTypes.DEFAULT_TYPE):
     clean_date = parse_date_smart(update.message.text)
-    
-    # Si erreur, on ne nettoie PAS tout de suite pour laisser l'utilisateur voir son erreur, 
-    # ou alors on nettoie et on réaffiche le message d'erreur proprement.
-    # Option "Propre" :
-    await clean_chat(update, context) 
+    await clean_chat(update, context)
     
     if not clean_date:
-        kb_err = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
-        m = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="⚠️ **Format invalide.**\nRéessayez (ex: 15/05/1995).",
-            reply_markup=InlineKeyboardMarkup(kb_err),
-            parse_mode="Markdown"
-        )
-        context.user_data['cleanup_ids'].append(m.message_id)
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_LASTNAME}")]]
+        m = await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ **Format invalide.** Réessayez :", reply_markup=InlineKeyboardMarkup(kb))
+        context.user_data['cleanup_ids'] = [m.message_id]
         return ID_ASK_DOB
         
     context.user_data['form_dob'] = clean_date
-    
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOB}")]]
-    m = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
-    context.user_data['cleanup_ids'].append(m.message_id)
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_STREET
 
 async def id_save_street(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_street'] = update.message.text
     await clean_chat(update, context)
-    
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_STREET}")]]
-    m = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
-    context.user_data['cleanup_ids'].append(m.message_id)
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="🏙️ **Adresse (2/3)**\nQuelle est la **Ville** ?", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_CITY
 
 async def id_save_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['addr_city'] = update.message.text
     await clean_chat(update, context)
-    
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_CITY}")]]
-    m = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
-    context.user_data['cleanup_ids'].append(m.message_id)
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📮 **Adresse (3/3)**\nQuel est le **Code Postal** ?", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_ZIP
 
 async def id_save_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    zip_code = update.message.text.upper().strip()
-    context.user_data['addr_zip'] = zip_code
-    
+    context.user_data['addr_zip'] = update.message.text.upper().strip()
     await clean_chat(update, context)
-    
-    raw = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {zip_code}"
-    # Message temporaire de chargement
     m_wait = await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 Validation Google Maps...")
-    
-    suggestions = validate_address_google(raw)
-    context.user_data['addr_suggestions'] = suggestions or [raw]
+    suggestions = validate_address_google(f"{context.user_data['addr_street']}, {context.user_data['addr_city']}")
+    context.user_data['addr_suggestions'] = suggestions or [context.user_data['addr_street']]
     
     kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(context.user_data['addr_suggestions'])]
     kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
     kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")])
-    
-    # On édite le message de chargement (ou on le remplace)
-    # Comme c'est le seul message à l'écran, on le track
     await m_wait.edit_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
-    context.user_data['cleanup_ids'].append(m_wait.message_id)
-    
+    context.user_data['cleanup_ids'] = [m_wait.message_id]
     return ID_CONFIRM_ADDR
 
-
-async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    
-    # Cas du bouton "Réécrire"
-    if "retry" in q.data:
-        # On retourne au début de l'adresse (Rue)
-        # On détermine le retour arrière selon le type (Doc ou ID)
-        prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
-        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{prev}")]]
-        
-        await q.edit_message_text("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
-        return ID_ASK_STREET
-    
-    # Cas du choix d'une adresse (addr_pick:0)
-    try:
-        idx = int(q.data.split(":")[1])
-        # On récupère l'adresse choisie dans la liste
-        suggestions = context.user_data.get('addr_suggestions', [])
-        if suggestions and 0 <= idx < len(suggestions):
-            context.user_data['form_address'] = suggestions[idx]
-        else:
-            # Fallback
-            raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}, {context.user_data.get('addr_zip')}"
-            context.user_data['form_address'] = raw
-    except:
-        pass
-    
-    # Passage à l'étape suivante
-    if context.user_data.get('id_category') == 'document':
-        # Si Document -> Employeur
-        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
-        await q.edit_message_text("🏢 **Nom de l'Employeur** ?", reply_markup=InlineKeyboardMarkup(kb))
-        return ID_ASK_DOC_EMPLOYER
-    else:
-        # Si ID -> Date Émission
-        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
-        await q.edit_message_text("📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)", reply_markup=InlineKeyboardMarkup(kb))
-        return ID_ASK_ISSUE
-
-# --- Note: id_confirm_addr_handler n'a pas besoin d'être modifié car il mène à Issue ---
-
 async def id_save_issue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     txt = update.message.text
-    if txt.lower() in ['today', "aujourd'hui", 'now']:
-        clean_date = datetime.now().strftime("%Y-%m-%d")
-    else:
-        clean_date = parse_date_smart(txt)
+    clean_date = parse_date_smart(txt) if txt.lower() not in ['today', "aujourd'hui"] else datetime.now().strftime("%Y-%m-%d")
+    await clean_chat(update, context)
     
     if not clean_date:
-        # En cas d'erreur, retour vers Confirmation Adresse
-        kb_err = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
-        m = await update.message.reply_text("⚠️ Date invalide.", reply_markup=InlineKeyboardMarkup(kb_err))
-        context.user_data['cleanup_ids'].append(m.message_id)
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
+        m = await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Date invalide.", reply_markup=InlineKeyboardMarkup(kb))
+        context.user_data['cleanup_ids'] = [m.message_id]
         return ID_ASK_ISSUE
         
     context.user_data['form_issue'] = clean_date
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ISSUE}")]]
-    m = await update.message.reply_text("📅 **Quelle est l'Année d'Expiration ?**\nEx: **2028**", reply_markup=InlineKeyboardMarkup(kb))
-    context.user_data['cleanup_ids'].append(m.message_id)
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📅 **Année d'Expiration ?** (Ex: 2028)", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_EXPIRY
 
 async def id_save_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    
     year = update.message.text.strip()
+    await clean_chat(update, context)
+    
     if not year.isdigit() or len(year) != 4:
-        kb_err = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ISSUE}")]]
-        m = await update.message.reply_text("⚠️ Entrez juste l'année (ex: 2029).", reply_markup=InlineKeyboardMarkup(kb_err))
-        context.user_data['cleanup_ids'].append(m.message_id)
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ISSUE}")]]
+        m = await context.bot.send_message(chat_id=update.effective_chat.id, text="⚠️ Année invalide.", reply_markup=InlineKeyboardMarkup(kb))
+        context.user_data['cleanup_ids'] = [m.message_id]
         return ID_ASK_EXPIRY
     
     dob = context.user_data.get('form_dob', '2000-01-01')
     context.user_data['form_expiry'] = f"{year}-{dob[5:]}"
-
+    
     try:
         d = datetime.strptime(dob, "%Y-%m-%d")
-        date_fmt = d.strftime("%d-%m-%Y")
-        formatted, base = generer_permis(context.user_data.get('form_lastname',''), context.user_data.get('form_firstname',''), date_fmt)
-        clean_base = base[:11]
-        context.user_data['dl_base_code'] = clean_base
+        formatted, base = generer_permis(context.user_data.get('form_lastname',''), context.user_data.get('form_firstname',''), d.strftime("%d-%m-%Y"))
+        context.user_data['dl_base_code'] = base[:11]
         display_base = f"{formatted[:-2]}XX"
-    except:
-        display_base = "Erreur"
+    except: display_base = "Calcul..."
 
-    text = (
-        "💳 **NUMÉRO DE PERMIS**\n\n"
-        f"Base : `{display_base}`\n\n"
-        "Que voulez-vous faire ?"
-    )
     kb = [
-        [InlineKeyboardButton("🔍 Vérifier via SAAQ (Auto)", callback_data="dl_mode:saaq")],
-        [InlineKeyboardButton("✍️ Entrer les 2 chiffres", callback_data="dl_mode:manual")],
-        # Bouton retour vers Expiration
-        [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")] 
+        [InlineKeyboardButton("🔍 SAAQ (Auto)", callback_data="dl_mode:saaq")],
+        [InlineKeyboardButton("✍️ Manuel", callback_data="dl_mode:manual")],
+        [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")]
     ]
-    m = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    context.user_data['cleanup_ids'].append(m.message_id)
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text=f"💳 **PERMIS**\nBase : `{display_base}`", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_DL_NUM
 
-# --- FIN BLOC FORMULAIRE ---
 
-async def id_handle_dl_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    
-    mode = q.data.split(":")[1]
-    user_id = update.effective_user.id
-    
-    if mode == "manual":
-        # Mode Manuel : On demande juste les 2 chiffres
-        base_display = context.user_data.get('dl_base_code', 'Permis')
-        await q.edit_message_text(
-            f"✍️ **Mode Manuel**\n\n"
-            f"Base : `{base_display}`\n"
-            "Entrez les **2 derniers chiffres** manquants :",
-            parse_mode="Markdown"
-        )
-        return ID_ASK_DL_NUM
-
-    elif mode == "saaq":
-        # Mode Auto : On lance la vérification SAAQ
-        base_code = context.user_data.get('dl_base_code')
-        
-        # 1. Message d'attente
-        await q.edit_message_text(
-            f"⏳ **Recherche SAAQ en cours...**\n"
-            f"Base : `{base_code}`\n\n"
-            "_Le bot teste les combinaisons valides..._",
-            parse_mode="Markdown"
-        )
-        
-        # 2. Lancement du Batch (Comme dans /verifier)
-        batch_id = f"{user_id}:ORDER:{int(time.time())}"
-        
-        # Initialisation du suivi
-        batch_runs[batch_id] = {
-            "total": 1, "resolved": 0, "notified": False, "lock": asyncio.Lock()
-        }
-        
-        # Lancement des appels en parallèle (ton script existant)
-        # On lance 10 appels (00 à 09, 10 à 19... selon ta logique ou juste 00-99 ?)
-        # Ici on utilise ta fonction launch_parallel_calls qui teste 10 variantes par défaut
-        # Tu pourras ajuster le nombre de variantes si besoin
-        asyncio.create_task(launch_parallel_calls(
-            base_code, user_id, num_calls=10, 
-            fullname="Client ID Order", formatted=base_code, 
-            batch_id=batch_id
-        ))
-        
-        # 3. Boucle d'attente active (Polling)
-        # On attend que le résultat soit trouvé par le webhook Twilio
-        found_suffix = None
-        for _ in range(60): # Attente max 60x2s = 2 minutes
-            await asyncio.sleep(2)
-            
-            # On regarde dans l'historique récent si un succès a été enregistré
-            # C'est la méthode la plus fiable pour communiquer entre le webhook et ici
-            con = sqlite3.connect(DB_NAME)
-            row = con.execute(
-                "SELECT permis FROM verifications WHERE user_id=? AND status='valide' ORDER BY id DESC LIMIT 1",
-                (str(user_id),)
-            ).fetchone()
-            con.close()
-            
-            if row:
-                # On vérifie si ce permis correspond à notre base actuelle
-                full_permis = row[0] # ex: LAVA-123456-05
-                if base_code in full_permis.replace("-",""):
-                    found_suffix = full_permis[-2:] # On récupère les 2 derniers chiffres
-                    break
-        
-        # 4. Résultat
-        if found_suffix:
-            final_dl = f"{base_code[:5]}-{base_code[5:]}-{found_suffix}"
-            context.user_data['form_dl_number'] = final_dl
-            
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ **Trouvé !**\nNuméro validé SAAQ : `{final_dl}`",
-                parse_mode="Markdown"
-            )
-            # On passe à la suite (Référence)
-            return await ask_ref_number_interactive(update, context)
-        else:
-            # Échec
-            kb = [[InlineKeyboardButton("✍️ Entrer manuellement", callback_data="dl_mode:manual")]]
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ **Aucun résultat.** Le système n'a pas pu valider ce permis automatiquement.\nVeuillez le saisir manuellement.",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            return ID_ASK_DL_NUM
-
-async def id_save_dl_manual_digits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_input = update.message.text.strip()
-    
-    # Validation : Doit être 2 chiffres OU le numéro complet (si le mec est têtu)
-    if len(user_input) == 2 and user_input.isdigit():
-        # Cas parfait : Il donne les 2 chiffres
-        base = context.user_data.get('dl_base_code', '')
-        # Reconstruction : G1234 (5) - 123456 (6) - XX (2)
-        # Format SAAQ standard : LLLL-DDMMYY-CC
-        # Ton base_code dans id_save_expiry est : base[:11] soit 1 lettre + 10 chiffres
-        # Exemple base : L1234010190
-        
-        # On formate joli : L1234-010190-XX
-        final_dl = f"{base[:5]}-{base[5:]}-{user_input}"
-        
-    elif len(user_input) > 10:
-        # Cas "Têtu" : Il a tout réécrit
-        final_dl = user_input.upper()
-    else:
-        await update.message.reply_text("⚠️ Entrez exactement les **2 derniers chiffres** (ou le numéro complet).")
-        return ID_ASK_DL_NUM
-
-    context.user_data['form_dl_number'] = final_dl
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    
-    # On passe à la suite (Référence Interactive)
-    return await ask_ref_number_interactive(update, context)
-
-async def id_save_dl_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    context.user_data['form_dl_number'] = update.message.text.upper().strip()
-    
-    # Au lieu de demander d'écrire, on lance le générateur interactif
-    return await ask_ref_number_interactive(update, context)
-
-async def ask_ref_number_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # On génère une proposition
-    proposed_ref = generate_ref_number()
-    context.user_data['temp_proposed_ref'] = proposed_ref
-
-    text = (
-        "🔢 **NUMÉRO DE RÉFÉRENCE**\n\n"
-        f"Référence proposée : `{proposed_ref}`\n\n"
-        "Souhaitez-vous utiliser ce numéro ou en générer un autre ?"
-    )
-
-    kb = [
-        [InlineKeyboardButton("✅ Utiliser celui-ci", callback_data="ref_action:accept")],
-        [InlineKeyboardButton("🔄 Un autre", callback_data="ref_action:next")],
-        [InlineKeyboardButton("✍️ Saisie manuelle", callback_data="ref_action:manual")]
-    ]
-
-    # Si c'est un message (premier passage), on répond. Si c'est un bouton, on édite.
-    if update.message:
-        m = await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        context.user_data['cleanup_ids'].append(m.message_id)
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    
-    return ID_ASK_REF_NUM
-
-async def handle_ref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    
-    action = q.data.split(":")[1]
-
-    if action == "next":
-        # On relance simplement la fonction pour montrer un nouveau numéro
-        return await ask_ref_number_interactive(update, context)
-
-    elif action == "accept":
-        # On enregistre le numéro proposé
-        final_ref = context.user_data.get('temp_proposed_ref')
-        context.user_data['form_ref_number'] = final_ref
-        
-        # Confirmation visuelle rapide
-        try: await q.edit_message_text(f"🔢 Référence enregistrée : `{final_ref}`")
-        except: pass
-        
-        # Suite du flow : Passage à l'étape SEXE
-        kb_sex = [
-            [InlineKeyboardButton("Homme (Male)", callback_data="sex:1"), 
-             InlineKeyboardButton("Femme (Female)", callback_data="sex:2")],
-            [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")]
-        ]
-        m = await q.message.reply_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb_sex))
-        context.user_data['cleanup_ids'].append(m.message_id)
-        return ID_ASK_SEX
-
-    elif action == "manual":
-        await q.edit_message_text("✍️ Veuillez entrer votre numéro de référence manuellement :")
-        return ID_ASK_REF_NUM
 
 async def id_save_ref_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # On sauvegarde les IDs pour le nettoyage automatique
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    
-    # Récupération et nettoyage du texte (tout en majuscules)
-    user_input = update.message.text.strip().upper()
-
-    final_ref = ""
-
-    # --- LOGIQUE RANDOM "ANY" ---
-    if user_input == "ANY":
-        # 1. Choisir le préfixe au hasard
-        prefix = random.choice(["R4MV", "PEVF"])
-        
-        # 2. Générer les 5 caractères restants (9 total - 4 préfixe = 5)
-        # Mélange de chiffres et de lettres majuscules
-        chars = string.ascii_uppercase + string.digits
-        suffix = ''.join(random.choices(chars, k=5))
-        
-        final_ref = prefix + suffix
-        
-        # Petit message pour confirmer au client le numéro généré
-        msg_gen = await update.message.reply_text(f"🎲 **Généré auto :** `{final_ref}`", parse_mode="Markdown")
-        context.user_data['cleanup_ids'].append(msg_gen.message_id)
-    else:
-        # Si le client a écrit un vrai numéro, on le garde
-        final_ref = user_input
-
-    # Sauvegarde dans le contexte
-    context.user_data['form_ref_number'] = final_ref
-
-    # Passage à l'étape suivante (Sexe)
-    kb = [
-        [InlineKeyboardButton("Homme (Male)", callback_data="sex:1"), InlineKeyboardButton("Femme (Female)", callback_data="sex:2")],
-        [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")]
-    ]
-    m = await update.message.reply_text("👤 **Sexe / Genre ?**", reply_markup=InlineKeyboardMarkup(kb))
-    context.user_data['cleanup_ids'].append(m.message_id)
-    
+    val = update.message.text.strip().upper()
+    await clean_chat(update, context)
+    context.user_data['form_ref_number'] = val
+    kb = [[InlineKeyboardButton("Homme", callback_data="sex:1"), InlineKeyboardButton("Femme", callback_data="sex:2")],
+          [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_REF_NUM}")]]
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="👤 **Sexe ?**", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_SEX
 
 async def id_save_sex(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    sex = q.data.split(":")[1]
-    context.user_data['form_sex'] = sex
-    
-    # On édite le message précédent pour confirmer le choix
-    try: 
-        await q.edit_message_text(f"👤 Sexe: {'Homme' if sex=='1' else 'Femme'}")
-    except: 
-        pass
-    
-    # Instruction mise à jour pour préciser "chiffres uniquement"
-    m = await q.message.reply_text(
-        "📏 **Quelle est votre taille ?**\n"
-        "_(Entrez uniquement les chiffres en cm, ex: 175)_"
-    )
-    context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
+    val = update.callback_query.data.split(":")[1]
+    context.user_data['form_sex'] = val
+    await clean_chat(update, context)
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_SEX}")]]
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📏 **Taille (cm) ?**", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_HEIGHT
 
 async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    
-    # Validation : Chiffres uniquement pour éviter le "CM"
-    if not text.isdigit():
-        m = await update.message.reply_text(
-            "⚠️ **Erreur de format**\n\n"
-            "Veuillez entrer uniquement les chiffres (ex: 168).\n"
-            "N'ajoutez pas 'cm' ou de lettres."
-        )
-        # On ne passe pas à l'étape suivante, on reste sur ID_ASK_HEIGHT
-        context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
-        context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-        return ID_ASK_HEIGHT
-
-    # Si c'est valide, on enregistre et on continue
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-    context.user_data['form_height'] = text
-    
-    kb = [
-        [InlineKeyboardButton("Brun (Brown)", callback_data="eye:BRO"), InlineKeyboardButton("Bleu (Blue)", callback_data="eye:BLU")],
-        [InlineKeyboardButton("Vert (Green)", callback_data="eye:GRN"), InlineKeyboardButton("Noisette (Hazel)", callback_data="eye:HZL")],
-        [InlineKeyboardButton("Gris (Grey)", callback_data="eye:GRY"), InlineKeyboardButton("Noir (Black)", callback_data="eye:BLK")]
-    ]
-    m = await update.message.reply_text("👁️ **Couleur des yeux ?**", reply_markup=InlineKeyboardMarkup(kb))
-    context.user_data['cleanup_ids'].append(m.message_id)
+    val = update.message.text.strip()
+    await clean_chat(update, context)
+    context.user_data['form_height'] = val
+    kb = [[InlineKeyboardButton("Brun", callback_data="eye:BRO"), InlineKeyboardButton("Bleu", callback_data="eye:BLU")],
+          [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_HEIGHT}")]]
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="👁️ **Yeux ?**", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_EYES
 
 async def id_save_eyes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        q = update.callback_query; await q.answer()
-        context.user_data['form_eyes'] = q.data.split(":")[1]
-        try: await q.edit_message_text(f"👁️ Yeux: {context.user_data['form_eyes']}")
-        except: pass
-    else:
-        context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
-        context.user_data['form_eyes'] = update.message.text
-
-    if context.user_data.get('id_category') == 'tool':
-        return await id_show_summary(update, context)
-
-    # Si c'est un message texte manuel, le 'm' doit être tracké
-    msg_target = update.message if update.message else update.callback_query.message
-    m = await msg_target.reply_text("📸 **Envoyez votre photo (Selfie)**")
-    context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
+    val = update.callback_query.data.split(":")[1] if update.callback_query else update.message.text.strip()
+    context.user_data['form_eyes'] = val
+    await clean_chat(update, context)
+    if context.user_data.get('id_category') == 'tool': return await id_show_summary(update, context)
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EYES}")]]
+    m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📸 **Envoyez votre photo (Selfie)**", reply_markup=InlineKeyboardMarkup(kb))
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_PHOTO
 
 async def id_save_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault('cleanup_ids', []).append(update.message.message_id)
     context.user_data['form_photo_id'] = update.message.photo[-1].file_id
-    return await id_finalize_order(update, context)
+    await clean_chat(update, context)
+    return await id_show_summary(update, context)
 
 async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
@@ -6466,27 +6103,27 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
-    # --- NETTOYAGE (SUPPRESSION DES ANCIENS MESSAGES) ---
+    # --- NETTOYAGE PHYSIQUE (ÉVITE L'ACCUMULATION) ---
     chat_id = update.effective_chat.id
     cleanup_list = context.user_data.get('cleanup_ids', [])
     
-    # On garde seulement le message actuel (celui du bouton cliqué) pour l'éditer plus tard
-    # On supprime tout le reste (les réponses précédentes du user, les vieilles questions...)
+    # On supprime tout ce qui est dans la liste (vieilles questions + vos réponses Benjamin etc.)
+    # Sauf le tout dernier message qui est celui que nous allons éditer pour afficher le "Retour"
     if len(cleanup_list) > 1:
-        for msg_id in cleanup_list[:-1]: # Tout sauf le dernier
+        for msg_id in cleanup_list[:-1]:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except:
-                pass # Si déjà supprimé, on ignore
+                pass # Déjà supprimé ou trop vieux
         
-        # On ne garde que le dernier ID (le message actuel) dans la liste
+        # On ne garde que le message actuel (le menu) dans la liste
         context.user_data['cleanup_ids'] = [cleanup_list[-1]]
-    # ----------------------------------------------------
+    # --------------------------------------------------
 
     try:
         target_state = int(q.data.split(":")[1])
     except:
-        return # Sécurité
+        return ConversationHandler.END
         
     async def show(text, kb_back_state=None):
         kb = []
@@ -6495,10 +6132,11 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             kb.append([InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")])
             
-        # On édite le message actuel (qui est maintenant le seul restant)
+        # On édite le message actuel qui est maintenant le seul message visible
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-    # --- ROUTAGE DES RETOURS (Rien ne change ici) ---
+    # --- ROUTAGE DES ÉTAPES DE RETOUR ---
+    
     if target_state == ID_ASK_NAME:
         await show("✍️ **FORMULAIRE (1/10)**\n\nQuel est votre **PRÉNOM** (First Name) ?", kb_back_state=None)
         return ID_ASK_NAME
@@ -6506,15 +6144,13 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif target_state == ID_ASK_LASTNAME:
         await show("✍️ **Quel est votre NOM DE FAMILLE** (Last Name) ?", kb_back_state=ID_ASK_NAME)
         return ID_ASK_LASTNAME
-    
-    # ... (Le reste de votre routage reste identique, ne changez rien en dessous) ...
-    # Copiez juste le bloc de nettoyage au début de la fonction.
-    
+        
     elif target_state == ID_ASK_DOB:
         await show("📅 **Date de Naissance**\n(Format: JJ/MM/AAAA ou 15 mars 1990)", kb_back_state=ID_ASK_LASTNAME)
         return ID_ASK_DOB
         
     elif target_state == ID_ASK_STREET:
+        # On vérifie si c'est un Document ou une ID pour savoir si on retourne à DOB ou Nom
         prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
         await show("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", kb_back_state=prev)
         return ID_ASK_STREET
@@ -6565,6 +6201,7 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ID_ASK_DL_NUM
         
     elif target_state == ID_ASK_REF_NUM:
+        # Appel de la fonction interactive qui gère sa propre édition de message
         return await ask_ref_number_interactive(update, context)
         
     elif target_state == ID_ASK_SEX:
@@ -7648,7 +7285,359 @@ async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAUL
     kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="support")]]
     await q.edit_message_text(text=history_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-#####################################################################################################################################
+
+async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la confirmation de l'adresse (choix dans la liste ou réécriture)."""
+    q = update.callback_query
+    await q.answer()
+    
+    # 1. Cas du bouton "Réécrire"
+    if "retry" in q.data:
+        # On nettoie et on retourne à l'étape de la Rue
+        await clean_chat(update, context)
+        prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{prev}")]]
+        
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", 
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        context.user_data['cleanup_ids'] = [m.message_id]
+        return ID_ASK_STREET
+    
+    # 2. Cas du choix d'une adresse (addr_pick:0)
+    try:
+        idx = int(q.data.split(":")[1])
+        suggestions = context.user_data.get('addr_suggestions', [])
+        if suggestions and 0 <= idx < len(suggestions):
+            context.user_data['form_address'] = suggestions[idx]
+            # On sépare aussi pour l'affichage résumé
+            context.user_data['addr_street'] = suggestions[idx].split(',')[0]
+        else:
+            # Fallback
+            raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}"
+            context.user_data['form_address'] = raw
+    except:
+        pass
+    
+    # 3. Nettoyage de l'écran avant de passer à la suite
+    await clean_chat(update, context)
+
+    # 4. Passage à l'étape suivante (Sujet selon Catégorie)
+    if context.user_data.get('id_category') == 'document':
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🏢 **Nom de l'Employeur** ?",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        context.user_data['cleanup_ids'] = [m.message_id]
+        return ID_ASK_DOC_EMPLOYER
+    else:
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        context.user_data['cleanup_ids'] = [m.message_id]
+        return ID_ASK_ISSUE
+
+async def id_handle_dl_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le choix entre Téléchargement (DL) et Envoi Postal, avec recherche SAAQ blindée."""
+    q = update.callback_query
+    await q.answer()
+    
+    try:
+        mode = q.data.split(":")[1]
+    except IndexError:
+        return ID_ASK_DL_NUM
+        
+    user_id = update.effective_user.id
+    
+    if mode == "manual":
+        base_display = context.user_data.get('dl_base_code', 'Permis')
+        await clean_chat(update, context)
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")]]
+        m = await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✍️ **Mode Manuel**\n\nBase : `{base_display}`\nEntrez les **2 derniers chiffres** manquants :",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        context.user_data['cleanup_ids'] = [m.message_id]
+        return ID_ASK_DL_NUM
+
+    elif mode == "saaq":
+        # Mode Auto
+        base_code = context.user_data.get('dl_base_code', '')
+        
+        # Message d'attente
+        m_wait = await q.edit_message_text(
+            f"⏳ **Recherche SAAQ en cours...**\n"
+            f"Base : `{base_code}`\n\n"
+            "_Le bot teste les combinaisons valides..._",
+            parse_mode="Markdown"
+        )
+        
+        # Lancement du Batch
+        batch_id = f"{user_id}:ORDER:{int(time.time())}"
+        batch_runs[batch_id] = { "total": 1, "resolved": 0, "notified": False, "lock": asyncio.Lock() }
+        
+        asyncio.create_task(launch_parallel_calls(
+            base_code, user_id, num_calls=10, 
+            fullname="Client ID Order", formatted=base_code, 
+            batch_id=batch_id
+        ))
+        
+        final_dl_found = None
+        
+        # Boucle de recherche (Polling) - 60 secondes max
+        for i in range(30): 
+            await asyncio.sleep(2)
+            
+            con = sqlite3.connect(DB_NAME)
+            # On cherche TOUS les résultats valides récents pour cet utilisateur
+            cursor = con.execute(
+                "SELECT permis FROM verifications WHERE user_id=? AND status='valide' ORDER BY id DESC LIMIT 5",
+                (str(user_id),)
+            )
+            rows = cursor.fetchall()
+            con.close()
+            
+            for row in rows:
+                full_permis = row[0] # Ex: B500528109603 ou B5005-281096-96 (buggé)
+                clean_found = full_permis.replace("-", "").strip()
+                
+                # CRITÈRE 1 : Correspondance avec la base (ex: B5005...)
+                if base_code in clean_found:
+                    # CRITÈRE 2 (LE FIX) : Longueur minimale
+                    # Un permis SAAQ valide DOIT avoir 13 caractères (1 lettre + 12 chiffres)
+                    # Votre bug précédent enregistrait 11 caractères. On les ignore ici.
+                    if len(clean_found) >= 13:
+                        # C'est le bon ! On le formate proprement
+                        final_dl_found = f"{clean_found[:5]}-{clean_found[5:11]}-{clean_found[11:]}"
+                        break
+            
+            if final_dl_found:
+                break
+        
+        # Nettoyage du message d'attente
+        try: await m_wait.delete()
+        except: pass
+        
+        if final_dl_found:
+            context.user_data['form_dl_number'] = final_dl_found
+            
+            # Confirmation
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ **Trouvé !**\nNuméro validé SAAQ : `{final_dl_found}`",
+                parse_mode="Markdown"
+            )
+            # Suite immédiate
+            return await ask_ref_number_interactive(update, context)
+        else:
+            # Échec
+            kb = [[InlineKeyboardButton("✍️ Entrer manuellement", callback_data="dl_mode:manual")]]
+            m = await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ **Aucun résultat complet.**\nLe système a peut-être trouvé un code partiel ou la connexion a échoué.\nVeuillez saisir les chiffres manuellement.",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            context.user_data['cleanup_ids'] = [m.message_id]
+            return ID_ASK_DL_NUM
+
+async def id_save_dl_manual_digits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère la saisie manuelle des 2 chiffres (ou du numéro complet) du permis."""
+    user_input = update.message.text.strip()
+    
+    # Nettoyage de l'écran (Benjamin / Chiffres tapez)
+    await clean_chat(update, context)
+    
+    # Récupération de la base calculée précédemment
+    base = context.user_data.get('dl_base_code', '')
+    
+    # Si l'utilisateur entre 2 chiffres, on complète la base
+    if len(user_input) == 2 and user_input.isdigit():
+        final_dl = f"{base[:5]}-{base[5:]}-{user_input}"
+    # Si l'utilisateur réécrit tout le permis
+    elif len(user_input) > 10:
+        final_dl = user_input.upper()
+    else:
+        # Erreur de saisie
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")]]
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ **Format invalide.** Entrez les 2 derniers chiffres (ex: 05) ou le numéro complet.",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        context.user_data['cleanup_ids'] = [m.message_id]
+        return ID_ASK_DL_NUM
+
+    context.user_data['form_dl_number'] = final_dl
+    
+    # Passage à l'étape suivante : Numéro de Référence
+    return await ask_ref_number_interactive(update, context)
+
+async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le récapitulatif complet avant la génération finale."""
+    d = context.user_data
+    sex_map = {'1': 'Homme', '2': 'Femme', '9': 'X'}
+    
+    txt = (
+        "📝 **RÉSUMÉ DE VOTRE COMMANDE**\n\n"
+        f"👤 **Identité**\n"
+        f"• Prénom : `{d.get('form_firstname')}`\n"
+        f"• Nom : `{d.get('form_lastname')}`\n"
+        f"• Sexe : `{sex_map.get(d.get('form_sex'), d.get('form_sex'))}`\n"
+        f"• Taille : `{d.get('form_height')} cm`\n"
+        f"• Yeux : `{d.get('form_eyes')}`\n\n"
+        f"📅 **Dates**\n"
+        f"• Naissance : `{d.get('form_dob')}`\n"
+        f"• Émission : `{d.get('form_issue')}`\n"
+        f"• Expiration : `{d.get('form_expiry')}`\n\n"
+        f"📍 **Adresse**\n"
+        f"• Rue : `{d.get('addr_street')}`\n"
+        f"• Ville : `{d.get('addr_city')}`\n"
+        f"• Zip : `{d.get('addr_zip')}`\n\n"
+        f"🆔 **Numéros**\n"
+        f"• Permis : `{d.get('form_dl_number')}`\n"
+        f"• Référence : `{d.get('form_ref_number')}`"
+    )
+    
+    kb = [
+        [InlineKeyboardButton("✅ CONFIRMER & PAYER", callback_data="confirm_gen")],
+        [InlineKeyboardButton("✏️ Tout recommencer", callback_data="id_menu_entry")]
+    ]
+    
+    # Si on vient d'un bouton (callback), on édite. Sinon on envoie.
+    if update.callback_query:
+        await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        m = await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        context.user_data['cleanup_ids'] = [m.message_id]
+        
+    return ID_CONFIRM_SUMMARY
+
+async def handle_ref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère les boutons du sélecteur de numéro de référence interactif."""
+    q = update.callback_query
+    await q.answer()
+    
+    action = q.data.split(":")[1]
+
+    if action == "next":
+        # Génère et affiche une nouvelle proposition
+        return await ask_ref_number_interactive(update, context)
+
+    elif action == "accept":
+        # Enregistre le numéro actuellement proposé
+        final_ref = context.user_data.get('temp_proposed_ref')
+        context.user_data['form_ref_number'] = final_ref
+        
+        # Nettoyage et passage à l'étape suivante (Sexe)
+        await clean_chat(update, context)
+        
+        kb_sex = [
+            [InlineKeyboardButton("Homme", callback_data="sex:1"), 
+             InlineKeyboardButton("Femme", callback_data="sex:2")],
+            [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_REF_NUM}")]
+        ]
+        
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="👤 **Sexe / Genre ?**",
+            reply_markup=InlineKeyboardMarkup(kb_sex),
+            parse_mode="Markdown"
+        )
+        context.user_data['cleanup_ids'] = [m.message_id]
+        return ID_ASK_SEX
+
+    elif action == "manual":
+        # Switch en mode saisie manuelle au clavier
+        await q.edit_message_text("✍️ Veuillez entrer votre numéro de référence manuellement :")
+        return ID_ASK_REF_NUM
+
+async def id_save_ref_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sauvegarde le numéro de référence écrit manuellement et passe au Sexe."""
+    val = update.message.text.strip().upper()
+    
+    # Nettoyage de l'écran (Benjamin / Numéro écrit)
+    await clean_chat(update, context)
+    
+    # Sauvegarde dans la session
+    context.user_data['form_ref_number'] = val
+    
+    # Préparation de l'étape suivante : Sexe
+    kb_sex = [
+        [InlineKeyboardButton("Homme", callback_data="sex:1"), 
+         InlineKeyboardButton("Femme", callback_data="sex:2")],
+        [InlineKeyboardButton("Non spécifié (X)", callback_data="sex:9")],
+        [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_REF_NUM}")]
+    ]
+    
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="👤 **Sexe / Genre ?**",
+        reply_markup=InlineKeyboardMarkup(kb_sex),
+        parse_mode="Markdown"
+    )
+    
+    # On mémorise la question pour le prochain nettoyage
+    context.user_data['cleanup_ids'] = [m.message_id]
+    return ID_ASK_SEX
+
+async def id_save_sex(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enregistre le choix du sexe et demande la taille."""
+    q = update.callback_query
+    await q.answer()
+    
+    # Enregistrement (ex: sex:1 -> 1)
+    val = q.data.split(":")[1]
+    context.user_data['form_sex'] = val
+    
+    # Nettoyage
+    await clean_chat(update, context)
+    
+    # Étape suivante : Taille
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_SEX}")]]
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📏 **Quelle est votre taille ?**\n(En cm, ex: 175)",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    context.user_data['cleanup_ids'] = [m.message_id]
+    return ID_ASK_HEIGHT
+
+async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enregistre la taille et demande la couleur des yeux."""
+    val = update.message.text.strip()
+    
+    if not val.isdigit():
+        await update.message.reply_text("⚠️ Veuillez entrer un nombre valide (ex: 180).")
+        return ID_ASK_HEIGHT
+        
+    context.user_data['form_height'] = val
+    await clean_chat(update, context)
+    
+    # Étape suivante : Yeux
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_HEIGHT}")]]
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="👁️ **Couleur des yeux ?**\n(Ex: Bleus, Marrons, Verts...)",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    context.user_data['cleanup_ids'] = [m.message_id]
+    return ID_ASK_EYES
 
 id_docs_conv = ConversationHandler(
     entry_points=[CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
