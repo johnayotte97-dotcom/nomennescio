@@ -22,6 +22,7 @@ import subprocess
 from datetime import datetime
 import pytz
 from dotenv import load_dotenv
+
 from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
@@ -29,6 +30,13 @@ from mnemonic import Mnemonic
 import tickets  # Importe notre nouveau fichier
 import random
 import string
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+from PIL import Image, ImageOps, ImageColor
+import io
+
+
+
 
 
 from telegram import (
@@ -39,6 +47,41 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, CallbackQueryHandler,
     TypeHandler, ApplicationHandlerStop
 )
+
+load_dotenv()
+
+
+os.environ.pop('http_proxy', None)
+os.environ.pop('https_proxy', None)
+os.environ.pop('all_proxy', None)
+os.environ.pop('HTTP_PROXY', None)
+os.environ.pop('HTTPS_PROXY', None)
+os.environ.pop('ALL_PROXY', None)
+
+# Forcer l'exception SignalWire
+os.environ["no_proxy"] = "signalwire.com,john-m-shop.signalwire.com,37.228.129.82"
+os.environ["NO_PROXY"] = "signalwire.com,john-m-shop.signalwire.com,37.228.129.82"
+
+# --- CONFIGURATION SENTRY ---
+sentry_dsn = os.environ.get("SENTRY_DSN")
+if sentry_dsn:
+    sentry_sdk.init(
+        dsn=sentry_dsn,
+        integrations=[FlaskIntegration()],
+        traces_sample_rate=1.0,
+        _experiments={"profiles_sample_rate": 1.0},
+    )
+    print("✅ SENTRY : Monitoring Activé.")
+else:
+    print("⚠️ SENTRY : Pas de clé DSN trouvée.")
+
+# ----------------------------
+
+
+# --- Ligne de test temporaire ---
+#division_by_zero = 1 / 0
+
+
 # ================= SECURITY HEARTBEAT =================
 # Ton lien Healthchecks personnel
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
@@ -51,19 +94,76 @@ def generate_ref_number():
     return f"{prefix}{suffix}"
 
 def get_signalwire_balance():
+    """Vérifie la connexion SignalWire."""
+    from dotenv import load_dotenv
+    load_dotenv(override=True)
+
+    pid = os.environ.get("SW_PROJECT_ID", "").strip() or os.environ.get("SIGNALWIRE_PROJECT_ID", "").strip()
+    token = os.environ.get("SW_TOKEN", "").strip() or os.environ.get("SIGNALWIRE_TOKEN", "").strip()
+    space_url = os.environ.get("SIGNALWIRE_SPACE_URL", "").strip()
+
+    if not pid or not token:
+        return "Clés manquantes"
+
+    host = space_url.replace("https://", "").replace("/", "").strip()
+    
+    # On tente de lire l'historique juste pour tester la connexion
+    url = f"https://{host}/api/laml/2010-04-01/Accounts/{pid}/Calls.json"
+    params = {"PageSize": 1}
+
     try:
-        # SignalWire ne permet pas tjs le solde via API directe sans endpoint de facturation
-        # On peut retourner une info de connexion ou ton calcul manuel
-        return f"{SW_PROJECT_ID[:4]}... Connecté" 
-    except: return "Erreur"
+        response = requests.get(url, auth=(pid, token), params=params, timeout=5)
+        
+        if response.status_code == 200:
+            return "✅ Connecté (Full)"
+            
+        elif response.status_code == 403:
+            # 403 = Authentifié mais lecture interdite.
+            # C'est bon signe : les clés sont valides pour envoyer des appels.
+            return "✅ Connecté (Appels OK)"
+            
+        elif response.status_code == 401:
+            return "❌ Erreur Clés (401)"
+        
+        elif response.status_code == 404:
+            return "❌ Erreur Projet (404)"
+
+        return f"Erreur {response.status_code}"
+
+    except Exception as e:
+        logger.error(f"[SW ERROR] {e}")
+        return "Erreur Connexion"
 
 def get_barcode_balance():
+    """Récupère le solde Barcode Solution (Clé: credits)."""
+    api_key = os.environ.get("FAKEID_API_KEY")
+    if not api_key: 
+        return "Non configuré"
+
+    url = "https://barcodes.fakeidsolutions.com/api/v2/balance"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json"
+    }
+
     try:
-        headers = {"Authorization": f"Bearer {FAKEID_API_KEY}"}
-        # Endpoint hypothétique selon la doc FakeIdSolutions
-        r = requests.get("https://barcodes.fakeidsolutions.com/api/v2/user", headers=headers, timeout=5)
-        return f"{r.json().get('credits', '??')} Credits"
-    except: return "Indisponible"
+        response = requests.get(url, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            # 👇 C'est ici que ça change : on lit "credits"
+            credits = data.get("credits")
+            
+            if credits is not None:
+                return f"{credits} Crédits"
+            else:
+                return "Format inconnu"
+        
+        return f"Erreur {response.status_code}"
+            
+    except Exception as e:
+        print(f"Erreur Barcode: {e}")
+        return "Erreur Connexion"
 
 def start_heartbeat():
     while True:
@@ -139,7 +239,7 @@ async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========================== ENV & LOCK ==========================
 
-load_dotenv()
+
 
 LOCK = "/tmp/bot-nomen.pid"
 
@@ -215,7 +315,7 @@ app = Flask(__name__)
 (ID_MENU_START, ID_CAT_VIEW, ID_PROD_VIEW, ID_ASK_QTY, ID_CONFIRM_BUY,
  ID_ASK_NAME, ID_ASK_DOB, 
  ID_ASK_STREET, ID_ASK_CITY, ID_ASK_ZIP, ID_CONFIRM_ADDR,
- ID_ASK_DOC_EMPLOYER, ID_ASK_DOC_JOB, ID_ASK_DOC_ADDR, ID_CHOOSE_INCOME_MODE,
+ ID_ASK_DOC_EMPLOYER, ID_ASK_DOC_JOB, ID_ASK_DOC_ADDR, ID_CHOOSE_INxCOME_MODE,
  ID_ASK_DOC_HOURS, ID_ASK_DOC_RATE, ID_ASK_DOC_SIN,
  ID_ASK_HEIGHT, ID_ASK_EYES, ID_ASK_PHOTO,
  # --- NOUVELLES ÉTAPES AJOUTÉES ---
@@ -248,14 +348,15 @@ SELECT_TOOL = 900
 WAIT_HLR_NUMBER = 901
 ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
 
+
 (ACC_WAIT_NEW_PIN, ACC_WAIT_USERNAME, ACC_WAIT_JABBER, ACC_WAIT_RESET_CONFIRM) = range(3200, 3204)
 
 # Paliers
 FORFAITS = {
-    "bronze":   {"min": 0,    "price": 10.0, "label": "🟫 Bronze"},
-    "silver":   {"min": 250,  "price": 8.0,  "label": "⬜️ Silver"},
-    "gold":     {"min": 500,  "price": 6.0,  "label": "🟨 Gold"},
-    "platinum": {"min": 1000, "price": 4.0,  "label": "⬛️ Platinum"},
+    "bronze":   {"min": 0,    "price": 7.00, "label": "🟫 Bronze"},   # Équivalent de ~10 CAD
+    "silver":   {"min": 175,  "price": 5.50, "label": "⬜️ Silver"},   # Équivalent de ~8 CAD
+    "gold":     {"min": 350,  "price": 4.25, "label": "🟨 Gold"},     # Équivalent de ~6 CAD
+    "platinum": {"min": 700,  "price": 2.80, "label": "⬛️ Platinum"}, # Équivalent de ~4 CAD
 }
 
 # ========================== GLOBALS ==========================
@@ -266,7 +367,8 @@ active_calls = {}
 pending_payments = {}
 user_validation_status = {}
 batch_runs = {}
-CATALOG_MSGS = {}  # messages envoyés pour le catalogue (pour les nettoyer)
+CATALOG_MSGS = {} 
+USER_STATES = {}
 
 # ========================== MESSAGES ==========================
 MESSAGES = {
@@ -275,17 +377,18 @@ MESSAGES = {
             "👋 Bienvenue sur Nomen Nescio !\n\n"
             "Votre espace central, réunissant tout ce qu’il vous faut.\n\n"
             "🆔 : {telegram_id}\n"
-            "💰 Solde : {balance:.2f} CAD\n"
+            "💰 Solde : {balance:.2f} USD\n" # <--- ICI
             "{statut_label}\n"
+            "{admin_info}\n"
             "\n\n🔑 Appuyez simplement sur la touche de votre choix."
-            
         ),
         'en': (
             "👋 Welcome to Nomen Nescio!\n\n"
             "Your central hub for everything you need.\n\n"
             "🆔 : {telegram_id}\n"
-            "💰 Balance: {balance:.2f} CAD\n"
+            "💰 Balance: {balance:.2f} USD\n" # <--- ET ICI
             "{statut_label}\n"
+            "{admin_info}\n"
             "\n\n🔑 Simply press the key of your choice."
         ),
     },
@@ -294,8 +397,8 @@ MESSAGES = {
         'en': "🌐 Please select your language / Choisissez votre langue"
     },
     'balance': {
-        'fr': "Votre solde actuel est : {balance:.2f} $ CAD.",
-        'en': "Your current balance is: {balance:.2f} CAD."
+        'fr': "Votre solde actuel est : {balance:.2f} $ USD.",
+        'en': "Your current balance is: {balance:.2f} USD."
     },
     'enter_bulk_qty': {
         'fr': "Combien de permis voulez-vous valider ? (3 Max.)",
@@ -315,7 +418,6 @@ MESSAGES = {
     'aucun_permis': {'fr': '❌ *Aucun permis trouvé* pour {fullname}.', 'en': '❌ *No license found* for {fullname}.'},
     'lang_updated': {'fr': '✅ Langue mise à jour.', 'en': '✅ Language updated.'}
 }
-
 
 
 def msg(user_id, key, **kwargs):
@@ -343,10 +445,20 @@ def msg(user_id, key, **kwargs):
 # ========================== DB & USERS ==========================
 def init_db():
     con = sqlite3.connect(DB_NAME)
+    
+    # ==========================================
+    # 🚀 OPTIMISATION PERFORMANCE (Mode TURBO)
+    # ==========================================
+    # Permet de lire et écrire en même temps.
+    # Réduit drastiquement le lag quand plusieurs utilisateurs sont actifs.
+    con.execute("PRAGMA journal_mode=WAL;") 
+    con.execute("PRAGMA synchronous=NORMAL;")
+    con.execute("PRAGMA cache_size=10000;") 
+    # ==========================================
+
     cur = con.cursor()
     
     # 1. TABLE DES UTILISATEURS
-    # Ajout de 'inactivity_timeout' dans la création
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -363,25 +475,28 @@ def init_db():
             forfait TEXT DEFAULT 'bronze',
             custom_username TEXT,
             jabber_id TEXT,
-            inactivity_timeout INTEGER DEFAULT 300
+            inactivity_timeout INTEGER DEFAULT 300,
+            pagination INTEGER DEFAULT 2
         )
     """)
     
-    # Patchs pour la table users (sécurité si déjà existante)
-    # J'ai ajouté ("inactivity_timeout", "INTEGER DEFAULT 300") à la liste
-    for col in [
+    # Patchs de sécurité (Ajoute les colonnes manquantes sans écraser les données)
+    columns_to_check = [
         ("user_id", "TEXT"), 
         ("seed_phrase", "TEXT"), 
         ("pin_code", "TEXT"), 
         ("username", "TEXT"), 
         ("custom_username", "TEXT"), 
         ("jabber_id", "TEXT"),
-        ("inactivity_timeout", "INTEGER DEFAULT 300")
-    ]:
+        ("inactivity_timeout", "INTEGER DEFAULT 300"),
+        ("pagination", "INTEGER DEFAULT 2")
+    ]
+    
+    for col_name, col_type in columns_to_check:
         try:
-            cur.execute(f"ALTER TABLE users ADD COLUMN {col[0]} {col[1]}")
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
         except sqlite3.OperationalError: 
-            pass
+            pass # La colonne existe déjà, on ignore
 
     # 2. TABLE DES TRANSACTIONS
     cur.execute("""
@@ -394,14 +509,14 @@ def init_db():
         )
     """)
 
-    # 3. TABLE DES PRODUITS
+    # 3. TABLE DES PRODUITS (Mise à jour défaut USD)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             category TEXT,
             title TEXT,
             price REAL,
-            currency TEXT DEFAULT 'CAD',
+            currency TEXT DEFAULT 'USD', 
             stock INTEGER DEFAULT 0,
             tier TEXT,
             is_active INTEGER DEFAULT 1,
@@ -409,7 +524,7 @@ def init_db():
         )
     """)
 
-    # 4. TABLE DES TICKETS (Version ajustée)
+    # 4. TABLE DES TICKETS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS support_tickets (
             ticket_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -417,17 +532,24 @@ def init_db():
             username TEXT,
             category TEXT,
             status TEXT DEFAULT 'open',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            message TEXT,
+            dashboard_msg_id INTEGER
         )
     """)
     
-    # Patchs pour support_tickets (pour le nouveau système)
-    for col in [("username", "TEXT"), ("category", "TEXT")]:
+    # Patchs pour support_tickets
+    for col in [
+        ("username", "TEXT"), 
+        ("category", "TEXT"), 
+        ("message", "TEXT"), 
+        ("dashboard_msg_id", "INTEGER")
+    ]:
         try:
             cur.execute(f"ALTER TABLE support_tickets ADD COLUMN {col[0]} {col[1]}")
         except sqlite3.OperationalError: pass
 
-    # 5. NOUVELLE TABLE : HISTORIQUE DES MESSAGES (CRITIQUE)
+    # 5. HISTORIQUE DES MESSAGES (Chat Support)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ticket_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -450,7 +572,7 @@ def init_db():
 
     con.commit()
     con.close()
-    log("DB initialized (V3.1 + Inactivity Timeout)", "SYSTEM")
+    log("DB initialized (V3.2 + Mode WAL TURBO 🚀)", "SYSTEM")
 
 def patch_db_tickets():
     con = sqlite3.connect(DB_NAME)
@@ -463,6 +585,34 @@ def patch_db_tickets():
         pass 
     con.commit()
     con.close()
+
+# --- AJOUTER CES DEUX FONCTIONS ---
+def get_user_pagination(user_id: str) -> int:
+    """Récupère le nombre d'items par page (Défaut: 2)."""
+    try:
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        # On tente de lire la colonne. Si elle n'existe pas, le 'try' échouera et on renverra 2 (défaut).
+        # Note: Assure-toi d'avoir lancé le script update_db.py avant !
+        cur.execute("SELECT pagination FROM users WHERE telegram_id=?", (user_id,))
+        row = cur.fetchone()
+        con.close()
+        return int(row[0]) if row and row[0] else 2
+    except:
+        return 2
+
+def set_user_pagination(user_id: str, qty: int):
+    """Sauvegarde le choix de pagination."""
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    # On ajoute la colonne si elle manque (sécurité 'à la volée')
+    try: cur.execute("ALTER TABLE users ADD COLUMN pagination INTEGER DEFAULT 2")
+    except: pass
+    
+    cur.execute("UPDATE users SET pagination=? WHERE telegram_id=?", (qty, user_id))
+    con.commit()
+    con.close()
+# ----------------------------------
 
 def user_exists(telegram_id: str) -> bool:
     con = sqlite3.connect(DB_NAME)
@@ -627,19 +777,52 @@ def update_transaction_status(order_id: str, status: str):
 
 # ========================== UTILS PERMIS ==========================
 def soundex(nom: str) -> str:
+    """Calcul du Soundex pour la SAAQ (LNNN)."""
     nom = (nom or "").upper()
     if not nom:
         return "0000"
-    codes = {'BFPV': '1', 'CGJKQSXZ': '2', 'DT': '3', 'L': '4', 'MN': '5', 'R': '6'}
-    result = nom[0]
+    
+    # 1. On garde la première lettre
+    first_char = nom[0]
+    
+    # Mapping des consonnes (Standard SAAQ)
+    # A, E, H, I, O, U, W, Y ne sont pas codés (valeur 0 ou ignorés)
+    mapping = {
+        'B': '1', 'F': '1', 'P': '1', 'V': '1',
+        'C': '2', 'G': '2', 'J': '2', 'K': '2', 'Q': '2', 'S': '2', 'X': '2', 'Z': '2',
+        'D': '3', 'T': '3',
+        'L': '4',
+        'M': '5', 'N': '5',
+        'R': '6'
+    }
+    
+    # On commence le code avec la première lettre
+    code = [first_char]
+    
+    # Code de la lettre précédente (pour gérer les doubles)
+    # On initialise avec le code de la 1ère lettre si elle en a un
+    last_code = mapping.get(first_char) 
+
+    # On parcourt le reste du nom
     for char in nom[1:]:
-        for key in codes:
-            if char in key:
-                code = codes[key]
-                if code != result[-1]:
-                    result += code
-                break
-    return result[:4].ljust(4, '0')
+        current_code = mapping.get(char)
+        
+        if current_code:
+            # Si c'est un code différent du précédent, on ajoute
+            # OU si c'est le même code mais séparé par une voyelle (last_code était devenu None)
+            if current_code != last_code:
+                code.append(current_code)
+                last_code = current_code
+        else:
+            # Si c'est une voyelle ou H/W, ça brise la chaîne de fusion pour la suite
+            # (Sauf H et W qui sont souvent transparents, mais pour simplifier ici on reset)
+            if char not in ['H', 'W']: 
+                last_code = None 
+
+        if len(code) >= 4:
+            break
+            
+    return "".join(code).ljust(4, '0')
 
 def codif_prenom(prenom: str) -> str:
     mapping = {
@@ -651,11 +834,37 @@ def codif_prenom(prenom: str) -> str:
     return mapping.get(letter, '0')
 
 def generer_permis(nom: str, prenom: str, date_txt: str):
-    date_obj = datetime.strptime(date_txt, "%d-%m-%Y")
-    date_str = date_obj.strftime("%d%m%y")
-    base = soundex(nom) + codif_prenom(prenom) + date_str
-    formatted = f"{base[:5]}-{base[5:11]}-**"
-    return formatted, base
+    """
+    Génère le numéro SAAQ.
+    Format QC: LNNN-P-JJMMAA-SEQ
+    ATTENTION: Au Québec, on n'ajoute PAS 50 au mois pour les femmes.
+    """
+    try:
+        # Nettoyage date (On attend JJ-MM-AAAA)
+        date_obj = datetime.strptime(date_txt, "%d-%m-%Y")
+        
+        # Formatage strict : JJ MM AA
+        day = f"{date_obj.day:02d}"
+        month = f"{date_obj.month:02d}"
+        year = date_obj.strftime("%y") # 99 pour 1999
+
+        date_saaq = f"{day}{month}{year}"
+        
+        # Calcul des codes
+        code_nom = soundex(nom)       # L116 pour Lefebvre
+        code_prenom = codif_prenom(prenom) # 1 pour Alexandre
+        
+        # Assemblage
+        base = code_nom + code_prenom + date_saaq
+        
+        # Format visuel : L1161-050499-**
+        formatted = f"{base[:5]}-{base[5:11]}-**"
+        
+        return formatted, base
+        
+    except Exception as e:
+        print(f"Erreur Gen Permis: {e}")
+        return "ERREUR-DATE", "00000000000"
 
 def convertir_en_code_saaq(code: str) -> str:
     if not code:
@@ -727,7 +936,14 @@ async def show_main_menu(user_id: int, clear: bool = True):
         bc_bal = get_barcode_balance()
         admin_info = f"\n🏦 SignalWire: {sw_bal}\n🪪 BarcodeSolution: {bc_bal}"
 
-    statut_label = f"⬛️ Statut : {statut_code.capitalize()}"
+    # --- CORRECTION : AFFICHAGE DYNAMIQUE ---
+    # On récupère le dictionnaire complet du forfait (ex: {'min': 0, 'label': '🟫 Bronze', ...})
+    # Si le statut est inconnu, on prend 'bronze' par défaut.
+    details_forfait = FORFAITS.get(statut_code, FORFAITS["bronze"])
+    
+    # On utilise le label qui contient déjà l'émoji (ex: "🟫 Bronze")
+    statut_label = f"🏆 Statut : {details_forfait['label']}"
+    # ----------------------------------------
 
     await app_telegram.bot.send_message(
         chat_id=user_id,
@@ -735,7 +951,7 @@ async def show_main_menu(user_id: int, clear: bool = True):
             telegram_id=user_id,
             balance=balance,
             statut_label=statut_label,
-            admin_info=admin_info # N'oublie pas d'ajouter {admin_info} dans ton dictionnaire MESSAGES
+            admin_info=admin_info 
         ),
         reply_markup=build_main_menu(user_id),
         parse_mode="Markdown"
@@ -837,7 +1053,10 @@ def _fmt_price(p):
         return f"{p}$"
 
 def _build_products_keyboard(page, total_pages, tier=None):
-    filt_row = [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")]
+    filt_row = [
+        InlineKeyboardButton("🔎 Filter", callback_data="filter_open"),
+        InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu") # <--- NOUVEAU BOUTON
+    ]
     nav_row = [
         InlineKeyboardButton("«", callback_data=f"prod:page:{max(0,page-1)}"),
         InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
@@ -845,6 +1064,32 @@ def _build_products_keyboard(page, total_pages, tier=None):
     ]
     back_row = [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     return InlineKeyboardMarkup([filt_row, nav_row, back_row])
+
+async def open_pagination_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le choix du nombre d'articles par page."""
+    q = update.callback_query
+    await q.answer()
+    
+    user_id = str(update.effective_user.id)
+    current = get_user_pagination(user_id)
+    
+    def txt(val): return f"✅ {val}" if current == val else f"{val}"
+    
+    kb = [
+        [
+            InlineKeyboardButton(txt(2), callback_data="set_pg_2"),
+            InlineKeyboardButton(txt(4), callback_data="set_pg_4"),
+            InlineKeyboardButton(txt(8), callback_data="set_pg_8")
+        ],
+        [InlineKeyboardButton(f"✏️ Custom ({current})", callback_data="set_pg_custom")],
+        [InlineKeyboardButton("🔙 Retour Catalogue", callback_data="propro")]
+    ]
+    
+    await q.message.edit_text(
+        f"📄 **RÉGLAGE AFFICHAGE**\n\nCombien de produits voulez-vous voir par page ?\nActuel : **{current}**",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
 
 
 
@@ -889,7 +1134,12 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     # 4. Exécution de la Recherche SQL
     try:
         filters = context.user_data.get('active_filters', {})
-        PER_PAGE = 2
+        
+        # --- MODIFICATION 1 : PAGINATION DYNAMIQUE ---
+        # On utilise la fonction créée à l'étape précédente
+        PER_PAGE = get_user_pagination(str(chat_id)) 
+        # ---------------------------------------------
+
         chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
     except Exception as e:
         if loading_msg:
@@ -934,7 +1184,7 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             f"🏙️ **VILLE** : `{city}`\n"
             f"📅 **ANNÉE** : `{year}`\n"
             f"📂 **BASE** : `{base}`\n"
-            f"💰 **PRIX** : `{price:.2f} CAD`"
+            f"💰 **PRIX** : `{price:.2f} USD`"
         )
         
         kb = InlineKeyboardMarkup([[
@@ -960,7 +1210,12 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         context.user_data['filter_msgs'] = [m.message_id]
     else:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔎 Filter", callback_data="filter_open")],
+            [
+                InlineKeyboardButton("🔎 Filter", callback_data="filter_open"),
+                # --- MODIFICATION 2 : BOUTON VUE ---
+                InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")
+                # -----------------------------------
+            ],
             [
                 InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), 
                 InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), 
@@ -972,6 +1227,8 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         sent_ids.append(m.message_id)
         CATALOG_MSGS[chat_id] = sent_ids
 
+
+        
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
     """Construit le menu de filtre dynamique, AVEC pagination optionnelle."""
     filters = context.user_data.get('pending_filters', {})
@@ -1575,12 +1832,14 @@ def ensure_payment_table():
 
 ensure_payment_table()
 
-def get_btc_price_cad():
+def get_btc_price_usd():
     try:
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=cad", timeout=5)
-        return float(r.json()['bitcoin']['cad'])
+        # On demande le prix en USD à CoinGecko
+        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=5)
+        return float(r.json()['bitcoin']['usd'])
     except:
-        return 135000.0 
+        # Fallback : Prix approximatif du BTC en USD (Mets une valeur sûre)
+        return 96000.0
 
 def zpub_to_xpub(zpub: str) -> str:
     """Convertit une clé zpub (Electrum) en xpub (Standard) pour compatibilité."""
@@ -1644,13 +1903,13 @@ async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     
     if not ADMIN_XPUB:
-        await q.message.reply_text("⚠️ Erreur config: XPUB manquant dans .env")
+        await q.message.reply_text("⚠️ Erreur config: XPUB manquant ")
         return ConversationHandler.END
 
     await replace_view(
         q,
-        "💸 **Recharge Crypto (Automatique)**\n\n"
-        "Combien voulez-vous ajouter ? (en CAD)\n"
+        "💸 **Recharge votre solde !**\n\n"
+        "Combien voulez-vous ajouter ? \n"
         "_(Exemple: tapez 50)_",
         reply_markup=kb_back_to_menu(),
         parse_mode="Markdown"
@@ -1660,9 +1919,10 @@ async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
-        amount_cad = float(update.message.text.replace(',', '.').strip())
-        if amount_cad < 5: 
-            await update.message.reply_text("❌ Minimum 5$.")
+        # On lit le montant comme étant du USD
+        amount_usd = float(update.message.text.replace(',', '.').strip())
+        if amount_usd < 5: 
+            await update.message.reply_text("❌ Minimum 5$ USD.")
             return WAIT_AMOUNT_CRYPTO
     except:
         await update.message.reply_text("❌ Montant invalide.")
@@ -1670,13 +1930,15 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
 
     msg_wait = await update.message.reply_text("⏳ Génération de l'adresse...")
     
-    btc_price = get_btc_price_cad()
-    amount_btc = amount_cad / btc_price
+    # Calcul en USD
+    btc_price = get_btc_price_usd() # <-- Appel de la nouvelle fonction
+    amount_btc = amount_usd / btc_price
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
+    # On sauvegarde amount_usd dans la colonne amount_cad (ou tu peux renommer ta colonne plus tard)
     cur.execute("INSERT INTO crypto_payments (user_id, amount_cad, amount_btc_expected) VALUES (?,?,?)", 
-                (str(user_id), amount_cad, amount_btc))
+                (str(user_id), amount_usd, amount_btc))
     order_id = cur.lastrowid
     
     address = generate_address(user_id, order_id)
@@ -1690,7 +1952,7 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
 
     txt = (
         f"🧾 **Facture #{order_id}**\n"
-        f"💰 Montant : `{amount_cad:.2f} CAD`\n"
+        f"💰 Montant : `{amount_usd:.2f} USD`\n" # <-- Affichage USD
         f"💎 BTC : `{amount_btc:.8f} BTC`\n\n"
         f"👉 **Envoyez à :**\n`{address}`\n\n"
         f"_(Cliquez l'adresse pour copier)_"
@@ -1978,14 +2240,15 @@ async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     lang = get_user_lang(str(update.effective_user.id))
+    
     if lang == "fr":
         txt = (
-            "📚 FAQ\n\n"
+            "📚 FAQ (Tarifs USD)\n\n"
             "💵 Système de paliers :\n"
-            "• Bronze : 10.00$ / permis\n"
-            "• Silver : 8.00$ / permis (après 250$ rechargés)\n"
-            "• Gold : 6.00$ / permis (après 500$)\n"
-            "• Platinum : 4.00$ / permis (après 1000$)\n"
+            "• Bronze : 7.00 USD / permis\n"
+            "• Silver : 5.50 USD / permis (après 175$ rechargés)\n"
+            "• Gold : 4.25 USD / permis (après 350$)\n"
+            "• Platinum : 2.80 USD / permis (après 700$)\n"
             "➡️ Le passage de palier est automatique selon vos recharges.\n\n"
             "🆘 Support :\n"
             "Après tout paiement, envoyez un *screenshot* de la preuve. Le crédit est ajouté très rapidement.\n"
@@ -1999,12 +2262,12 @@ async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         txt = (
-            "📚 FAQ\n\n"
+            "📚 FAQ (USD Pricing)\n\n"
             "💵 Tier system:\n"
-            "• Bronze: $10.00 / license\n"
-            "• Silver: $8.00 / license (after $250 recharged)\n"
-            "• Gold: $6.00 / license (after $500)\n"
-            "• Platinum: $4.00 / license (after $1000)\n"
+            "• Bronze: 7.00 USD / license\n"
+            "• Silver: 5.50 USD / license (after $175 recharged)\n"
+            "• Gold: 4.25 USD / license (after $350)\n"
+            "• Platinum: 2.80 USD / license (after $700)\n"
             "➡️ Tier upgrades are automatic based on your recharges.\n\n"
             "🆘 Support:\n"
             "After each payment, please send a *screenshot* as proof. Your balance will be credited very quickly.\n"
@@ -2016,6 +2279,7 @@ async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🚀 Upcoming features:\n"
             "New functionalities coming soon (automation, statistics, advanced tools)."
         )
+    
     await replace_view(q, txt, reply_markup=kb_back_to_menu(), parse_mode="Markdown")
 
 # ================= CHANNEL PRIVÉ (FINAL) =================
@@ -2588,10 +2852,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # CAS A : Déjà sécurisé -> LOGIN AVEC CLAVIER
     if row and row[0]: 
+        # --- 👇 CORRECTIF ANTI-CRASH 👇 ---
+        # On récupère le nom (soit de la DB, soit de Telegram)
+        raw_name = row[1] or user.first_name or "Utilisateur"
+        # On échappe les caractères spéciaux pour le Markdown
+        safe_name = str(raw_name).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+        # ----------------------------------
+
         # On stocke le message ID pour le supprimer plus tard
         msg = await update.message.reply_text(
             f"🔒 **TERMINAL VERROUILLÉ**\n"
-            f"Utilisateur : {row[1] or user.first_name}\n\n"
+            f"Utilisateur : {safe_name}\n\n"
             f"PIN : `____`", # 4 underscores pour commencer
             reply_markup=get_pin_keyboard(),
             parse_mode="Markdown"
@@ -4449,7 +4720,6 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) not in ADMIN_IDS: return
 
     # 2. SÉCURITÉ : On désactive le mode "Édition de Solde" si on revient ici
-    # Cela évite que le bot intercepte des messages si l'admin change d'avis
     context.user_data["SOLDE_EDIT_MODE"] = False 
 
     target_id = None
@@ -4464,11 +4734,11 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "admin_adjust_" in q.data:
             target_id = q.data.replace("admin_adjust_", "")
     
-    # Cas B : Appel interne (après modification ou via variable globale)
+    # Cas B : Appel interne
     if not target_id:
         target_id = context.user_data.get('target_user')
 
-    # Cas C : Si toujours rien, on utilise la variable blindée SOLDE_TARGET_ID par précaution
+    # Cas C : Fallback
     if not target_id:
         target_id = context.user_data.get('SOLDE_TARGET_ID')
 
@@ -4479,7 +4749,7 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 4. Sauvegarde BLINDÉE pour la suite
     context.user_data["target_user"] = target_id
-    context.user_data["SOLDE_TARGET_ID"] = target_id # On synchronise les deux variables
+    context.user_data["SOLDE_TARGET_ID"] = target_id 
 
     # 5. Récupération DB
     con = sqlite3.connect(DB_NAME)
@@ -4489,12 +4759,17 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = row[0] if row else "Inconnu"
     balance = row[1] if row else 0.0
 
+    # --- 👇 CORRECTIF ANTI-CRASH : Échappement des caractères Markdown 👇 ---
+    # On ajoute des backslashs devant _ et * pour que Telegram ne les interprète pas comme du formatage
+    safe_username = str(username).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`") if username else "Inconnu"
+    # -----------------------------------------------------------------------
+
     # 6. Construction Interface
     txt = (
         f"👤 **GESTION UTILISATEUR**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🆔 ID : `{target_id}`\n"
-        f"📛 Nom : @{username}\n"
+        f"📛 Nom : @{safe_username}\n"  # <--- On utilise safe_username ici
         f"💰 Solde actuel : **{balance:.2f} $**\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
@@ -4512,8 +4787,12 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     except:
-        # Fallback ultime (si message trop vieux pour être édité)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        # Fallback ultime : si le Markdown plante encore (ex: caractères bizarres), on envoie en texte brut
+        try:
+            clean_txt = txt.replace("*", "").replace("`", "").replace("_", "")
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=clean_txt, reply_markup=InlineKeyboardMarkup(kb))
+        except: 
+            pass
 
 
 async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4550,6 +4829,12 @@ async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT
 async def admin_customamount_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     from datetime import datetime
     import asyncio
+
+    # --- 🛡️ CORRECTIF SENTRY ---
+    # Si context.user_data est None (ex: message de canal), on arrête tout de suite.
+    if context.user_data is None:
+        return
+    # ---------------------------
 
     # 1. Vérification : Est-ce qu'on est en train de modifier un solde ?
     if not context.user_data.get("SOLDE_EDIT_MODE"):
@@ -4697,7 +4982,7 @@ async def admin_setstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-async def admin_userstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_userstatut(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id=None):
     # Guard admin
     if str(update.effective_user.id) not in ADMIN_IDS:
         return
@@ -4705,30 +4990,36 @@ async def admin_userstatut(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    # On récupère l'ID
-    target_id = q.data.replace("admin_userstatut_", "")
+    # --- LOGIQUE D'EXTRACTION DE L'ID ---
+    # Si target_id n'est pas fourni, on le prend dans q.data (clic normal)
+    # Si target_id est fourni, on ignore q.data (appel forcé après modif)
+    if target_id is None:
+        target_id = q.data.replace("admin_userstatut_", "")
     
     # On récupère les infos
     con = sqlite3.connect(DB_NAME)
+    # Utilisation de Row pour plus de sécurité sur les colonnes
     row = con.execute("SELECT username, forfait, balance FROM users WHERE telegram_id=?", (target_id,)).fetchone()
     con.close()
     
     if not row:
-        await q.message.reply_text("Utilisateur introuvable.")
+        await q.message.reply_text("❌ Utilisateur introuvable.")
         return
 
     uname, current_tier, bal = row
+    # Gestion du label actuel (fallback sur le tier si non trouvé)
     current_label = FORFAITS.get(current_tier, {}).get('label', current_tier)
 
     # Menu de choix propre
     kb = [
-        [InlineKeyboardButton(f"{FORFAITS['bronze']['label']}",   callback_data=f"admin_statut_{target_id}_bronze")],
-        [InlineKeyboardButton(f"{FORFAITS['silver']['label']}",   callback_data=f"admin_statut_{target_id}_silver")],
-        [InlineKeyboardButton(f"{FORFAITS['gold']['label']}",     callback_data=f"admin_statut_{target_id}_gold")],
-        [InlineKeyboardButton(f"{FORFAITS['platinum']['label']}", callback_data=f"admin_statut_{target_id}_platinum")],
+        [InlineKeyboardButton(f"🥉 {FORFAITS['bronze']['label']}",   callback_data=f"admin_statut_{target_id}_bronze")],
+        [InlineKeyboardButton(f"🥈 {FORFAITS['silver']['label']}",   callback_data=f"admin_statut_{target_id}_silver")],
+        [InlineKeyboardButton(f"🥇 {FORFAITS['gold']['label']}",     callback_data=f"admin_statut_{target_id}_gold")],
+        [InlineKeyboardButton(f"💎 {FORFAITS['platinum']['label']}", callback_data=f"admin_statut_{target_id}_platinum")],
         [InlineKeyboardButton("⬅️ Retour Liste", callback_data="admin_setstatut")]
     ]
 
+    # Mise à jour du message
     await q.edit_message_text(
         f"🏷 **MODIFIER LE STATUT**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -4759,8 +5050,7 @@ async def admin_setstatut_final(update: Update, context: ContextTypes.DEFAULT_TY
     
     # On modifie le q.data pour simuler un rappel de la fonction d'affichage du profil
     # Cela va rafraîchir la page et montrer le nouveau statut instantanément
-    q.data = f"admin_userstatut_{target_id}"
-    await admin_userstatut(update, context)
+    await admin_userstatut(update, context, target_id=target_id)
 
 async def admin_hard_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
@@ -4906,43 +5196,106 @@ async def launch_parallel_calls(base_code, user_id, num_calls=10, fullname="", f
     if batch_id is None:
         batch_id = f"{user_id}:{base_code}"
 
+    # 1. Initialisation de l'état en mémoire
     key = f"{batch_id}:{base_code}"
-
     user_validation_status[key] = {
-        "notified": False,
-        "total": 0,
+        "notified": False, 
+        "total": 0, 
         "fullname": fullname,
-        "formatted": formatted,
-        "resolved": False,
+        "formatted": formatted, 
+        "resolved": False, 
         "batch_id": batch_id
     }
 
-    log(f"\U0001f9e9 Initialisation du batch {batch_id} pour {num_calls} variantes...", user_id)
+    # --- 🛡️ PROTECTION ANTI-DOUBLON ---
+    # On vérifie si ce permis exact (Base + Nom) est déjà marqué 'valide'
+    try:
+        con = sqlite3.connect(DB_NAME)
+        # On cherche un permis qui commence par la même base et pour le même nom
+        existing = con.execute("""
+            SELECT permis FROM verifications 
+            WHERE fullname = ? AND status = 'valide' AND permis LIKE ?
+            LIMIT 1
+        """, (fullname, f"{base_code}%")).fetchone()
+        con.close()
 
-    async def make_call(variant):
-        try:
-            call = client.calls.create(
+        if existing:
+            found_permis = existing[0]
+            log(f"✅ [SKIP] Permis déjà en base pour {fullname} : {found_permis}", user_id)
+            
+            # On marque comme notifié pour arrêter toute exécution
+            user_validation_status[key]["notified"] = True
+            
+            # Message flash pour le client
+            await app_telegram.bot.send_message(
+                chat_id=int(user_id), 
+                text=f"♻️ **Permis déjà validé !**\n\nNous avons retrouvé le numéro dans vos archives :\n`{found_permis}`\n\n(Aucun crédit n'a été utilisé)."
+            )
+            
+            # Mise à jour de l'animation du batch (pour que l'UI passe à 1/1)
+            br = batch_runs.get(batch_id)
+            if br:
+                async with br["lock"]:
+                    br["resolved"] += 1
+                    if br["resolved"] >= br["total"]:
+                        br["notified"] = True
+            return 
+    except Exception as e:
+        log(f"⚠️ Erreur check doublon: {e}", user_id, "warning")
+    # --- FIN DE LA PROTECTION ---
+
+    log(f"🚀 [SIGNALWIRE] Déclenchement séquence (Base: {base_code}) - Délai: 6s", user_id)
+
+    # 2. Boucle séquentielle des appels
+    for i in range(num_calls):
+        # Vérification si un appel précédent a déjà réussi
+        if user_validation_status[key].get("notified"):
+            log(f"🛑 Code trouvé ! Arrêt de la séquence pour {fullname}.", user_id)
+            break
+
+        # Lancement d'un appel unique via l'ouvrier
+        await _launch_single_call(base_code, i, user_id, batch_id)
+
+        # Délai de 6 secondes entre chaque variante pour rester "propre"
+        if i < num_calls - 1: # Pas besoin de dormir après le dernier appel
+            log(f"⏳ Pause 6s avant la variante {i+1}...", user_id)
+            await asyncio.sleep(6)
+
+    log(f"🏁 Séquence de batch terminée pour {batch_id}", user_id)
+
+async def _launch_single_call(base_code, i, user_id, batch_id):
+    """Lance UN SEUL appel SignalWire sans faire crash le bot."""
+    variant = f"{base_code}{i:02}"
+    
+    # Construction de l'URL proprement
+    webhook_url = f"{SERVER_URL}/twilio_handler?code={variant}&uid={user_id}&bid={batch_id}"
+    
+    try:
+        # On force l'exécution en arrière-plan pour éviter les blocages
+        loop = asyncio.get_running_loop()
+        
+        # On utilise une fonction lambda pour passer les arguments à SignalWire
+        def call_signalwire():
+            return client.calls.create(
                 to=DESTINATION_NUMBER,
                 from_=SIGNALWIRE_NUMBER,
-                url=f"{SERVER_URL}/twilio_handler?code={variant}&uid={user_id}&bid={batch_id}",
-                record=True,
-                recording_channels="dual"
+                url=webhook_url,
+                record=False,
+                machine_detection="DetectMessageEnd",
+                machine_detection_timeout=5
             )
-            sid = call.sid
-            active_calls[sid] = {"user_id": user_id, "code": variant, "batch_id": batch_id}
-            log(f"\ud83d\udcde Appel lanc\u00e9 → Variante {variant} | SID: {sid}", user_id)
-        except Exception as e:
-            log(f"\u274c Erreur SignalWire sur la variante {variant} : {e}", user_id, "error")
 
-    tasks = []
-    for i in range(num_calls):
-        variant = f"{base_code}{i:02}"
-        tasks.append(asyncio.create_task(make_call(variant)))
-        await asyncio.sleep(1)
+        # L'exécution réelle
+        call = await loop.run_in_executor(None, call_signalwire)
+        
+        if call and call.sid:
+            active_calls[call.sid] = {"user_id": user_id, "code": variant, "batch_id": batch_id}
+            log(f"📞 Succès : Variante {variant} | SID: {call.sid}", user_id)
+        
+    except Exception as e:
+        # On capture l'erreur mais on ne l'envoie pas plus loin (Anti-Crash)
+        log(f"⚠️ SignalWire a refusé la variante {variant} : {e}", user_id, "error")
 
-    if tasks:
-        await asyncio.gather(*tasks)
-        log(f"\ud83d\ude80 Tous les appels pour le batch {batch_id} ont \u00e9t\u00e9 lanc\u00e9s.", user_id)
 
 
 async def cancel_all_calls(batch_id: str | None = None, user_id: int | str | None = None):
@@ -5119,18 +5472,41 @@ def analyze_response():
     formatted = state.get("formatted", "")
     logger.info(f"🧾 Analyse du code {variant} pour {fullname} / batch={batch_id}")
 
-    # === Détection vocale ===
+    # === Détection vocale (AMÉLIORÉE) ===
+    # Nettoyage agressif pour la comparaison
+    speech_clean = speech.replace('.', '').replace(',', '')
+
+    # 1. Phrases GAGNANTES (Priorité absolue)
+    # Si le bot entend ça, c'est valide à 100%, peu importe le reste.
+    winning_phrases = [
+        "permis de conduire est valide",
+        "le dossier est valide",
+        "ce permis est valide",
+        "comprend la classe", # La SAAQ dit ça quand c'est valide
+        "comprend les classes",
+        "status is valid"
+    ]
+
+    is_absolute_win = any(phrase in speech_clean for phrase in winning_phrases)
+
+    # 2. Patterns négatifs (Échec)
     neg_patterns = [
         r"\binvalide\b", r"\bnon\s+valide\b", r"\bpas\s+valide\b",
         r"n[\'’]est\s+pas\s+valide", r"\binvalid\b", r"\bnot\s+valid\b",
+        r"comporte une erreur", # Important : SAAQ dit ça quand le numéro est faux
+        r"ne correspond à aucun"
     ]
-    pos_pattern = r"\b(valide|valid)\b"
 
-    is_negative = any(re.search(p, speech) for p in neg_patterns)
-    is_positive = bool(re.search(pos_pattern, speech))
-    valid = is_positive and not is_negative
+    # 3. Logique de décision
+    if is_absolute_win:
+        valid = True
+        logger.info("✅ DÉTECTION FORCÉE : Phrase gagnante trouvée !")
+    else:
+        is_negative = any(re.search(p, speech) for p in neg_patterns)
+        is_positive = bool(re.search(r"\b(valide|valid)\b", speech))
+        valid = is_positive and not is_negative
 
-    logger.info(f"🔎 Interprétation — positif={is_positive}, négatif={is_negative}, valid={valid}")
+    logger.info(f"🔎 Interprétation — Win={is_absolute_win}, Valid={valid}")
 
     # === Sous-fonction notification ===
     def _maybe_finish_batch(add_result_text=None):
@@ -5139,65 +5515,77 @@ def analyze_response():
             if not br: return
 
             async with br.setdefault("lock", asyncio.Lock()):
-                
-                # 1. Envoi du résultat (Valide/Invalide)
+                # 1. Mise à jour du compteur de résolution
+                if not state["resolved"]:
+                    state["resolved"] = True
+                    br["resolved"] += 1 
+
+                # 2. Envoi du message au client (seulement si ce n'est pas une COMMANDE d'ID)
                 if add_result_text:
-                    # PATCH : Si c'est une COMMANDE, on reste silencieux ici.
+                    # Si "ORDER" est dans l'ID, le formulaire gère l'affichage, donc on reste silencieux
                     if "ORDER" not in str(batch_id):
                         await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text)
                 
-                # 2. Mise à jour du compteur
-                if not state["resolved"] and (add_result_text or state.get("total", 0) >= 10): 
-                    state["resolved"] = True
-                    br["resolved"] += 1 
-                
-                # 3. Fin du batch
+                # 3. Fermeture du batch si tout est fini
                 if br["resolved"] >= br["total"] and not br["notified"]:
                     br["notified"] = True 
                     
-                    # PATCH CRITIQUE : Si c'est une COMMANDE, on s'arrête LÀ.
-                    # Pas de message "Fin", pas de retour menu. Le formulaire gère la suite.
+                    # Si c'est une commande d'ID, on logue mais on ne renvoie pas au menu
                     if "ORDER" in str(batch_id):
-                        logger.info(f"✅ Batch Commande {batch_id} terminé en silence.")
+                        logger.info(f"✅ [POLLING] Batch Commande {batch_id} validé avec succès.")
                         return
 
-                    # Comportement normal (/verifier)
+                    # Pour une vérification simple (/verifier), on renvoie au menu
                     await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
                     await show_main_menu(user_id)
                     
         asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
 
     try:
-        # === Cas permis valide ===
+        # === CAS PERMIS VALIDE ===
         if valid and not state["notified"]:
-            final_suffix = re.sub(r"\D", "", variant[-2:]).rjust(2, "0")
-            final_permis = (formatted.replace("**", final_suffix)
-                            if formatted else f"{variant[:5]}-{variant[5:11]}-{final_suffix}")
-            logger.info(f"✅ Permis VALIDÉ : {final_permis}")
+            # On prend les 2 derniers chiffres de la variante (ex: 03)
+            real_suffix = variant[-2:] 
+            
+            # Nettoyage strict
+            clean_var = re.sub(r'[^A-Z0-9]', '', variant.upper())
+            
+            if len(clean_var) == 13:
+                final_permis = f"{clean_var[:5]}-{clean_var[5:11]}-{clean_var[11:]}"
+            else:
+                final_permis = formatted.replace("**", real_suffix) if formatted else clean_var
 
+            logger.info(f"🎯 MATCH: {final_permis}")
             state["notified"] = True
+            
+            # SAUVEGARDE DB (Indispensable pour débloquer le formulaire)
             save_permit_history(user_id, fullname, final_permis, "valide")
+            
+            # NOTIFICATION
             _maybe_finish_batch(add_result_text=msg(user_id, "validation_ok", permis=final_permis, fullname=fullname))
 
-        # === Cas invalide ===
+        # === CAS INVALIDE ===
         else:
             state["total"] += 1
-            logger.info(f"❌ Permis rejeté (tentative {state['total']}/10)")
+            logger.info(f"❌ [FAIL] Variante {variant[-2:]} rejetée ({state['total']}/10)")
+            
+            # Si on a testé les 10 variantes sans succès
             if state["total"] >= 10 and not state["notified"]:
                 state["notified"] = True
                 save_permit_history(user_id, fullname, None, "aucun")
                 _maybe_finish_batch(add_result_text=msg(user_id, "aucun_permis", fullname=fullname))
 
-        # === Sécurité : redirection pour éviter coupure SignalWire ===
+        # === SÉCURITÉ SIGNALWIRE (Redirection ou Fin) ===
         r = VoiceResponse()
-        r.pause(length=2)
-        r.redirect(f"{SERVER_URL}/composer_code?uid={user_id}", method="POST")
-        logger.info("➡️ Redirection vers composer_code pour continuer le cycle d’appel.")
+        if not state["notified"]:
+            # Si pas encore trouvé, on laisse l'appel cycler
+            r.pause(length=2)
+            r.redirect(f"{SERVER_URL}/composer_code?uid={user_id}", method="POST")
+        else:
+            # Si trouvé, on raccroche cet appel spécifique
+            r.hangup()
+            
         return Response(str(r), mimetype="text/xml")
-
-    except Exception as e:
-        logger.exception(f"❌ Exception analyze_response: {e}")
-        return Response("<Response><Hangup/></Response>", mimetype="text/xml")
 
     finally:
         try:
@@ -5205,6 +5593,95 @@ def analyze_response():
         except Exception as e:
             logger.warning(f"⚠️ Erreur fermeture appel: {e}")
         active_calls.pop(call_sid, None)
+
+    # === Sous-fonction notification ===
+    def _maybe_finish_batch(add_result_text=None):
+        async def _notify_serialized():
+            br = batch_runs.get(batch_id)
+            if not br: return
+
+            async with br.setdefault("lock", asyncio.Lock()):
+                # 1. Mise à jour du compteur de résolution
+                # On ne l'incrémente que si ce n'est pas déjà fait pour ce permis
+                if not state["resolved"]:
+                    state["resolved"] = True
+                    br["resolved"] += 1 
+
+                # 2. Envoi du message au client (seulement si ce n'est pas une COMMANDE d'ID)
+                if add_result_text:
+                    # Si "ORDER" est dans l'ID, le formulaire gère l'affichage, donc on reste silencieux
+                    if "ORDER" not in str(batch_id):
+                        await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text)
+                
+                # 3. Fermeture du batch si tout est fini
+                if br["resolved"] >= br["total"] and not br["notified"]:
+                    br["notified"] = True 
+                    
+                    # Si c'est une commande d'ID, on logue mais on ne renvoie pas au menu
+                    if "ORDER" in str(batch_id):
+                        logger.info(f"✅ [POLLING] Batch Commande {batch_id} validé avec succès.")
+                        return
+
+                    # Pour une vérification simple (/verifier), on renvoie au menu
+                    await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
+                    await show_main_menu(user_id)
+                    
+        asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
+
+    try:
+        # Dans ta fonction analyze_response, remplace le bloc "Cas permis valide" :
+        if valid and not state["notified"]:
+            # On prend les 2 derniers chiffres de la variante (ex: 03)
+            real_suffix = variant[-2:] 
+            
+            # Nettoyage strict
+            clean_var = re.sub(r'[^A-Z0-9]', '', variant.upper())
+            
+            if len(clean_var) == 13:
+                final_permis = f"{clean_var[:5]}-{clean_var[5:11]}-{clean_var[11:]}"
+            else:
+                final_permis = formatted.replace("**", real_suffix) if formatted else clean_var
+
+            logger.info(f"🎯 MATCH: {final_permis}")
+            state["notified"] = True
+            
+            # SAUVEGARDE DB (Indispensable pour débloquer le formulaire)
+            save_permit_history(user_id, fullname, final_permis, "valide")
+            
+            # NOTIFICATION (C'est ici que bot_loop est utilisé)
+            _maybe_finish_batch(add_result_text=msg(user_id, "validation_ok", permis=final_permis, fullname=fullname))
+
+        # === CAS INVALIDE ===
+        else:
+            state["total"] += 1
+            logger.info(f"❌ [FAIL] Variante {variant[-2:]} rejetée ({state['total']}/10)")
+            
+            # Si on a testé les 10 variantes sans succès
+            if state["total"] >= 10 and not state["notified"]:
+                state["notified"] = True
+                save_permit_history(user_id, fullname, None, "aucun")
+                _maybe_finish_batch(add_result_text=msg(user_id, "aucun_permis", fullname=fullname))
+
+        # === SÉCURITÉ SIGNALWIRE (Redirection ou Fin) ===
+        r = VoiceResponse()
+        if not state["notified"]:
+            # Si pas encore trouvé, on laisse l'appel cycler
+            r.pause(length=2)
+            r.redirect(f"{SERVER_URL}/composer_code?uid={user_id}", method="POST")
+        else:
+            # Si trouvé, on raccroche cet appel spécifique
+            r.hangup()
+            
+        return Response(str(r), mimetype="text/xml")
+
+    finally:
+        try:
+            client.calls(call_sid).update(status="completed")
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur fermeture appel: {e}")
+        active_calls.pop(call_sid, None)
+
+
 
 # ========================== MENU/ROUTEUR CALLBACKS ==========================
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5278,20 +5755,42 @@ async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ================= MODULE ID/DOCS CENTER (INTÉGRÉ) ================
 
 # 1. OUTILS GOOGLE & MAPPING & DATES
-def validate_address_google(raw_address):
-    """Interroge Google Maps pour nettoyer l'adresse."""
-    # Sécurité : Si pas de clé configurée dans .env, on retourne vide sans planter
-    if not GOOGLE_API_KEY or "AIzaSy" not in GOOGLE_API_KEY:
+def validate_address_canada_post(raw_address):
+    """Interroge l'API AddressComplete de Postes Canada."""
+    key = os.environ.get("CANADA_POST_API_KEY")
+    if not key: 
+        print("⚠️ Pas de clé Postes Canada configurée.")
         return []
 
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    # Endpoint AddressComplete Standard
+    url = "https://ws1.postescanada-canadapost.ca/AddressComplete/Interactive/Find/v2.10/json3.ws"
+    
+    params = {
+        "Key": key,
+        "SearchTerm": raw_address,
+        "Country": "CAN",
+        "LanguagePreference": "fr",
+        "MaxResults": 5
+    }
+    
     try:
-        res = requests.get(url, params={"address": raw_address, "key": GOOGLE_API_KEY, "language": "fr"})
-        data = res.json()
-        if data['status'] == 'OK':
-            return [r['formatted_address'] for r in data['results'][:3]]
-    except: pass
-    return []
+        r = requests.get(url, params=params, timeout=5)
+        data = r.json()
+        
+        results = []
+        if "Items" in data:
+            for item in data['Items']:
+                # On combine Text (ex: 123 Rue A) et Description (ex: Montréal, QC, H1A 1A1)
+                # Note: Parfois Description est vide si l'adresse est incomplète, on gère ça.
+                text = item.get('Text', '')
+                desc = item.get('Description', '')
+                full = f"{text}, {desc}" if desc else text
+                results.append(full)
+                
+        return results
+    except Exception as e:
+        print(f"[Canada Post Error] {e}")
+        return []
 
 def parse_date_smart(text):
     """Transforme '15 decembre 1990' ou '15/12/90' en '1990-12-15'."""
@@ -5326,6 +5825,28 @@ def generate_barcode_via_api(data_dict, province_code):
     clean_code = province_code.replace('-D', '').replace('BAR-', '')
     jurisdiction = f"CAN-{clean_code}" 
     
+    # --- CORRECTION COULEUR YEUX (MAPPING AAMVA) ---
+    # On récupère la valeur brute, on met en majuscules et on enlève les espaces
+    raw_eyes = str(data_dict.get('form_eyes', 'BRO')).upper().strip()
+
+    # Dictionnaire de correspondance (Entrée possible -> Code Standard AAMVA)
+    # Convertit les anciens codes (BRN), l'anglais (BROWN) et le français (BRUN)
+    eye_map = {
+        'BRN': 'BRO', 'BROWN': 'BRO', 'BRUN': 'BRO',
+        'BLU': 'BLU', 'BLUE': 'BLU', 'BLEU': 'BLU',
+        'HAZ': 'HZL', 'HAZEL': 'HZL',
+        'GRN': 'GRN', 'GREEN': 'GRN', 'VERT': 'GRN',
+        'GRY': 'GRY', 'GRAY': 'GRY', 'GREY': 'GRY', 'GRIS': 'GRY',
+        'BLK': 'BLK', 'BLACK': 'BLK', 'NOIR': 'BLK',
+        'PNK': 'PNK', 'PINK': 'PNK',
+        'MAR': 'MAR', 'MAROON': 'MAR',
+        'DIC': 'DIC', 'MULTI': 'DIC'
+    }
+
+    # Si le code est dans la liste, on le remplace. Sinon on garde l'original.
+    final_eyes = eye_map.get(raw_eyes, raw_eyes)
+    # -----------------------------------------------
+
     # Payload optimisé avec champs séparés
     payload = {
         "jurisdiction": jurisdiction,
@@ -5344,7 +5865,9 @@ def generate_barcode_via_api(data_dict, province_code):
         "data[DAJ]": "QC" if "QC" in jurisdiction else "ON",
         "data[DBC]": data_dict.get('form_sex', '1'), 
         "data[DAU]": data_dict.get('form_height', '175 cm').replace('cm', '').strip(),
-        "data[DAY]": data_dict.get('form_eyes', 'BRO')
+        
+        # 👇 UTILISATION DE LA VARIABLE CORRIGÉE ICI 👇
+        "data[DAY]": final_eyes 
     }
 
     headers = {"Authorization": f"Bearer {FAKEID_API_KEY}", "Accept": "image/png"}
@@ -5733,16 +6256,33 @@ async def id_save_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ID_ASK_ZIP
 
 async def id_save_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reçoit le Code Postal et lance la recherche Postes Canada."""
     context.user_data['addr_zip'] = update.message.text.upper().strip()
     await clean_chat(update, context)
-    m_wait = await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 Validation Google Maps...")
-    suggestions = validate_address_google(f"{context.user_data['addr_street']}, {context.user_data['addr_city']}")
-    context.user_data['addr_suggestions'] = suggestions or [context.user_data['addr_street']]
     
-    kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(context.user_data['addr_suggestions'])]
-    kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
+    m_wait = await context.bot.send_message(chat_id=update.effective_chat.id, text="📮 **Interrogation Postes Canada...**", parse_mode="Markdown")
+    
+    # On construit une recherche large : Rue + Ville + Code Postal
+    search_query = f"{context.user_data['addr_street']}, {context.user_data['addr_city']}, {context.user_data['addr_zip']}"
+    
+    # Appel de la nouvelle fonction
+    suggestions = validate_address_canada_post(search_query)
+    
+    # Fallback : Si l'API ne trouve rien, on propose ce que l'user a écrit
+    if not suggestions:
+        suggestions = [search_query]
+        
+    context.user_data['addr_suggestions'] = suggestions
+    
+    # Création des boutons
+    kb = [[InlineKeyboardButton(f"📍 {a[:60]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(suggestions)]
+    
+    # Ajout des options Manuel et Retry
+    kb.append([InlineKeyboardButton("✍️ Saisie Manuelle (Libre)", callback_data="addr_manual")])
+    kb.append([InlineKeyboardButton("🔄 Réessayer", callback_data="addr_retry")])
     kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")])
-    await m_wait.edit_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
+    
+    await m_wait.edit_text("✅ **Adresse normalisée :**\nChoisissez la version officielle :", reply_markup=InlineKeyboardMarkup(kb))
     context.user_data['cleanup_ids'] = [m_wait.message_id]
     return ID_CONFIRM_ADDR
 
@@ -5838,7 +6378,12 @@ async def id_save_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await clean_chat(update, context)
     return await id_show_summary(update, context)
 
+# ==========================================
+# 👇 COLLEZ CECI JUSTE APRÈS id_save_photo 👇
+# ==========================================
+
 async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le résumé avec le bouton MODIFIER."""
     d = context.user_data
     sex_map = {'1': 'Homme', '2': 'Femme', '9': 'X'}
     
@@ -5846,7 +6391,7 @@ async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('editing_key', None)
 
     txt = (
-        f"📝 **RÉSUMÉ DES DONNÉES**\n\n"
+        f"📝 **RÉSUMÉ DE VOTRE COMMANDE**\n\n"
         f"👤 **Identité**\n"
         f"• Prénom (DAC) : `{d.get('form_firstname')}`\n"
         f"• Nom (DCS) : `{d.get('form_lastname')}`\n"
@@ -5868,24 +6413,33 @@ async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     kb = [
         [InlineKeyboardButton("✅ CONFIRMER & GÉNÉRER", callback_data="confirm_gen")],
-        # 👇 LE NOUVEAU BOUTON EST ICI 👇
+        # 👇 C'est cette ligne qui ajoute le bouton Modifier 👇
         [InlineKeyboardButton("✏️ Modifier / Corriger", callback_data="edit_open_menu")],
-        # -------------------------------
+        # -------------------------------------------------------------
         [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]
     ]
     
     target = update.message or update.callback_query.message
-    # Si on vient d'une édition, on édite le message, sinon on envoie un nouveau
+    
+    # Gestion intelligente : Si on vient d'un bouton (callback), on édite le message.
+    # Sinon (message texte), on envoie un nouveau message.
     if update.callback_query:
         try:
             m = await target.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         except:
+             # Fallback si l'édition échoue (ex: message identique)
              m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
         m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         
     context.user_data.setdefault('cleanup_ids', []).append(m.message_id) 
     return ID_CONFIRM_SUMMARY
+
+# ==========================================
+# 👆 FIN DU BLOC À COLLER 👆
+# ==========================================
+
+
 
 async def id_open_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche la grille de 13 boutons pour choisir quoi modifier."""
@@ -5989,11 +6543,87 @@ async def id_receive_new_value(update: Update, context: ContextTypes.DEFAULT_TYP
     # id_show_summary va envoyer un nouveau message ou éditer le dernier connu.
     return await id_show_summary(update, context)
 
+def creer_verso_complet(pdf417_bytes, linear_bytes):
+    """
+    Génère le verso complet avec un alignement horizontal parfait :
+    1. PDF417 (Gros) à gauche (X=208).
+    2. Code 128 (Petit) à droite (X=2445).
+    3. Alignement horizontal strict sur la ligne du haut (Y=125).
+    4. Recoloration #322c0d pour les deux.
+    """
+    try:
+        # --- CONFIGURATION ---
+        bg_path = "assets/back_template.jpg" 
+        target_hex = "#322c0d"
+        target_rgb = ImageColor.getrgb(target_hex)
+        
+        # =========================================================
+        # 📍 COORDONNÉES VALIDÉES (Image 4067x2579 px)
+        # =========================================================
+        Y_ALIGN = 125  # Alignement horizontal parfait du haut
+
+        # PDF417 (Le gros pavé à gauche)
+        PDF_X, PDF_Y, PDF_W, PDF_H = 208, Y_ALIGN, 1938, 388
+        
+        # Code 128 (La petite bande à droite)
+        LIN_X, LIN_Y, LIN_W, LIN_H = 2445, Y_ALIGN, 1404, 202
+        # =========================================================
+
+        # 1. Charger l'image de fond
+        try:
+            background = Image.open(bg_path).convert("RGBA")
+        except FileNotFoundError:
+            print(f"❌ ERREUR : Image de fond '{bg_path}' introuvable dans assets/ !")
+            return None
+
+        # --- Fonction interne pour traiter et recolorer les codes-barres ---
+        def process_layer(img_bytes, w, h):
+            if not img_bytes: return None
+            # Ouvrir l'image du code-barres
+            original = Image.open(io.BytesIO(img_bytes)).convert("RGBA")
+            
+            # Gestion de la transparence (Masque)
+            alpha = original.split()[3]
+            if alpha.getextrema()[0] == 255: # Si fond blanc opaque
+                mask = ImageOps.invert(original.convert('L'))
+            else: # Si fond déjà transparent
+                mask = alpha
+
+            # Appliquer la couleur cible (#322c0d)
+            colored_img = Image.new("RGBA", original.size, target_rgb)
+            colored_img.putalpha(mask)
+
+            # Redimensionnement haute qualité
+            return colored_img.resize((w, h), Image.Resampling.LANCZOS)
+
+        # 2. Traitement et Collage du PDF417 (Gauche)
+        if pdf417_bytes:
+            pdf_img = process_layer(pdf417_bytes, PDF_W, PDF_H)
+            if pdf_img:
+                background.paste(pdf_img, (PDF_X, PDF_Y), pdf_img)
+
+        # 3. Traitement et Collage du Code 128 (Droite)
+        if linear_bytes:
+            lin_img = process_layer(linear_bytes, LIN_W, LIN_H)
+            if lin_img:
+                background.paste(lin_img, (LIN_X, LIN_Y), lin_img)
+
+        # 4. Export Final en PNG (Qualité maximale)
+        output = io.BytesIO()
+        background.save(output, format="PNG", optimize=True)
+        output.seek(0)
+        return output
+
+    except Exception as e:
+        print(f"❌ Erreur PIL Verso Complet: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import asyncio
     q = update.callback_query
     
-    # 1. On répond au callback immédiatement
     if q:
         try: await q.answer()
         except: pass
@@ -6001,13 +6631,12 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     d = context.user_data
     
-    # Sécurité : On récupère les données
+    # 1. Récupération des données
     cat = d.get('id_category', 'ID')
     prod = d.get('id_product', {})
     prod_name = prod.get('name', 'Produit Inconnu')
     prod_code = prod.get('code', 'QC')
 
-    # 2. Préparation des données
     def clean(key): return str(d.get(key, '')).upper().strip()
 
     api_data = {
@@ -6026,75 +6655,112 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "form_expiry": clean('form_expiry')
     }
 
-    # 3. Message de statut
+    # 2. Calcul du coût
+    total_cost = d.get('id_qty', 1) * prod.get('price', 0)
+
+    # 3. Construction du texte Admin
+    admin_txt = (
+        f"🚨 NOUVELLE COMMANDE : {cat.upper()} 🚨\n\n"
+        f"👤 CLIENT : {user.first_name} (@{user.username if user.username else 'N/A'})\n"
+        f"🆔 ID : {user.id}\n"
+        f"🛒 PRODUIT : {prod_name} (x{d.get('id_qty', 1)})\n"
+        f"💰 TOTAL : {total_cost:.2f} $\n"
+        f"--------------\n\n"
+        f"🆔 DOCUMENTS :\n\n"
+        f"💳 Permis : {api_data['form_dl_number']}\n"
+        f"📛 Nom : {api_data['form_lastname']}\n"
+        f"📛 Prénom : {api_data['form_firstname']}\n"
+        f"🎂 DDN : {api_data['form_dob']}\n"
+        f"📍 Adresse : {api_data['form_street']}\n"
+        f"🏙️ Ville: {api_data['form_city']}\n"
+        f"📨 CP: {api_data['form_zip']}\n"
+        f"📏 Taille: {api_data['form_height']} cm\n"
+        f"👁 Yeux : {api_data['form_eyes']}\n"
+        f"🧬 Sexe: {api_data['form_sex']}\n"
+        f"🔢 Référence : {api_data['form_ref_number']}\n"
+        f"📅 Valide : {api_data['form_issue']}\n"
+        f"📅 Expiration : {api_data['form_expiry']}\n"
+    )
+
+    # 4. SAUVEGARDE EN BASE DE DONNÉES
+    try:
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO support_tickets (user_id, username, category, status, message) VALUES (?, ?, ?, ?, ?)",
+            (str(user.id), user.username or "Inconnu", f"ORDER: {prod_name}", "closed", admin_txt)
+        )
+        order_ticket_id = cur.lastrowid
+        con.commit()
+        con.close()
+        admin_txt = f"🧾 **ORDER #{order_ticket_id}**\n" + admin_txt
+    except Exception as db_err:
+        print(f"❌ DB SAVE ERROR: {db_err}")
+
+    # 5. Message d'attente client
     status_msg = await context.bot.send_message(
         chat_id=user.id, 
-        text="⏳ **Génération des fichiers et envoi en cours...**\n_(Cela peut prendre quelques secondes)_", 
+        text="⏳ **Validation et génération des fichiers...**", 
         parse_mode="Markdown"
     )
 
     try:
-        # 4. Génération Barcode (API)
-        loop = asyncio.get_running_loop()
-        pdf417, linear = await loop.run_in_executor(None, lambda: generate_barcode_via_api(api_data, prod_code))
-
-        # 5. Débit de l'argent
-        total_cost = d.get('id_qty', 1) * prod.get('price', 0)
+        # 6. Débit
         update_user_balance(str(user.id), -total_cost)
 
-        # 6. Message Admin (FORMAT EXACT AVEC ESPACES)
-        admin_txt = (
-            f"🚨 NOUVELLE COMMANDE : {cat.upper()} 🚨\n\n"
-            f"👤 CLIENT : {user.first_name} (@{user.username if user.username else 'N/A'})\n"
-            f"🆔 ID : {user.id}\n"
-            f"🛒 PRODUIT : {prod_name} (x{d.get('id_qty', 1)})\n"
-            f"💰 TOTAL : {total_cost:.2f}$\n"
-            f"--------------\n\n"
-            f"🆔 DOCUMENTS :\n\n"
-            f"💳 Permis : {api_data['form_dl_number']}\n"
-            f"📛 Nom : {api_data['form_lastname']}\n"
-            f"📛 Prénom : {api_data['form_firstname']}\n"
-            f"🎂 DDN : {api_data['form_dob']}\n"
-            f"📍 Adresse : {api_data['form_street']}\n"
-            f"🏙️ Ville: {api_data['form_city']}\n"
-            f"📨 CP: {api_data['form_zip']}\n"
-            f"📏 Taille (cm): {api_data['form_height']}\n"
-            f" 🧬 Sexe: {api_data['form_sex']}\n"
-            f"🔢 Référence : {api_data['form_ref_number']}\n"
-            f"📅 Valide : {api_data['form_issue']}\n"
-            f"📅 Expiration : {api_data['form_expiry']}\n"
-        )
+        # 7. Génération Barcode (API)
+        loop = asyncio.get_running_loop()
+        pdf417_raw, linear_raw = await loop.run_in_executor(None, lambda: generate_barcode_via_api(api_data, prod_code))
 
-        target_id = "-1003589564052" # Channel Logs
+        # ==============================================================
+        # 8. CRÉATION DU VERSO COMPLET (Fusion via Pillow)
+        # ==============================================================
+        final_verso = None
+        if pdf417_raw:
+            # On appelle ta fonction magique
+            final_verso = await loop.run_in_executor(None, lambda: creer_verso_complet(pdf417_raw, linear_raw))
+
+        # 9. Envoi au Canal Logs
+        target_id = CHANNEL_LOGS 
         
-        # Envoi Photo + Texte
+        # A. Envoi Infos Texte + Photo (Selfie)
         if d.get('form_photo_id'):
             await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_txt)
         else:
             await context.bot.send_message(chat_id=target_id, text=admin_txt)
         
-        # Envoi Barcodes
-        if pdf417: 
-            await context.bot.send_document(chat_id=target_id, document=pdf417, filename=f"pdf417_{api_data['form_lastname']}.png")
-        if linear: 
-            await context.bot.send_document(chat_id=target_id, document=linear, filename=f"code128_{api_data['form_lastname']}.png")
+        # B. ENVOI DU RÉSULTAT FINAL
+        if final_verso: 
+            await context.bot.send_document(
+                chat_id=target_id, 
+                document=final_verso, 
+                filename=f"Back_{api_data['form_lastname']}.png",
+                caption="🖨️ **Verso Généré (Prêt à imprimer)**"
+            )
+        else:
+            # Fallback : Si Pillow échoue, on envoie le brut pour ne pas perdre la commande
+            if pdf417_raw:
+                 await context.bot.send_document(chat_id=target_id, document=pdf417_raw, filename="raw_pdf417.png")
 
-        # 7. Succès Client
+        # 10. Succès Client
         await status_msg.edit_text("✅ **Commande reçue !**\nLes fichiers ont été envoyés à l'équipe.\nVotre solde a été débité.", parse_mode="Markdown")
 
     except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
-        await status_msg.edit_text(f"⚠️ **Erreur technique.**\nL'admin a été notifié. Ne refaites pas la commande.")
+        print(f"CRITICAL ERROR in Order: {e}")
+        import traceback
+        traceback.print_exc()
+        await status_msg.edit_text(f"⚠️ **Commande enregistrée mais erreur technique.**\nL'admin a reçu les détails.")
+        try:
+            await context.bot.send_message(chat_id=CHANNEL_LOGS, text=f"⚠️ ERREUR TECHNIQUE {user.id}: {e}")
+        except: pass
 
-    # 8. Nettoyage sécurisé
+    # 11. Nettoyage
     await asyncio.sleep(2)
     for mid in d.get('cleanup_ids', []):
         try: await context.bot.delete_message(chat_id=user.id, message_id=mid)
         except: pass
     
     context.user_data['cleanup_ids'] = []
-    
-    # 9. Retour Menu
     await show_main_menu(user.id)
     return ConversationHandler.END
 
@@ -7285,175 +7951,142 @@ async def ticket_view_reply_handler(update: Update, context: ContextTypes.DEFAUL
     kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="support")]]
     await q.edit_message_text(text=history_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-
 async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la confirmation de l'adresse (choix dans la liste ou réécriture)."""
+    """Gère la confirmation de l'adresse avec parsing intelligent et nettoyage."""
     q = update.callback_query
-    await q.answer()
     
-    # 1. Cas du bouton "Réécrire"
-    if "retry" in q.data:
-        # On nettoie et on retourne à l'étape de la Rue
-        await clean_chat(update, context)
-        prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
-        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{prev}")]]
-        
-        m = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", 
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown"
-        )
-        context.user_data['cleanup_ids'] = [m.message_id]
-        return ID_ASK_STREET
-    
-    # 2. Cas du choix d'une adresse (addr_pick:0)
-    try:
-        idx = int(q.data.split(":")[1])
-        suggestions = context.user_data.get('addr_suggestions', [])
-        if suggestions and 0 <= idx < len(suggestions):
-            context.user_data['form_address'] = suggestions[idx]
-            # On sépare aussi pour l'affichage résumé
-            context.user_data['addr_street'] = suggestions[idx].split(',')[0]
-        else:
-            # Fallback
-            raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}"
-            context.user_data['form_address'] = raw
-    except:
-        pass
-    
-    # 3. Nettoyage de l'écran avant de passer à la suite
-    await clean_chat(update, context)
+    # --- GESTION DES BOUTONS ---
+    if q:
+        await q.answer()
+        data = q.data
 
-    # 4. Passage à l'étape suivante (Sujet selon Catégorie)
+        if data == "addr_retry":
+            await clean_chat(update, context)
+            prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
+            kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{prev}")]]
+            m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", reply_markup=InlineKeyboardMarkup(kb))
+            context.user_data['cleanup_ids'] = [m.message_id]
+            return ID_ASK_STREET
+
+        if data == "addr_manual":
+            # On supprime le menu de choix pour afficher la demande de saisie
+            try: await q.message.delete()
+            except: pass
+            
+            m = await context.bot.send_message(chat_id=update.effective_chat.id, text="✍️ **SAISIE MANUELLE**\n\nVeuillez écrire l'adresse complète :\n_(Ex: 123 Rue de la Paix, Apt 4, Montréal, QC, H1A 1A1)_")
+            context.user_data['cleanup_ids'] = [m.message_id] # On track ce nouveau message
+            return ID_CONFIRM_ADDR 
+
+        # Choix d'une suggestion Postes Canada
+        try:
+            if data.startswith("addr_pick:"):
+                idx = int(data.split(":")[1])
+                suggestions = context.user_data.get('addr_suggestions', [])
+                if suggestions and 0 <= idx < len(suggestions):
+                    full_addr = suggestions[idx]
+                    context.user_data['form_address'] = full_addr
+                    
+                    # --- PARSING INTELLIGENT ---
+                    parts = [p.strip() for p in full_addr.split(',')]
+                    
+                    if len(parts) >= 3:
+                        context.user_data['addr_zip'] = parts[-1] 
+                        candidate_city = parts[-3]
+                        
+                        # Fix si la ville commence par un chiffre (c'est encore la rue)
+                        if candidate_city and candidate_city[0].isdigit():
+                             candidate_city = parts[-2]
+                             if len(candidate_city) == 2: candidate_city = parts[-3]
+
+                        context.user_data['addr_city'] = candidate_city
+                        context.user_data['addr_street'] = parts[0]
+                    
+                    # 🔥 C'EST ICI LA CORRECTION 🔥
+                    # On supprime le message "Choisissez la version officielle"
+                    try: await q.message.delete()
+                    except: pass
+                    # On vide la liste car on vient de supprimer le message manuellement
+                    context.user_data['cleanup_ids'] = []
+
+                else:
+                    # Fallback
+                    raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}"
+                    context.user_data['form_address'] = raw
+                    try: await q.message.delete()
+                    except: pass
+        except Exception as e:
+            print(f"Erreur Parsing Adresse: {e}")
+
+    # --- GESTION DU TEXTE MANUEL ---
+    elif update.message:
+        manual_addr = update.message.text.strip()
+        context.user_data['form_address'] = manual_addr
+        parts = manual_addr.split(',')
+        if len(parts) > 0: context.user_data['addr_street'] = parts[0].strip()
+        if len(parts) > 1: context.user_data['addr_city'] = parts[1].strip()
+        if len(parts) > 2: context.user_data['addr_zip'] = parts[-1].strip()
+        
+        await clean_chat(update, context)
+
+    # --- SUITE DU FORMULAIRE ---
     if context.user_data.get('id_category') == 'document':
         kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
-        m = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="🏢 **Nom de l'Employeur** ?",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown"
-        )
+        m = await context.bot.send_message(chat_id=update.effective_chat.id, text="🏢 **Nom de l'Employeur** ?", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['cleanup_ids'] = [m.message_id]
         return ID_ASK_DOC_EMPLOYER
     else:
         kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
-        m = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)",
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode="Markdown"
-        )
+        m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['cleanup_ids'] = [m.message_id]
         return ID_ASK_ISSUE
 
 async def id_handle_dl_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère le choix entre Téléchargement (DL) et Envoi Postal, avec recherche SAAQ blindée."""
+    """Gère le choix entre SAAQ Auto et Saisie Manuelle."""
     q = update.callback_query
     await q.answer()
-    
-    try:
-        mode = q.data.split(":")[1]
-    except IndexError:
-        return ID_ASK_DL_NUM
-        
     user_id = update.effective_user.id
+    mode = q.data.split(":")[1]
     
     if mode == "manual":
-        base_display = context.user_data.get('dl_base_code', 'Permis')
         await clean_chat(update, context)
         kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")]]
         m = await context.bot.send_message(
-            chat_id=user_id,
-            text=f"✍️ **Mode Manuel**\n\nBase : `{base_display}`\nEntrez les **2 derniers chiffres** manquants :",
+            chat_id=update.effective_chat.id,
+            text="✍️ **SAISIE MANUELLE**\n\nVeuillez entrer les **2 derniers chiffres** de votre permis (ex: 03) :",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown"
         )
         context.user_data['cleanup_ids'] = [m.message_id]
         return ID_ASK_DL_NUM
 
-    elif mode == "saaq":
-        # Mode Auto
-        base_code = context.user_data.get('dl_base_code', '')
+    if mode == "saaq":
+        base_code = str(context.user_data.get('dl_base_code', '')).upper().strip()
+        status_msg = await q.edit_message_text(f"⏳ **Recherche SAAQ en cours...**\nBase : `{base_code}`\n\n_Validation en cours (3m 30s max)..._", reply_markup=None, parse_mode="Markdown")
         
-        # Message d'attente
-        m_wait = await q.edit_message_text(
-            f"⏳ **Recherche SAAQ en cours...**\n"
-            f"Base : `{base_code}`\n\n"
-            "_Le bot teste les combinaisons valides..._",
-            parse_mode="Markdown"
-        )
-        
-        # Lancement du Batch
         batch_id = f"{user_id}:ORDER:{int(time.time())}"
         batch_runs[batch_id] = { "total": 1, "resolved": 0, "notified": False, "lock": asyncio.Lock() }
-        
-        asyncio.create_task(launch_parallel_calls(
-            base_code, user_id, num_calls=10, 
-            fullname="Client ID Order", formatted=base_code, 
-            batch_id=batch_id
-        ))
+        asyncio.create_task(launch_parallel_calls(base_code, user_id, num_calls=5, fullname="Commande ID", formatted=base_code, batch_id=batch_id))
         
         final_dl_found = None
-        
-        # Boucle de recherche (Polling) - 60 secondes max
-        for i in range(30): 
+        for i in range(300):
             await asyncio.sleep(2)
-            
-            con = sqlite3.connect(DB_NAME)
-            # On cherche TOUS les résultats valides récents pour cet utilisateur
-            cursor = con.execute(
-                "SELECT permis FROM verifications WHERE user_id=? AND status='valide' ORDER BY id DESC LIMIT 5",
-                (str(user_id),)
-            )
-            rows = cursor.fetchall()
-            con.close()
-            
-            for row in rows:
-                full_permis = row[0] # Ex: B500528109603 ou B5005-281096-96 (buggé)
-                clean_found = full_permis.replace("-", "").strip()
-                
-                # CRITÈRE 1 : Correspondance avec la base (ex: B5005...)
-                if base_code in clean_found:
-                    # CRITÈRE 2 (LE FIX) : Longueur minimale
-                    # Un permis SAAQ valide DOIT avoir 13 caractères (1 lettre + 12 chiffres)
-                    # Votre bug précédent enregistrait 11 caractères. On les ignore ici.
-                    if len(clean_found) >= 13:
-                        # C'est le bon ! On le formate proprement
-                        final_dl_found = f"{clean_found[:5]}-{clean_found[5:11]}-{clean_found[11:]}"
-                        break
-            
-            if final_dl_found:
-                break
-        
-        # Nettoyage du message d'attente
-        try: await m_wait.delete()
-        except: pass
+            with sqlite3.connect(DB_NAME) as con:
+                row = con.execute("SELECT permis FROM verifications WHERE user_id=? AND status='valide' AND length(replace(permis, '-', '')) = 13 AND created_at > datetime('now', '-5 minutes') ORDER BY id DESC LIMIT 1", (str(user_id),)).fetchone()
+                if row:
+                    final_dl_found = row[0]
+                    break
         
         if final_dl_found:
             context.user_data['form_dl_number'] = final_dl_found
-            
-            # Confirmation
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"✅ **Trouvé !**\nNuméro validé SAAQ : `{final_dl_found}`",
-                parse_mode="Markdown"
-            )
-            # Suite immédiate
+            await status_msg.edit_text(f"✅ **Permis SAAQ détecté !**\nNuméro : `{final_dl_found}`", parse_mode="Markdown")
+            await asyncio.sleep(1.5)
             return await ask_ref_number_interactive(update, context)
         else:
-            # Échec
-            kb = [[InlineKeyboardButton("✍️ Entrer manuellement", callback_data="dl_mode:manual")]]
-            m = await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ **Aucun résultat complet.**\nLe système a peut-être trouvé un code partiel ou la connexion a échoué.\nVeuillez saisir les chiffres manuellement.",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            context.user_data['cleanup_ids'] = [m.message_id]
+            await status_msg.edit_text("❌ **Délai dépassé.**\nVeuillez entrer les chiffres manuellement :")
             return ID_ASK_DL_NUM
 
 async def id_save_dl_manual_digits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la saisie manuelle des 2 chiffres (ou du numéro complet) du permis."""
+    """Gère la saisie manuelle des 2 chiffres (ou complet) et PASSE À LA RÉFÉRENCE."""
     user_input = update.message.text.strip()
     
     # Nettoyage de l'écran (Benjamin / Chiffres tapez)
@@ -7473,7 +8106,7 @@ async def id_save_dl_manual_digits(update: Update, context: ContextTypes.DEFAULT
         kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_EXPIRY}")]]
         m = await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="⚠️ **Format invalide.** Entrez les 2 derniers chiffres (ex: 05) ou le numéro complet.",
+            text="⚠️ **Format invalide.** Entrez les 2 derniers chiffres (ex: 03) ou le numéro complet.",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown"
         )
@@ -7482,48 +8115,41 @@ async def id_save_dl_manual_digits(update: Update, context: ContextTypes.DEFAULT
 
     context.user_data['form_dl_number'] = final_dl
     
-    # Passage à l'étape suivante : Numéro de Référence
+    # 🔥 LA CORRECTION EST ICI : On appelle la fonction suivante
     return await ask_ref_number_interactive(update, context)
 
-async def id_show_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le récapitulatif complet avant la génération finale."""
-    d = context.user_data
-    sex_map = {'1': 'Homme', '2': 'Femme', '9': 'X'}
-    
-    txt = (
-        "📝 **RÉSUMÉ DE VOTRE COMMANDE**\n\n"
-        f"👤 **Identité**\n"
-        f"• Prénom : `{d.get('form_firstname')}`\n"
-        f"• Nom : `{d.get('form_lastname')}`\n"
-        f"• Sexe : `{sex_map.get(d.get('form_sex'), d.get('form_sex'))}`\n"
-        f"• Taille : `{d.get('form_height')} cm`\n"
-        f"• Yeux : `{d.get('form_eyes')}`\n\n"
-        f"📅 **Dates**\n"
-        f"• Naissance : `{d.get('form_dob')}`\n"
-        f"• Émission : `{d.get('form_issue')}`\n"
-        f"• Expiration : `{d.get('form_expiry')}`\n\n"
-        f"📍 **Adresse**\n"
-        f"• Rue : `{d.get('addr_street')}`\n"
-        f"• Ville : `{d.get('addr_city')}`\n"
-        f"• Zip : `{d.get('addr_zip')}`\n\n"
-        f"🆔 **Numéros**\n"
-        f"• Permis : `{d.get('form_dl_number')}`\n"
-        f"• Référence : `{d.get('form_ref_number')}`"
+async def ask_ref_number_interactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le choix du numéro de référence avec le bouton Retour en bas de liste."""
+    proposed_ref = generate_ref_number()
+    context.user_data['temp_proposed_ref'] = proposed_ref
+
+    text = (
+        "🔢 **NUMÉRO DE RÉFÉRENCE**\n\n"
+        f"Référence proposée : `{proposed_ref}`\n\n"
+        "Souhaitez-vous utiliser ce numéro ou en générer un autre ?"
     )
-    
+
+    # Le bouton Retour est maintenant placé à la FIN de la liste kb
     kb = [
-        [InlineKeyboardButton("✅ CONFIRMER & PAYER", callback_data="confirm_gen")],
-        [InlineKeyboardButton("✏️ Tout recommencer", callback_data="id_menu_entry")]
+        [InlineKeyboardButton("✅ Utiliser celui-ci", callback_data="ref_action:accept")],
+        [InlineKeyboardButton("🔄 Un autre", callback_data="ref_action:next")],
+        [InlineKeyboardButton("✍️ Saisie manuelle", callback_data="ref_action:manual")],
+        [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:ID_ASK_DL_NUM")] # Tout en bas
     ]
     
-    # Si on vient d'un bouton (callback), on édite. Sinon on envoie.
+    reply_markup = InlineKeyboardMarkup(kb)
+
     if update.callback_query:
-        await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        except:
+            m = await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+            context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
     else:
-        m = await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-        context.user_data['cleanup_ids'] = [m.message_id]
-        
-    return ID_CONFIRM_SUMMARY
+        m = await context.bot.send_message(chat_id=update.effective_chat.id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+        context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
+    
+    return ID_ASK_REF_NUM
 
 async def handle_ref_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère les boutons du sélecteur de numéro de référence interactif."""
@@ -7618,25 +8244,37 @@ async def id_save_sex(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ID_ASK_HEIGHT
 
 async def id_save_height(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Enregistre la taille et demande la couleur des yeux."""
+    """Enregistre la taille et déclenche la sélection de la couleur des yeux."""
     val = update.message.text.strip()
     
+    # Validation de la taille
     if not val.isdigit():
-        await update.message.reply_text("⚠️ Veuillez entrer un nombre valide (ex: 180).")
+        await update.message.reply_text("⚠️ Please enter a valid number in cm (e.g., 180).")
         return ID_ASK_HEIGHT
         
     context.user_data['form_height'] = val
+    
+    # Nettoyage du message de l'utilisateur
     await clean_chat(update, context)
     
-    # Étape suivante : Yeux
-    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_HEIGHT}")]]
-    m = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="👁️ **Couleur des yeux ?**\n(Ex: Bleus, Marrons, Verts...)",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
-    context.user_data['cleanup_ids'] = [m.message_id]
+    # On appelle directement ask_eye_color pour afficher le menu des yeux
+    return await ask_eye_color(update, context)
+
+async def ask_eye_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Demande la couleur des yeux avec codes 3 lettres anglais."""
+    chat_id = update.effective_chat.id
+    text = "👁 **EYE COLOR**\n\nSelect your eye color (Official 3-letter codes):"
+    kb = [
+        [InlineKeyboardButton("Brown (BRO)", callback_data="eyes:BRO"), InlineKeyboardButton("Blue (BLU)", callback_data="eyes:BLU")],
+        [InlineKeyboardButton("Grey (GRY)", callback_data="eyes:GRY"), InlineKeyboardButton("Green (GRN)", callback_data="eyes:GRN")],
+        [InlineKeyboardButton("Hazel (HZL)", callback_data="eyes:HZL"), InlineKeyboardButton("Black (BLK)", callback_data="eyes:BLK")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"form_back:{ID_ASK_HEIGHT}")]
+    ]
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_EYES
 
 id_docs_conv = ConversationHandler(
@@ -7646,87 +8284,54 @@ id_docs_conv = ConversationHandler(
         ID_PROD_VIEW: [
             CallbackQueryHandler(id_view_product, pattern="^id_view:"),
             CallbackQueryHandler(id_start_buy, pattern="^id_buy:"),
-            CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"),
-            CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"),
+            CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")
         ],
-        # Quantité
         ID_ASK_QTY: [
             CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_"),
             CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
         ],
-        ID_CONFIRM_BUY: [CallbackQueryHandler(id_start_form, pattern="^id_confirm_pay$")],
+        ID_ASK_NAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_firstname)],
+        ID_ASK_LASTNAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_lastname)],
+        ID_ASK_DOB: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_dob)],
+        ID_ASK_STREET: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_street)],
+        ID_ASK_CITY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_city)],
+        ID_ASK_ZIP: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_zip)],
+        ID_CONFIRM_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
+        ID_ASK_ISSUE: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_issue)],
+        ID_ASK_EXPIRY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_expiry)],
         
-        # --- FORMULAIRE (AVEC BOUTON RETOUR PARTOUT) ---
-        ID_ASK_NAME: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"), # Retour
-            MessageHandler(filters.TEXT, id_save_firstname)
-        ],
-        ID_ASK_LASTNAME: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_lastname)
-        ],
-        ID_ASK_DOB: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_dob)
-        ],
-        ID_ASK_STREET: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_street)
-        ],
-        ID_ASK_CITY: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_city)
-        ],
-        ID_ASK_ZIP: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_zip)
-        ],
-        ID_CONFIRM_ADDR: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")
-        ],
-        ID_ASK_ISSUE: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_issue)
-        ],
-        ID_ASK_EXPIRY: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_expiry)
-        ],
+        # --- ETAT DL NUM CORRIGÉ POUR LE MANUEL ---
         ID_ASK_DL_NUM: [
             CallbackQueryHandler(id_form_back, pattern="^form_back:"),
             CallbackQueryHandler(id_handle_dl_method, pattern="^dl_mode:"), 
             MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_manual_digits)
         ],
+        
         ID_ASK_REF_NUM: [
             CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"), 
+            CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)
-        ], 
-        ID_ASK_SEX: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            CallbackQueryHandler(id_save_sex, pattern="^sex:")
         ],
-        ID_ASK_HEIGHT: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.TEXT, id_save_height)
-        ],
+        ID_ASK_SEX: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_save_sex, pattern="^sex:")],
+        ID_ASK_HEIGHT: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_height)],
+        
+        # --- ETAT EYES CORRIGÉ ---
         ID_ASK_EYES: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            CallbackQueryHandler(id_save_eyes, pattern="^eye:"), 
-            MessageHandler(filters.TEXT, id_save_eyes)
-        ],
-        ID_ASK_PHOTO: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            MessageHandler(filters.PHOTO, id_save_photo)
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"), 
+            CallbackQueryHandler(id_save_eyes, pattern="^eyes:") # Pattern matching avec ask_eye_color
         ],
         
-        # Résumé & Edition
+        ID_ASK_PHOTO: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.PHOTO, id_save_photo)],
+        
+        # --- ETAT RÉSUMÉ AVEC ÉDITION ---
         ID_CONFIRM_SUMMARY: [
-            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"),
-            CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$")
+            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), 
+            CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$"), # <-- Le bouton Modifier
+            CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")       # <-- Le bouton Annuler
         ],
+        
+        # --- NOUVEAUX ÉTATS D'ÉDITION ---
         ID_EDIT_MENU: [
             CallbackQueryHandler(id_handle_edit_choice, pattern="^do_edit:"), 
             CallbackQueryHandler(id_show_summary, pattern="^back_to_summary$")
@@ -7735,21 +8340,8 @@ id_docs_conv = ConversationHandler(
             MessageHandler(filters.TEXT, id_receive_new_value), 
             CallbackQueryHandler(id_open_edit_menu, pattern="^cancel_edit_input$")
         ],
-        
-        # Docs Extras
-        ID_ASK_DOC_EMPLOYER: [MessageHandler(filters.TEXT, id_save_employer)],
-        ID_ASK_DOC_JOB: [MessageHandler(filters.TEXT, id_save_job)],
-        ID_ASK_DOC_ADDR: [MessageHandler(filters.TEXT, id_save_emp_addr)],
-        ID_CHOOSE_INCOME_MODE: [CallbackQueryHandler(id_income_mode, pattern="^inc_")],
-        ID_ASK_DOC_HOURS: [MessageHandler(filters.TEXT, id_save_hours)],
-        ID_ASK_DOC_RATE: [MessageHandler(filters.TEXT, id_save_rate)],
-        ID_ASK_DOC_SIN: [CallbackQueryHandler(id_save_sin_or_range, pattern="^sal:"), MessageHandler(filters.TEXT, id_save_sin_or_range)],
     },
-    fallbacks=[
-        CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
-        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", goto_menu)
-    ],
+    fallbacks=[CommandHandler("start", goto_menu), CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")],
     name="id_docs_conversation"
 )
 
@@ -7922,6 +8514,7 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"),
         # 👇 CORRECTION ICI : Ajout de "tickets." devant start_support
         CallbackQueryHandler(tickets.start_support, pattern="^support$"),
+        CallbackQueryHandler(account_menu, pattern="^account_menu$"),
     ],
     states={
         # --- AUTHENTIFICATION ---
@@ -7943,6 +8536,7 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(handle_buy_sms, pattern="^buy_sms:"), 
             CallbackQueryHandler(sms_control_callback, pattern="^sms_ban_"),
             CallbackQueryHandler(acc_set_timeout, pattern="^set_timeout_"),
+            CallbackQueryHandler(account_menu, pattern="^account_menu$"),
             CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")
         ],
         WAIT_HLR_NUMBER: [MessageHandler(filters.TEXT, tool_process_hlr)],
@@ -7989,131 +8583,108 @@ conv_handler = ConversationHandler(
     name="main_conversation"
 )
 
+# ====================================================
+#      INITIALISATION GLOBALE (POUR GUNICORN)
+# ====================================================
+
+# 1. On prépare l'application Telegram
+app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# 2. Configuration des Handlers (Copie de ta logique)
+app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
+
+# --- Handlers Boutique ---
+app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
+app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
+app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
+app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
+app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
+app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
+
+# --- Conversations ---
+app_telegram.add_handler(admin_search_conv, group=8)
+app_telegram.add_handler(admin_csv_conv, group=6)
+app_telegram.add_handler(admin_ivr_conv, group=7)
+app_telegram.add_handler(history_filter_conv, group=5)
+app_telegram.add_handler(catalog_filter_conv)
+app_telegram.add_handler(ccs_catalog_filter_conv)
+app_telegram.add_handler(payment_conv)
+app_telegram.add_handler(id_docs_conv)
+app_telegram.add_handler(admin_ticket_conv, group=9)
+app_telegram.add_handler(conv_handler)
+
+# --- Admin & Callbacks (Tes handlers existants ici...) ---
+app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_.*$"))
+app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_.*$"))
+# ... (garde tous tes autres add_handler ici) ...
+
+# --- Gestion Pagination ---
+async def set_pg_callback(update, context):
+    q = update.callback_query
+    user_id = str(update.effective_user.id)
+    if "custom" in q.data:
+        USER_STATES[int(user_id)] = "waiting_pagination_custom"
+        await q.message.edit_text("🔢 **Entrez le nombre souhaité :**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Annuler", callback_data="propro")]]), parse_mode="Markdown")
+        return
+    qty = int(q.data.split("_")[2])
+    set_user_pagination(user_id, qty)
+    await q.answer(f"✅ Vue réglée sur {qty} !")
+    await show_products(update, context, page=0)
+
+async def custom_pg_receive(update, context):
+    user_id = update.effective_user.id
+    if USER_STATES.get(user_id) == "waiting_pagination_custom":
+        try:
+            qty = int(update.message.text.strip())
+            if 1 <= qty <= 50:
+                set_user_pagination(str(user_id), qty)
+                await update.message.reply_text(f"✅ Noté : {qty} par page.")
+                USER_STATES.pop(user_id, None)
+                await asyncio.sleep(1)
+                await show_products(update, context, page=0)
+        except: await update.message.reply_text("⚠️ Chiffre invalide.")
+
+app_telegram.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
+app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
+app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
+app_telegram.add_handler(CallbackQueryHandler(menu_handler))
+
+# ====================================================
+#      FONCTION DE LANCEMENT (THREAD SAFE)
+# ====================================================
+
+def run_bot_polling():
+    """Démarre le polling dans une nouvelle boucle d'événements"""
+    print("🤖 Bot Telegram en cours de démarrage...")
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Tâches de fond
+    if app_telegram.job_queue:
+        app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
+    
+    # 🔥 LA CORRECTION EST ICI : stop_signals=False
+    app_telegram.run_polling(close_loop=False, stop_signals=False)
+
+# DÉMARRAGE DU THREAD BOT IMMÉDIAT (Pour Gunicorn)
+threading.Thread(target=run_bot_polling, daemon=True).start()
+
+# ====================================================
+#      BLOC MAIN (UNIQUEMENT POUR TEST LOCAL)
+# ====================================================
+
 if __name__ == "__main__":
     # --- INIT DB ---
     db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
     shop_helpers.ensure_shop_tables(db_conn)
     init_db()
     
-    # Patch DB Tickets (Important)
-    try:
-        tickets.patch_db_tickets()
-    except:
-        pass
+    try: tickets.patch_db_tickets()
+    except: pass
         
     ensure_verifications_table()
     ensure_payment_table()
 
-    # --- FLASK (IVR SERVER) ---
-    flask_thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False),
-        daemon=True
-    )
-    flask_thread.start()
-
-    # --- TELEGRAM BOT ---
-    app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Capture de la boucle d'événement pour les tâches asynchrones (SignalWire/Animation)
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    bot_loop = loop
-
-    # Middleware de sécurité (Enforcement & Auto-lock)
-    app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
-    app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
-
-    # ====================================================
-    #      AJOUT DES HANDLERS (ORDRE DE PRIORITÉ)
-    # ====================================================
-
-    # 1. BOUTIQUE ET PANIER (Priorité Haute pour éviter les conflits)
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
-    app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
-
-    # 2. CONVERSATIONS COMPLEXES (États multiples)
-    app_telegram.add_handler(admin_search_conv, group=8)
-    app_telegram.add_handler(admin_csv_conv, group=6)
-    app_telegram.add_handler(admin_ivr_conv, group=7)
-    app_telegram.add_handler(history_filter_conv, group=5)
-    app_telegram.add_handler(catalog_filter_conv)
-    app_telegram.add_handler(ccs_catalog_filter_conv)
-    app_telegram.add_handler(payment_conv)
-    app_telegram.add_handler(id_docs_conv)
-    app_telegram.add_handler(admin_ticket_conv, group=9)
-    app_telegram.add_handler(conv_handler) # Main Router (Start, Verif, Support)
-
-    # 3. COMMANDES ET CALLBACKS ADMIN
-    app_telegram.add_handler(CommandHandler("clean_users", admin_clean_ghost_users))
-    app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_\d+$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_menu, pattern="^admin_menu$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern=r"^admin_users(:page:\d+)?$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_.*$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_.*$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern=r"^admin_setstatut(:page:\d+)?$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_.*$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_.*$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:.*$"))
-    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive), group=21)
-    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_customamount_receive), group=22)
-
-    # 4. CALLBACKS GÉNÉRAUX ET NAVIGATION
-    app_telegram.add_handler(CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"))
-    app_telegram.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_\d+$"))
-    app_telegram.add_handler(CallbackQueryHandler(callback_show_my_id, pattern="^show_my_id$"))
-    app_telegram.add_handler(CallbackQueryHandler(choose_lang, pattern="^choose_lang$"))
-    app_telegram.add_handler(CallbackQueryHandler(set_lang_fr, pattern="^set_lang_fr$"))
-    app_telegram.add_handler(CallbackQueryHandler(set_lang_en, pattern="^set_lang_en$"))
-    app_telegram.add_handler(CallbackQueryHandler(callback_check_balance, pattern="^check_balance$"))
-    app_telegram.add_handler(CallbackQueryHandler(callback_support, pattern="^support$"))
-    app_telegram.add_handler(CallbackQueryHandler(callback_faq, pattern="^faq$"))
-    app_telegram.add_handler(CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$"))
-    app_telegram.add_handler(CallbackQueryHandler(on_back_cats, pattern=r"^back:cats$"))
-    app_telegram.add_handler(CallbackQueryHandler(on_category, pattern=r"^cat:.+$"))
-    app_telegram.add_handler(CallbackQueryHandler(hist_view_callback, pattern=r"^hist:view$"))
-    app_telegram.add_handler(CallbackQueryHandler(show_ids_history, pattern="^hist:ids$"))
-    app_telegram.add_handler(CallbackQueryHandler(hist_pros, pattern=r"^hist:pros(:page:\d+)?$"))
-    app_telegram.add_handler(CallbackQueryHandler(hist_permis, pattern=r"^hist:permis(:page:\d+)?$"))
-    app_telegram.add_handler(CallbackQueryHandler(close_history, pattern=r"^close_history$"))
-    app_telegram.add_handler(CallbackQueryHandler(delete_history_handler, pattern=r"^delete_history_\d+$"))
-    app_telegram.add_handler(CallbackQueryHandler(auth_logout, pattern="^auth_logout$"))
-    app_telegram.add_handler(CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"))
-    app_telegram.add_handler(CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"))
-    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
-    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
-    app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
-    app_telegram.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
-    app_telegram.add_handler(CallbackQueryHandler(ticket_view_reply_handler, pattern="^view_reply:"))
-    app_telegram.add_handler(MessageHandler(filters.Chat(chat_id=int(tickets.CHANNEL_LOGS)) & filters.REPLY, tickets.admin_reply_native))
-
-    # 5. EN DERNIER : Le menu_handler (Capturer les clics non gérés)
-    app_telegram.add_handler(CallbackQueryHandler(menu_handler))
-
-    # Attachement des données globales à bot_data
-    app_telegram.bot_data['db_conn'] = db_conn
-    app_telegram.bot_data['db'] = db_conn
-    app_telegram.bot_data['get_user_balance'] = get_user_balance
-    app_telegram.bot_data['update_user_balance'] = update_user_balance
-    app_telegram.bot_data['create_transaction'] = create_transaction
-
-    # 6. Démarrage final
-    print("✅ NOMEN NESCIO : SYSTÈME OPÉRATIONNEL.")
-    app_telegram.run_polling(close_loop=False)
-
-    while True:
-        time.sleep(3600)
+    print("✅ SYSTÈME OPÉRATIONNEL (Mode Manuel)")
+    # Flask tourne sur le port 5001 pour l'IVR
+    app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
