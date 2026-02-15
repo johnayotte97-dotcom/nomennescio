@@ -8608,9 +8608,12 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(auth_import_start, pattern="^auth_import_start$"),
         CallbackQueryHandler(auth_create_start, pattern="^auth_create$"),
         CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"),
-        # 👇 CORRECTION ICI : Ajout de "tickets." devant start_support
         CallbackQueryHandler(tickets.start_support, pattern="^support$"),
         CallbackQueryHandler(account_menu, pattern="^account_menu$"),
+        CallbackQueryHandler(admin_menu, pattern="^admin_menu$"),
+        CallbackQueryHandler(auth_logout, pattern="^auth_logout$"),
+        CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"),
+        CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"),
     ],
     states={
         # --- AUTHENTIFICATION ---
@@ -8756,8 +8759,50 @@ app_telegram.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^op
 app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
 app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
 app_telegram.add_handler(CallbackQueryHandler(menu_handler))
+
 # ====================================================
-#      FONCTION DE LANCEMENT (THREAD SAFE)
+# 🔧 CONNEXIONS DU MENU ADMIN (MANQUANTES)
+# ====================================================
+
+# 1. Gestion des Tickets
+app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
+app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
+app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
+
+# 2. Gestion des Utilisateurs & Solde
+app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users"))
+app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_"))
+app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_"))
+# Pour la modification manuelle du solde (via message texte)
+app_telegram.add_handler(MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive))
+
+# 3. Gestion des Forfaits (Statuts)
+app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut"))
+# (Les boutons admin_userstatut_ et admin_statut_ sont déjà là, mais on les remet par sécurité si besoin)
+app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
+app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
+
+# 4. Redémarrage
+app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
+
+# 5. Logistique (ID's Orders)
+app_telegram.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
+app_telegram.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
+app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
+
+# 6. Gestion des Produits (Cc's & Pro's)
+app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:"))
+app_telegram.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
+app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
+app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_"))
+# Pour l'ajout manuel de produit (Texte)
+app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
+app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
+
+# 7. Réglages IVR
+app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
+
+
 # ====================================================
 
 def run_bot_polling():
