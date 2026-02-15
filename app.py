@@ -1094,21 +1094,26 @@ async def open_pagination_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def show_products(update, context, page=0, tier=None, from_filter=False):
-    # Imports locaux pour garantir le fonctionnement
     import asyncio 
     import os
-    
+    import sqlite3
+    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+
+    # --- RÉCUPÉRATION INFOS ---
     query = getattr(update, "callback_query", None)
     chat_id = query.message.chat_id if query else update.effective_chat.id
+    user_id = str(update.effective_user.id)
     
-    # 1. UX : ON AFFICHE LE CHARGEMENT TOUT DE SUITE
+    # ✅ FIX RETOUR : On marque qu'on est dans les Pro's
+    context.user_data['cart_return_to'] = "cat:propro"
+    
+    # 1. Message de chargement
     loading_msg = None
     try:
-        loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Recherche en cours...")
-        await asyncio.sleep(0.5) 
+        loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
     except: pass
 
-    # 2. Gestion de la suppression de l'ancien message (Menu ou Filtre)
+    # 2. Nettoyage
     if query:
         try: await query.answer()
         except: pass
@@ -1116,7 +1121,6 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
             except: pass
 
-    # 3. Nettoyage des listes de messages en arrière-plan
     try:
         msgs_to_del = []
         if from_filter:
@@ -1131,65 +1135,101 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             except: pass
     except: pass
 
-    # 4. Exécution de la Recherche SQL
+    # 3. REQUÊTE SQL
     try:
-        filters = context.user_data.get('active_filters', {})
-        
-        # --- MODIFICATION 1 : PAGINATION DYNAMIQUE ---
-        # On utilise la fonction créée à l'étape précédente
-        PER_PAGE = get_user_pagination(str(chat_id)) 
-        # ---------------------------------------------
+        # a. Pagination
+        try:
+            con_pg = sqlite3.connect(DB_NAME)
+            cur_pg = con_pg.cursor()
+            cur_pg.execute("SELECT pagination FROM users WHERE telegram_id=?", (user_id,))
+            row_pg = cur_pg.fetchone()
+            con_pg.close()
+            PER_PAGE = int(row_pg[0]) if row_pg and row_pg[0] else 2
+        except:
+            PER_PAGE = 2
 
-        chunk, total_items = _get_products_optimized(category="propro", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
+        # b. Filtres & SQL
+        filters = context.user_data.get('active_filters', {})
+        sql = "SELECT * FROM products WHERE category='propro' AND is_active=1 AND stock > 0"
+        params = []
+
+        if tier:
+            sql += " AND tier=?"
+            params.append(tier)
+        
+        if filters.get('city'):
+            sql += " AND city LIKE ?"
+            params.append(f"%{filters['city']}%")
+        if filters.get('year'):
+            sql += " AND (title LIKE ? OR content LIKE ?)"
+            yr = filters['year']
+            params.append(f"%{yr}%")
+            params.append(f"%{yr}%")
+        
+        con = sqlite3.connect(DB_NAME)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        
+        cur.execute(f"SELECT count(*) FROM ({sql})", params)
+        total_items = cur.fetchone()[0]
+
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.append(PER_PAGE)
+        params.append(page * PER_PAGE)
+        
+        cur.execute(sql, params)
+        chunk = [dict(row) for row in cur.fetchall()]
+        con.close()
+
     except Exception as e:
         if loading_msg:
-            try: await loading_msg.edit_text(f"⚠️ Erreur: {e}")
+            try: await loading_msg.edit_text(f"⚠️ Erreur SQL: {e}")
             except: pass
         return
 
-    # 5. On supprime le message "Recherche..." maintenant que c'est prêt
+    # 4. Suppression du chargement
     if loading_msg:
         try: await loading_msg.delete()
         except: pass
 
-    # Calculs de page
+    # 5. Gestion Page Vide
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     sent_ids = []
 
-    # 6. Si aucun résultat
     if not chunk:
         text = "❌ Aucun produit trouvé."
-        kb = _build_filter_menu(context, page_info=None) if from_filter else InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
         m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
         if from_filter: context.user_data['filter_msgs'] = [m.message_id]
         else: CATALOG_MSGS[chat_id] = [m.message_id]
         return
 
-    # 7. Affichage des fiches (VERSION AJUSTÉE)
+    # 6. Affichage des Produits
     for p in chunk:
-        # On extrait le nom proprement (en enlevant les points de séparation du titre)
         raw_title = str(p.get('title', 'Unknown')).replace("*", "").replace("`", "")
         name = raw_title.split('•')[0].strip()
-        
-        # On récupère les colonnes spécifiques
         city = str(p.get('city', 'N/A')).replace("*", "")
-        year = str(p.get('year', 'N/A')).replace("*", "")
+        year = str(p.get('year', ''))
+        if not year or year == 'N/A':
+            parts = raw_title.split('•')
+            year = parts[1].strip() if len(parts) > 1 else "N/A"
+            
         base = str(p.get('tier', 'N/A')).replace("*", "")
-        price = p.get('price', 0.0)
+        try: price = float(p.get('price', 0.0))
+        except: price = 0.0
         
-        # Formatage de la fiche ultra-propre
         txt = (
             f"👤 **NOM** : `{name}`\n"
             f"🏙️ **VILLE** : `{city}`\n"
             f"📅 **ANNÉE** : `{year}`\n"
             f"📂 **BASE** : `{base}`\n"
-            f"💰 **PRIX** : `{price:.2f} USD`"
+            f"💰 **PRIX** : `{price:.2f} CAD`"
         )
         
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}"), 
-            InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}") 
+            InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}"), 
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buynow:{p['id']}")
         ]])
         
         try:
@@ -1197,36 +1237,47 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             sent_ids.append(m.message_id)
         except: 
             try:
-                # Fallback si le Markdown pose problème
                 m = await context.bot.send_message(chat_id=chat_id, text=txt.replace('*','').replace('`',''), reply_markup=kb)
                 sent_ids.append(m.message_id)
             except: pass
 
-    # 8. Menu Navigation (Bas de page)
+    # 7. Menu Navigation
+    try:
+        con_cart = sqlite3.connect(DB_NAME)
+        cur_cart = con_cart.cursor()
+        cur_cart.execute("SELECT count(*) FROM cart_items WHERE user_id=?", (user_id,))
+        cart_count = cur_cart.fetchone()[0]
+        con_cart.close()
+    except:
+        cart_count = 0
+
+    kb_rows = []
+    if cart_count > 0:
+        kb_rows.append([InlineKeyboardButton(f"🧺 Voir Panier ({cart_count})", callback_data="cart:view")])
+
+    kb_rows.append([
+        InlineKeyboardButton("🔎 Filter", callback_data="filter_open"),
+        InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")
+    ])
+    kb_rows.append([
+        InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), 
+        InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), 
+        InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")
+    ])
+    kb_rows.append([InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")])
+
+    kb = InlineKeyboardMarkup(kb_rows)
+
+    navigation_text = "🔻 Menu de Navigation 🔻" 
+    
     if from_filter:
         context.user_data['filter_fiches_msg_ids'] = sent_ids
-        kb = _build_filter_menu(context, page_info={'page': page, 'total_pages': total_pages})
-        m = await context.bot.send_message(chat_id=chat_id, text=f"🔎 Résultats : {total_items} (Page {page+1}/{total_pages})", reply_markup=kb)
+        m = await context.bot.send_message(chat_id=chat_id, text=navigation_text, reply_markup=kb)
         context.user_data['filter_msgs'] = [m.message_id]
     else:
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔎 Filter", callback_data="filter_open"),
-                # --- MODIFICATION 2 : BOUTON VUE ---
-                InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")
-                # -----------------------------------
-            ],
-            [
-                InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), 
-                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), 
-                InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")
-            ],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
-        ])
-        m = await context.bot.send_message(chat_id=chat_id, text=f"📊 Catalogue ({total_items} produits)", reply_markup=kb)
+        m = await context.bot.send_message(chat_id=chat_id, text=navigation_text, reply_markup=kb)
         sent_ids.append(m.message_id)
         CATALOG_MSGS[chat_id] = sent_ids
-
 
         
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
@@ -5700,26 +5751,33 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = q.data
 
+    # --- LOGIQUE DE RETOUR PANIER ---
     if data == "menu_accueil":
+        # Quand on est au menu, le panier doit proposer un retour au menu
+        context.user_data['cart_return_to'] = "menu_accueil"
         return await goto_menu(update, context)
 
-    # --- DÉBUT MODIFICATION ---
+    # --- SECTION PRO'S ---
+    # Si ton bouton dans le menu principal envoie "propro" ou "cat:propro"
+    if data == "propro" or data == "cat:propro":
+        context.user_data["prod_tier"] = None
+        # On marque que maintenant, le retour du panier doit se faire vers les Pro's
+        context.user_data['cart_return_to'] = "cat:propro"
+        return await show_products(update, context, page=0, tier=None)
 
+    # --- PAGINATION ---
+    if data.startswith("prod:page:"):
+        page = int(data.split(":")[2])
+        tier = context.user_data.get("prod_tier")
+        # On s'assure que le retour est toujours calé sur Pro's pendant la navigation
+        context.user_data['cart_return_to'] = "cat:propro"
+        return await show_products(update, context, page=page, tier=tier)
 
+    # --- SECTION CCS ---
     if data.startswith("ccs:page:"):
         page = int(data.split(":")[2])
         tier = context.user_data.get("prod_tier")
         return await show_products_ccs(update, context, page=page, tier=tier)
-
-    if data == "propro":
-        context.user_data["prod_tier"] = None
-        return await show_products(update, context, page=0, tier=None)
-
-    if data.startswith("prod:page:"):
-        page = int(data.split(":")[2])
-        tier = context.user_data.get("prod_tier")
-        return await show_products(update, context, page=page, tier=tier)
-    # --- FIN MODIFICATION ---
 
     if data == "noop":
         return
@@ -8589,6 +8647,18 @@ conv_handler = ConversationHandler(
 
 # 1. On prépare l'application Telegram
 app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# --- DÉBUT DU CORRECTIF ---
+# 1. On crée une connexion spécifique pour le bot (indispensable pour SQLite)
+bot_db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+
+# 2. On injecte la base de données dans le "sac à dos" du bot
+app_telegram.bot_data["db_conn"] = bot_db_conn
+
+# 3. On injecte les fonctions pour gérer l'argent (sinon l'achat plantera après)
+app_telegram.bot_data["get_user_balance"] = get_user_balance
+app_telegram.bot_data["update_user_balance"] = update_user_balance
+# --- FIN DU CORRECTIF ---
 
 # 2. Configuration des Handlers (Copie de ta logique)
 app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
