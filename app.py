@@ -50,6 +50,8 @@ from telegram.ext import (
 
 load_dotenv()
 
+app = Flask(__name__)
+
 
 os.environ.pop('http_proxy', None)
 os.environ.pop('https_proxy', None)
@@ -321,7 +323,7 @@ NUMVERIFY_API_KEY = os.environ.get("NUMVERIFY_API_KEY")
 DB_NAME = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
 
 client = SignalWireClient(SW_PROJECT_ID, SW_TOKEN)
-app = Flask(__name__)
+
 
 # ========================== CONSTANTES ==========================
 
@@ -8903,14 +8905,16 @@ if __name__ == "__main__":
     global_init()
 
     # 2. On lance le BOT dans un thread séparé (Arrière-plan)
-    # On le lance en premier pour qu'il s'initialise pendant que Flask monte
+    # Note: Flask tourne DÉJÀ grâce au thread lancé au tout début du fichier
     bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
     bot_thread.start()
 
-    # 3. On lance FLASK dans le thread principal (Bloquant)
-    # C'est Flask qui va maintenir le script en vie sur le port 5001
-    print("✅ SERVEUR WEBHOOK lancé sur le port 5001")
+    print("✅ SYSTÈME EN LIGNE (Flask + Bot actifs)")
+    
+    # 3. On maintient le script en vie indéfiniment
+    # On ne lance PAS app.run() ici, car il est déjà lancé en haut !
     try:
-        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
+        while True:
+            time.sleep(1)
     except KeyboardInterrupt:
         print("🛑 Arrêt du système...")
