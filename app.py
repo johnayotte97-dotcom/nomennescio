@@ -86,6 +86,19 @@ else:
 # Ton lien Healthchecks personnel
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
 
+
+# --- LANCEMENT PRIORITAIRE DU WEBHOOK ---
+def start_webhook_now():
+    try:
+        print("🌐 [PRIORITÉ] Tentative d'ouverture immédiate du port 5001...")
+        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
+    except Exception as e:
+        print(f"❌ ÉCHEC Webhook au démarrage: {e}")
+
+# On lance Flask TOUT DE SUITE dans un thread
+threading.Thread(target=start_webhook_now, daemon=True).start()
+# ----------------------------------------
+
 def generate_ref_number():
     """Génère un numéro de référence au format standard (ex: R4MV-5A2B)"""
     prefix = random.choice(["R4MV", "PEVF"]) # Vos préfixes habituels
@@ -2460,50 +2473,75 @@ async def hist_menu(update, context):
     ]
     await replace_view(q, "📜 Choisissez une section :", reply_markup=InlineKeyboardMarkup(kb))
 
-async def show_ids_history(update, context):
-    """Affiche l'historique filtré pour ID et PHYSICAL"""
+async def show_ids_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     user_id = str(update.effective_user.id)
-    
-    con = sqlite3.connect(DB_NAME)
-    cursor = con.cursor()
-    
-    # On cherche tout ce qui contient 'ID' ou 'PHYSICAL' dans la catégorie
-    cursor.execute("""
-        SELECT ticket_id, category, status, created_at 
-        FROM support_tickets 
-        WHERE user_id = ? AND (category LIKE '%ID%' OR category LIKE '%PHYSICAL%')
-        ORDER BY ticket_id DESC LIMIT 10
-    """, (user_id,))
-    
-    rows = cursor.fetchall()
-    con.close()
+    chat_id = update.effective_chat.id
 
-    if not rows:
-        kb_vide = [[InlineKeyboardButton("⬅️ Retour", callback_data="hist_view")]] 
-        await replace_view(q, "🆔 **Aucune commande d'ID trouvée.**", reply_markup=InlineKeyboardMarkup(kb_vide))
-        return
-
-    # Création de la liste
-    kb = []
-    for row in rows:
-        tid, cat, status, date = row
+    try:
+        # 1. On tente de récupérer les données
+        con = sqlite3.connect(DB_NAME)
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
         
-        # Petite icône de statut
-        icon = "🟢" if status == 'closed' else "🟡"
-        if status == 'rejected': icon = "🔴"
+        # On vérifie d'abord si la table id_physical_submissions existe
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='id_physical_submissions'")
+        exists = cur.fetchone()
         
-        btn_txt = f"{icon} {cat} ({date.split()[0]})"
-        # On redirige vers ta vue de détail (usr_ord_...)
-        kb.append([InlineKeyboardButton(btn_txt, callback_data=f"usr_ord_{tid}")])
+        rows = []
+        if exists:
+            cur.execute("""
+                SELECT type_document, first_name, last_name, status, created_at 
+                FROM id_physical_submissions 
+                WHERE user_id = ? 
+                ORDER BY id DESC LIMIT 5
+            """, (user_id,))
+            rows = cur.fetchall()
+        else:
+            # Si cette table n'existe pas, on cherche dans support_tickets (utilisé dans tickets.py)
+            cur.execute("""
+                SELECT category as type_document, 'Formulaire' as first_name, '' as last_name, status, created_at 
+                FROM support_tickets 
+                WHERE user_id = ? AND (category LIKE '%ID%' OR category LIKE '%PHYSICAL%')
+                ORDER BY ticket_id DESC LIMIT 5
+            """, (user_id,))
+            rows = cur.fetchall()
+        con.close()
 
-    # Bouton retour vers le menu historique (pas l'accueil)
-    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")])
+        # 2. NETTOYAGE : On supprime le menu SEULEMENT si on a réussi la requête
+        try: await q.message.delete()
+        except: pass
 
-    await replace_view(q, "🆔 **VOS COMMANDES D'IDs :**", reply_markup=InlineKeyboardMarkup(kb))
+        sent_ids = []
+        if not rows:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")]])
+            m = await context.bot.send_message(chat_id, "📑 **Aucun historique d'ID trouvé.**", reply_markup=kb, parse_mode="Markdown")
+            sent_ids.append(m.message_id)
+        else:
+            for r in rows:
+                status_emoji = "⏳" if r['status'] in ['pending', 'open'] else "✅" if r['status'] in ['completed', 'closed'] else "❌"
+                txt = (
+                    f"📑 **FORMULAIRE ID**\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📂 **TYPE** : `{r['type_document']}`\n"
+                    f"👤 **NOM** : `{r['first_name']} {r['last_name']}`\n"
+                    f"📊 **STATUT** : {status_emoji} `{r['status'].upper()}`\n"
+                    f"📅 **DATE** : `{r['created_at']}`"
+                )
+                m = await context.bot.send_message(chat_id, txt, parse_mode="Markdown")
+                sent_ids.append(m.message_id)
 
-# CODE À COLLER À LA LIGNE 1056
+            kb_fin = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")]])
+            m_fin = await context.bot.send_message(chat_id, "🔻 **Fin de l'historique** 🔻", reply_markup=kb_fin)
+            sent_ids.append(m_fin.message_id)
+
+        context.user_data["hist_msgs"] = sent_ids
+
+    except Exception as e:
+        # SI CA CRASH, LE BOT TE LE DIT ICI
+        print(f"DEBUG ID HIST: {e}")
+        await q.answer(f"⚠️ Erreur technique : {str(e)[:50]}", show_alert=True)
+
 async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche l'historique des produits achetés, avec pagination ET FILTRE."""
     from shop_helpers import full_product_text
@@ -2722,6 +2760,71 @@ async def hist_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await replace_view(q, "\n".join(lines), reply_markup=kb_back_to_menu())
 
     # CODE À COLLER À LA LIGNE 1222 (SANS ESPACES DEVANT)
+
+async def show_permis_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche les derniers permis générés avec un style UX (une bulle par item)."""
+    q = update.callback_query
+    await q.answer()
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+
+    # 1. Nettoyage de l'écran (On efface le menu historique)
+    try:
+        await q.message.delete()
+    except:
+        pass
+
+    # 2. Récupération des données en DB
+    con = sqlite3.connect(DB_NAME)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+    
+    # On récupère les 5 dernières vérifications réussies
+    cur.execute("""
+        SELECT fullname, permis, status, created_at 
+        FROM verifications 
+        WHERE user_id = ? AND status = 'valide'
+        ORDER BY id DESC LIMIT 5
+    """, (user_id,))
+    
+    rows = cur.fetchall()
+    con.close()
+
+    if not rows:
+        kb_vide = [[InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")]]
+        return await context.bot.send_message(
+            chat_id=chat_id, 
+            text="🚗 **Aucun permis trouvé dans votre historique.**", 
+            reply_markup=InlineKeyboardMarkup(kb_vide),
+            parse_mode="Markdown"
+        )
+
+    # 3. Envoi des fiches (Style UX)
+    sent_ids = []
+    for r in rows:
+        txt = (
+            f"🚗 **PERMIS GÉNÉRÉ**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"👤 **NOM** : `{r['fullname']}`\n"
+            f"🆔 **NUMÉRO** : `{r['permis']}`\n"
+            f"📅 **DATE** : `{r['created_at']}`\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        # On peut ajouter un bouton pour copier le numéro facilement
+        m = await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="Markdown")
+        sent_ids.append(m.message_id)
+
+    # 4. Bulle de navigation finale
+    kb_fin = [[InlineKeyboardButton("⬅️ Retour à l'Historique", callback_data="hist:view")]]
+    m_fin = await context.bot.send_message(
+        chat_id=chat_id, 
+        text="🔻 **Fin de votre historique Permis** 🔻", 
+        reply_markup=InlineKeyboardMarkup(kb_fin)
+    )
+    sent_ids.append(m_fin.message_id)
+
+    # On stocke les IDs pour que le bouton "Retour" puisse tout effacer d'un coup
+    context.user_data["hist_msgs"] = sent_ids
 
 async def history_filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche les options de filtre pour l'historique."""
@@ -5753,23 +5856,36 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- LOGIQUE DE RETOUR PANIER ---
     if data == "menu_accueil":
-        # Quand on est au menu, le panier doit proposer un retour au menu
         context.user_data['cart_return_to'] = "menu_accueil"
         return await goto_menu(update, context)
 
-    # --- SECTION PRO'S ---
-    # Si ton bouton dans le menu principal envoie "propro" ou "cat:propro"
+    # --- SECTION HISTORIQUE (MENU) ---
+    if data == "hist:view":
+        return await hist_view_callback(update, context)
+
+    # --- SOUS-SECTIONS HISTORIQUE (UX) ---
+    # 1. Historique des Pro's (Achats)
+    if data == "hist:pros":
+        return await hist_pros(update, context)
+
+    # 2. Historique des Permis (Générations)
+    if data == "hist:permis":
+        return await show_permis_history(update, context)
+
+    # 3. Historique des IDs (Formulaires)
+    if data == "hist:ids":
+        return await show_ids_history(update, context)
+
+    # --- SECTION PRO'S (BOUTIQUE) ---
     if data == "propro" or data == "cat:propro":
         context.user_data["prod_tier"] = None
-        # On marque que maintenant, le retour du panier doit se faire vers les Pro's
         context.user_data['cart_return_to'] = "cat:propro"
         return await show_products(update, context, page=0, tier=None)
 
-    # --- PAGINATION ---
+    # --- PAGINATION PRO'S ---
     if data.startswith("prod:page:"):
         page = int(data.split(":")[2])
         tier = context.user_data.get("prod_tier")
-        # On s'assure que le retour est toujours calé sur Pro's pendant la navigation
         context.user_data['cart_return_to'] = "cat:propro"
         return await show_products(update, context, page=page, tier=tier)
 
@@ -5785,29 +5901,34 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         q = update.callback_query
-        user_id = q.from_user.id
-        chat_id = q.message.chat_id
-        nav_message_id = q.message.message_id # L'ID du message de navigation ("Page 1/1...")
-
-        # --- CORRECTION AJOUTÉE ---
-        # Récupère la liste des messages (fiches + nav) et la vide
-        old_msgs = context.user_data.pop("hist_msgs", []) 
-        if old_msgs:
-            for mid in old_msgs:
-                if mid != nav_message_id: # Ne supprime pas le message de nav lui-même
-                    try:
-                        # Supprime les anciennes fiches de l'historique
-                        await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-                    except:
-                        pass # Ignore les messages déjà supprimés
-        # --- FIN DE LA CORRECTION ---
+        if q: await q.answer()
         
-        # Appelle hist_menu, qui va maintenant remplacer le message de navigation (q.message)
-        # par le menu "Choisissez une section :"
+        chat_id = update.effective_chat.id
+        
+        # --- NETTOYAGE UX ---
+        # 1. On récupère et supprime toutes les fiches d'historique précédentes
+        old_msgs = context.user_data.pop("hist_msgs", [])
+        for mid in old_msgs:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            except:
+                pass # Message déjà supprimé ou introuvable
+        
+        # 2. Nettoyage du message de navigation/menu actuel (le triangle ou le bouton retour)
+        try:
+            await q.message.delete()
+        except:
+            pass
+
+        # --- AFFICHAGE DU MENU ---
+        # On appelle hist_menu qui va envoyer le menu "Choisissez une section :"
+        # comme un nouveau message propre.
         await hist_menu(update, context) 
     
     except Exception as e:
-        log(f"hist_view_callback error: {e}", str(update.effective_user.id), "error")
+        # Utilisation de ton système de log existant
+        if hasattr(update.effective_user, 'id'):
+            log(f"hist_view_callback error: {e}", str(update.effective_user.id), "error")
 
         # ==================================================================
 # ================= MODULE ID/DOCS CENTER (INTÉGRÉ) ================
@@ -6680,6 +6801,7 @@ def creer_verso_complet(pdf417_bytes, linear_bytes):
 
 async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import asyncio
+    import sqlite3
     q = update.callback_query
     
     if q:
@@ -6740,18 +6862,39 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 Expiration : {api_data['form_expiry']}\n"
     )
 
-    # 4. SAUVEGARDE EN BASE DE DONNÉES
+    # 4. DOUBLE SAUVEGARDE EN BASE DE DONNÉES
     try:
         con = sqlite3.connect(DB_NAME)
         cur = con.cursor()
+        
+        # A. Sauvegarde dans support_tickets (pour l'admin)
         cur.execute(
             "INSERT INTO support_tickets (user_id, username, category, status, message) VALUES (?, ?, ?, ?, ?)",
             (str(user.id), user.username or "Inconnu", f"ORDER: {prod_name}", "closed", admin_txt)
         )
         order_ticket_id = cur.lastrowid
+
+        # B. Sauvegarde détaillée dans id_physical_submissions (pour modifications/historique)
+        cur.execute("""
+            INSERT INTO id_physical_submissions (
+                user_id, type_document, status, last_name, first_name, dob, 
+                street, city, zip, height, eyes, sex, 
+                dl_number, ref_number, issue_date, expiry_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(user.id), cat.upper(), 'pending',
+            api_data['form_lastname'], api_data['form_firstname'], api_data['form_dob'],
+            api_data['form_street'], api_data['form_city'], api_data['form_zip'],
+            api_data['form_height'], api_data['form_eyes'], api_data['form_sex'],
+            api_data['form_dl_number'], api_data['form_ref_number'],
+            api_data['form_issue'], api_data['form_expiry']
+        ))
+        
         con.commit()
         con.close()
         admin_txt = f"🧾 **ORDER #{order_ticket_id}**\n" + admin_txt
+        print(f"[DB] Commande {order_ticket_id} archivée totalement.")
+        
     except Exception as db_err:
         print(f"❌ DB SAVE ERROR: {db_err}")
 
@@ -6770,24 +6913,19 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         loop = asyncio.get_running_loop()
         pdf417_raw, linear_raw = await loop.run_in_executor(None, lambda: generate_barcode_via_api(api_data, prod_code))
 
-        # ==============================================================
-        # 8. CRÉATION DU VERSO COMPLET (Fusion via Pillow)
-        # ==============================================================
+        # 8. CRÉATION DU VERSO COMPLET
         final_verso = None
         if pdf417_raw:
-            # On appelle ta fonction magique
             final_verso = await loop.run_in_executor(None, lambda: creer_verso_complet(pdf417_raw, linear_raw))
 
-        # 9. Envoi au Canal Logs
+        # 9. Envoi au Canal Logs (Admin)
         target_id = CHANNEL_LOGS 
         
-        # A. Envoi Infos Texte + Photo (Selfie)
         if d.get('form_photo_id'):
             await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_txt)
         else:
             await context.bot.send_message(chat_id=target_id, text=admin_txt)
         
-        # B. ENVOI DU RÉSULTAT FINAL
         if final_verso: 
             await context.bot.send_document(
                 chat_id=target_id, 
@@ -6796,7 +6934,6 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="🖨️ **Verso Généré (Prêt à imprimer)**"
             )
         else:
-            # Fallback : Si Pillow échoue, on envoie le brut pour ne pas perdre la commande
             if pdf417_raw:
                  await context.bot.send_document(chat_id=target_id, document=pdf417_raw, filename="raw_pdf417.png")
 
@@ -6805,20 +6942,20 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print(f"CRITICAL ERROR in Order: {e}")
-        import traceback
-        traceback.print_exc()
         await status_msg.edit_text(f"⚠️ **Commande enregistrée mais erreur technique.**\nL'admin a reçu les détails.")
         try:
             await context.bot.send_message(chat_id=CHANNEL_LOGS, text=f"⚠️ ERREUR TECHNIQUE {user.id}: {e}")
         except: pass
 
-    # 11. Nettoyage
+    # 11. Nettoyage et Retour Menu
     await asyncio.sleep(2)
     for mid in d.get('cleanup_ids', []):
         try: await context.bot.delete_message(chat_id=user.id, message_id=mid)
         except: pass
     
     context.user_data['cleanup_ids'] = []
+    # On marque le retour pour le panier/navigation
+    context.user_data['cart_return_to'] = "menu_accueil"
     await show_main_menu(user.id)
     return ConversationHandler.END
 
@@ -8718,7 +8855,6 @@ app_telegram.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^op
 app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
 app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
 app_telegram.add_handler(CallbackQueryHandler(menu_handler))
-
 # ====================================================
 #      FONCTION DE LANCEMENT (THREAD SAFE)
 # ====================================================
@@ -8726,35 +8862,55 @@ app_telegram.add_handler(CallbackQueryHandler(menu_handler))
 def run_bot_polling():
     """Démarre le polling dans une nouvelle boucle d'événements"""
     print("🤖 Bot Telegram en cours de démarrage...")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    # Tâches de fond
-    if app_telegram.job_queue:
-        app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
-    
-    # 🔥 LA CORRECTION EST ICI : stop_signals=False
-    app_telegram.run_polling(close_loop=False, stop_signals=False)
-
-# DÉMARRAGE DU THREAD BOT IMMÉDIAT (Pour Gunicorn)
-threading.Thread(target=run_bot_polling, daemon=True).start()
+    try:
+        # Création d'une nouvelle boucle d'événements dédiée au thread du bot
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        if app_telegram.job_queue:
+            app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
+        
+        # stop_signals=False est crucial pour ne pas interférer avec Flask
+        app_telegram.run_polling(close_loop=False, stop_signals=False)
+    except Exception as e:
+        print(f"❌ Erreur critique Bot: {e}")
 
 # ====================================================
-#      BLOC MAIN (UNIQUEMENT POUR TEST LOCAL)
+#      DÉMARRAGE GLOBAL
+# ====================================================
+
+def global_init():
+    print("📦 Initialisation des bases de données...")
+    try:
+        db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        shop_helpers.ensure_shop_tables(db_conn)
+        init_db()
+        try: tickets.patch_db_tickets()
+        except: pass
+        ensure_verifications_table()
+        ensure_payment_table()
+        db_conn.close()
+        print("✅ Bases de données prêtes.")
+    except Exception as e:
+        print(f"❌ Erreur Init DB: {e}")
+
+# ====================================================
+#      POINT D'ENTRÉE PRINCIPAL
 # ====================================================
 
 if __name__ == "__main__":
-    # --- INIT DB ---
-    db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-    shop_helpers.ensure_shop_tables(db_conn)
-    init_db()
-    
-    try: tickets.patch_db_tickets()
-    except: pass
-        
-    ensure_verifications_table()
-    ensure_payment_table()
+    # 1. On prépare tout
+    global_init()
 
-    print("✅ SYSTÈME OPÉRATIONNEL (Mode Manuel)")
-    # Flask tourne sur le port 5001 pour l'IVR
-    app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
+    # 2. On lance le BOT dans un thread séparé (Arrière-plan)
+    # On le lance en premier pour qu'il s'initialise pendant que Flask monte
+    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
+    bot_thread.start()
+
+    # 3. On lance FLASK dans le thread principal (Bloquant)
+    # C'est Flask qui va maintenir le script en vie sur le port 5001
+    print("✅ SERVEUR WEBHOOK lancé sur le port 5001")
+    try:
+        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
+    except KeyboardInterrupt:
+        print("🛑 Arrêt du système...")
