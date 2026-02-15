@@ -89,17 +89,7 @@ else:
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
 
 
-# --- LANCEMENT PRIORITAIRE DU WEBHOOK ---
-def start_webhook_now():
-    try:
-        print("🌐 [PRIORITÉ] Tentative d'ouverture immédiate du port 5001...")
-        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
-    except Exception as e:
-        print(f"❌ ÉCHEC Webhook au démarrage: {e}")
 
-# On lance Flask TOUT DE SUITE dans un thread
-threading.Thread(target=start_webhook_now, daemon=True).start()
-# ----------------------------------------
 
 def generate_ref_number():
     """Génère un numéro de référence au format standard (ex: R4MV-5A2B)"""
@@ -5515,10 +5505,19 @@ async def cancel_all_calls(batch_id: str | None = None, user_id: int | str | Non
 
 # REMPLACE la fonction twilio_handler (ligne 1749) par CELLE-CI :
 
+def convertir_en_code_saaq(code):
+    """Convertit un code en format SAAQ."""
+    # Ajoutez ici la logique de conversion
+    return code
+
 @app.route("/twilio_handler", methods=["GET", "POST"], endpoint="twilio_handler_main")
 def twilio_handler():
     code = request.args.get("code", "")
     uid = request.args.get("uid")
+    
+    if not code or not uid:
+        logger.error("❌ Paramètres manquants : code ou uid")
+        return Response("<Response><Hangup/></Response>", mimetype="text/xml")
     bid = request.args.get("bid")
     call_sid = request.form.get("CallSid", f"call_{datetime.now().timestamp()}")
     
@@ -5592,6 +5591,7 @@ def analyze_response():
     # === Logs d’entrée ===
     speech_raw = request.form.get("SpeechResult", "")
     speech = (speech_raw or "").lower().strip()
+    speech_clean = speech.replace('.', '').replace(',', '')
     call_sid = request.form.get("CallSid")
     logger.info(f"📞 [analyze_response] reçu — CallSid: {call_sid}")
     logger.info(f"🗣️ Résultat vocal brut: {speech_raw}")
@@ -5634,16 +5634,16 @@ def analyze_response():
 
     # 1. Phrases GAGNANTES (Priorité absolue)
     # Si le bot entend ça, c'est valide à 100%, peu importe le reste.
-    winning_phrases = [
+    WINNING_PHRASES = [
         "permis de conduire est valide",
         "le dossier est valide",
         "ce permis est valide",
-        "comprend la classe", # La SAAQ dit ça quand c'est valide
+        "comprend la classe",
         "comprend les classes",
         "status is valid"
     ]
 
-    is_absolute_win = any(phrase in speech_clean for phrase in winning_phrases)
+    is_absolute_win = any(phrase in speech_clean for phrase in WINNING_PHRASES)
 
     # 2. Patterns négatifs (Échec)
     neg_patterns = [
@@ -8789,7 +8789,7 @@ def run_bot_polling():
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
         
-        # stop_signals=False est crucial pour ne pas interférer avec Flask
+        # stop_signals=False est crucial pour ne pas interférer avec Flask/Gunicorn
         app_telegram.run_polling(close_loop=False, stop_signals=False)
     except Exception as e:
         print(f"❌ Erreur critique Bot: {e}")
@@ -8814,24 +8814,29 @@ def global_init():
         print(f"❌ Erreur Init DB: {e}")
 
 # ====================================================
+#      INITIALISATION AUTO (POUR GUNICORN)
+# ====================================================
+
+def start_everything():
+    """Initialise la DB et lance le bot en arrière-plan"""
+    global_init()
+    # On lance le bot dans un thread pour que Flask/Gunicorn puisse continuer
+    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
+    bot_thread.start()
+    print("✅ SYSTÈME INITIALISÉ (Bot en arrière-plan)")
+
+# Appel immédiat pour que Gunicorn lance le bot au chargement
+start_everything()
+
+# ====================================================
 #      POINT D'ENTRÉE PRINCIPAL
 # ====================================================
 
 if __name__ == "__main__":
-    # 1. On prépare tout
-    global_init()
-
-    # 2. On lance le BOT dans un thread séparé (Arrière-plan)
-    # Note: Flask tourne DÉJÀ grâce au thread lancé au tout début du fichier
-    bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
-    bot_thread.start()
-
-    print("✅ SYSTÈME EN LIGNE (Flask + Bot actifs)")
-    
-    # 3. On maintient le script en vie indéfiniment
-    # On ne lance PAS app.run() ici, car il est déjà lancé en haut !
+    # Ce bloc ne s'exécute QUE si tu lances 'python3 app.py'
+    print("🌐 Démarrage du serveur Web...")
     try:
-        while True:
-            time.sleep(1)
+        # En mode manuel, Flask bloque ici et maintient le tout en vie
+        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
     except KeyboardInterrupt:
         print("🛑 Arrêt du système...")
