@@ -8760,109 +8760,124 @@ app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_
 app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
 app_telegram.add_handler(CallbackQueryHandler(menu_handler))
 
+
 # ====================================================
-# 🔧 CONNEXIONS DU MENU ADMIN (MANQUANTES)
-# ====================================================
-
-# 1. Gestion des Tickets
-app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
-app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
-app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
-
-# 2. Gestion des Utilisateurs & Solde
-app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users"))
-app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_"))
-app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_"))
-# Pour la modification manuelle du solde (via message texte)
-app_telegram.add_handler(MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive))
-
-# 3. Gestion des Forfaits (Statuts)
-app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut"))
-# (Les boutons admin_userstatut_ et admin_statut_ sont déjà là, mais on les remet par sécurité si besoin)
-app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
-app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
-
-# 4. Redémarrage
-app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
-
-# 5. Logistique (ID's Orders)
-app_telegram.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
-app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
-
-# 6. Gestion des Produits (Cc's & Pro's)
-app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:"))
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_"))
-# Pour l'ajout manuel de produit (Texte)
-app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
-app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
-
-# 7. Réglages IVR
-app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
-
-
+#      FONCTION DE LANCEMENT DU BOT (THREAD SAFE)
 # ====================================================
 
 def run_bot_polling():
     global bot_loop
+    global app_telegram  # CRUCIAL : Pour que la variable existe partout
+
     print("🤖 Bot Telegram en cours de démarrage...")
+    
     try:
+        # 1. Création de la boucle asynchrone pour ce thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        bot_loop = loop  # <--- CETTE LIGNE EST ESSENTIELLE
+        bot_loop = loop 
         
+        # 2. Construction de l'Application
+        app_telegram = ApplicationBuilder().token(TOKEN).build()
+
+        # ====================================================
+        # 3. ENREGISTREMENT DES HANDLERS (CÂBLAGE DES BOUTONS)
+        # ====================================================
+        
+        # A. Conversation Principale
+        app_telegram.add_handler(conv_handler)
+
+        # B. Menu Admin - Gestion Tickets
+        app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
+        app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
+        app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
+
+        # C. Menu Admin - Utilisateurs & Solde
+        app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_"))
+        app_telegram.add_handler(MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive))
+
+        # D. Menu Admin - Statuts
+        app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
+
+        # E. Menu Admin - Produits (CC / Pros)
+        app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
+        app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
+
+        # F. Menu Admin - Divers (Logistique, Reboot, IVR)
+        app_telegram.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
+
+        # G. Handler de secours (boutons génériques)
+        app_telegram.add_handler(CallbackQueryHandler(button_handler))
+
+        # 4. Lancement du Job Queue (Tâches de fond)
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
         
+        print("✅ Tous les handlers sont chargés. Démarrage du polling...")
         app_telegram.run_polling(close_loop=False, stop_signals=False)
+
     except Exception as e:
         print(f"❌ Erreur critique Bot: {e}")
 
 # ====================================================
-#      DÉMARRAGE GLOBAL
+#      DÉMARRAGE GLOBAL (DB + BOT + FLASK)
 # ====================================================
 
 def global_init():
     print("📦 Initialisation des bases de données...")
     try:
         db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        shop_helpers.ensure_shop_tables(db_conn)
-        init_db()
+        # Création des tables Shop/Tickets/Verif si absentes
+        try: shop_helpers.ensure_shop_tables(db_conn)
+        except: pass
+        
+        init_db() # Tables utilisateurs
+        
         try: tickets.patch_db_tickets()
         except: pass
+        
         ensure_verifications_table()
         ensure_payment_table()
+        
         db_conn.close()
         print("✅ Bases de données prêtes.")
     except Exception as e:
         print(f"❌ Erreur Init DB: {e}")
 
-# ====================================================
-#      INITIALISATION AUTO (POUR GUNICORN)
-# ====================================================
-
 def start_everything():
     """Initialise la DB et lance le bot en arrière-plan"""
     global_init()
-    # On lance le bot dans un thread pour que Flask/Gunicorn puisse continuer
+    
+    # On lance le bot dans un thread séparé (Daemon)
+    # Daemon = Le thread meurt quand le programme principal s'arrête
     bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
     bot_thread.start()
-    print("✅ SYSTÈME INITIALISÉ (Bot en arrière-plan)")
-
-# Appel immédiat pour que Gunicorn lance le bot au chargement
-start_everything()
+    print("✅ SYSTÈME INITIALISÉ (Bot tourne en arrière-plan)")
 
 # ====================================================
 #      POINT D'ENTRÉE PRINCIPAL
 # ====================================================
 
 if __name__ == "__main__":
-    # Ce bloc ne s'exécute QUE si tu lances 'python3 app.py'
-    print("🌐 Démarrage du serveur Web...")
+    # 1. On lance tout (DB + Bot)
+    start_everything()
+    
+    print("🌐 Démarrage du serveur Web Flask...")
     try:
-        # En mode manuel, Flask bloque ici et maintient le tout en vie
+        # Flask prend le relais du thread principal
+        # use_reloader=False est important pour éviter de lancer le bot 2 fois
         app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
     except KeyboardInterrupt:
         print("🛑 Arrêt du système...")
