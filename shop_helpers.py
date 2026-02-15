@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 import os
+import asyncio
 
 DB_NAME = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
 
@@ -486,14 +487,17 @@ def cart_total(items: List[Tuple[Dict[str,Any], int]]) -> float:
 # =========================
 
 def build_product_keyboard(db: sqlite3.Connection, user_id: str, pid: int, prod: Dict[str,Any]):
+    # Si déjà acheté -> Voir
     if user_has_bought(db, user_id, pid):
-        kb = [[InlineKeyboardButton("⚡ View full", callback_data=f"prod:view:{pid}")]]
-    else:
-        kb = [[InlineKeyboardButton("👁 Preview", callback_data=f"prod:preview:{pid}"),
-               InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{pid}")],
-              [InlineKeyboardButton("⚡ Buy Now", callback_data=f"buynow:{pid}"),
-               InlineKeyboardButton("🧺 View Cart", callback_data="cart:view")]]
-    return InlineKeyboardMarkup(kb)
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⚡ View full", callback_data=f"prod:view:{pid}")]])
+    
+    # Sinon -> Seulement "Add" et "Buy Now". Le bouton "Panier" sera dans le menu global.
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{pid}"),
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buynow:{pid}")
+        ]
+    ])
 
 # =========================
 # Handlers produits
@@ -606,7 +610,33 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             print(f"[BUY] WARN full_product_text failed: {e_fmt}", flush=True)
             details = f"{prod.get('title','(sans titre)')}\nPRICE: {price:.2f} CAD"
 
-        return await q.message.reply_text("✅ Achat confirmé — fiche complète :\n\n" + details)
+        # --- MODIFICATION DÉBUT : Nettoyage & Autodestruction ---
+
+        # A. On supprime le message du produit (celui avec le bouton Buy Now)
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+
+        # B. On envoie la fiche complète
+        sent_msg = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✅ Achat confirmé — fiche complète (Disparaît dans 60s) :\n\n" + details
+        )
+
+        # C. On lance le compte à rebours de 60 secondes en arrière-plan
+        async def _self_destruct(msg, delay):
+            await asyncio.sleep(delay)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+
+        # Cela lance la suppression SANS bloquer le reste du bot
+        asyncio.create_task(_self_destruct(sent_msg, 60))
+        
+        return
+        # --- MODIFICATION FIN ---
 
     except Exception as e:
         try:
@@ -634,22 +664,57 @@ def _kb_cart_back_only():
 
 async def cart_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if q: 
-        try: await q.answer()
-        except: pass
-    if not q or not q.data.startswith("cart:add:"):
+    
+    # On ne répond pas au début pour garder le contrôle du Toast à la fin
+    if not q or not q.data.startswith("cart:add:"): 
         return
-    pid = int(q.data.split(":",2)[2])
-    user_id = str(update.effective_user.id)
-    db: sqlite3.Connection = context.bot_data["db_conn"]
-    cart_add(db, user_id, pid, 1)
-    await q.message.reply_text(
-        "🛒 Ajouté au panier.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧺 Voir Panier", callback_data="cart:view")],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
-        ])
-    )
+
+    try:
+        pid = int(q.data.split(":", 2)[2])
+        user_id = str(update.effective_user.id)
+
+        if "db_conn" not in context.bot_data:
+            await q.answer("❌ Erreur interne", show_alert=False)
+            return
+        
+        db: sqlite3.Connection = context.bot_data["db_conn"]
+        c = db.cursor()
+
+        # A. VÉRIFICATION DOUBLON
+        c.execute("SELECT 1 FROM cart_items WHERE user_id=? AND product_id=?", (user_id, pid))
+        exists = c.fetchone()
+
+        if exists:
+            # Si déjà là, on bloque avec un message rouge (Toast)
+            await q.answer("❌ Déjà dans le panier !", show_alert=False)
+            return
+
+        # B. AJOUT
+        c.execute("INSERT INTO cart_items (user_id, product_id, qty) VALUES (?,?,1)", (user_id, pid))
+        db.commit()
+
+        # C. FEEDBACK POSITIF (Toast rouge)
+        # On calcule le total pour l'afficher dans la notif
+        c.execute("SELECT count(*) FROM cart_items WHERE user_id=?", (user_id,))
+        count = c.fetchone()[0]
+        
+        await q.answer(f"🔴 Ajouté ! (Total: {count})", show_alert=False)
+
+        # Astuce : On modifie le bouton pour montrer qu'il est ajouté (visuel)
+        try:
+            new_kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Added", callback_data="noop"), # Bouton inactif
+                    InlineKeyboardButton("⚡ Buy Now", callback_data=f"buynow:{pid}")
+                ]
+            ])
+            await q.edit_message_reply_markup(reply_markup=new_kb)
+        except: pass
+
+    except Exception as e:
+        print(f"[CART ERROR] {e}", flush=True)
+        try: await q.answer("❌ Erreur ajout", show_alert=False)
+        except: pass
 
 async def _send_or_edit(update: Update, text: str, reply_markup: InlineKeyboardMarkup | None = None):
     q = getattr(update, "callback_query", None)
@@ -666,39 +731,111 @@ async def _send_or_edit(update: Update, text: str, reply_markup: InlineKeyboardM
 
 async def cart_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if q: 
-        try: await q.answer()
-        except: pass
-
+    if q: await q.answer()
+    
+    chat_id = update.effective_chat.id
     user_id = str(update.effective_user.id)
+    
+    # 1. NETTOYAGE RADICAL (On efface tout avant d'afficher le panier)
+    from app import CATALOG_MSGS 
+    msgs_to_del = CATALOG_MSGS.pop(chat_id, [])
+    for mid in msgs_to_del:
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except: pass
+    
+    # On supprime aussi le message sur lequel on a cliqué (le triangle 🔻)
+    try: await q.message.delete()
+    except: pass
+
+    # 2. RÉCUPÉRATION DES ITEMS
     db: sqlite3.Connection = context.bot_data["db_conn"]
     items = cart_get(db, user_id)
+    
+    return_target = context.user_data.get('cart_return_to', 'menu_accueil')
+    return_label = "⬅️ Retour aux Pro's" if return_target == "cat:propro" else "⬅️ Retour"
 
     if not items:
-        return await _send_or_edit(update, "🛒 Votre panier est vide.", reply_markup=_kb_cart_back_only())
+        kb_empty = InlineKeyboardMarkup([[InlineKeyboardButton(return_label, callback_data=return_target)]])
+        return await context.bot.send_message(chat_id=chat_id, text="🛒 **VOTRE PANIER EST VIDE**", reply_markup=kb_empty, parse_mode="Markdown")
 
-    lines = ["🧺 **Votre panier**"]
-    running = 0.0
+    # 3. ENVOI D'UNE BULLE PAR PRODUIT
+    total_global = 0.0
+    sent_cart_ids = []
+
     for prod, qty in items:
+        raw_title = str(prod.get('title', 'Unknown'))
+        name = raw_title.split('•')[0].strip().upper()
+        city = str(prod.get('city', 'N/A')).upper()
+        
+        year = str(prod.get('year', ''))
+        if not year or year == 'N/A':
+            parts = raw_title.split('•')
+            year = parts[1].strip() if len(parts) > 1 else "19XX"
+        
         price = _coerce_price(prod.get("price"))
-        parsed = _parse_content_block((prod.get("content") or "") + "\n" + (prod.get("title") or ""))
-        label = parsed.get("firstname") or (prod.get("title") or f"id {prod.get('id')}")
-        sub = price * int(qty)
-        running += sub
-        lines.append(f"• {label} (id {prod.get('id')}) ×{qty} — {sub:.2f} CAD")
-    lines.append(f"\nTotal: {running:.2f} CAD")
+        subtotal = price * int(qty)
+        total_global += subtotal
+        pid = prod.get('id')
 
-    await _send_or_edit(update, "\n".join(lines), reply_markup=_kb_cart_base())
+        txt = (
+            f"👤 **NOM** : `{name}`\n"
+            f"🏙️ **VILLE** : `{city}`\n"
+            f"📅 **ANNÉE** : `{year}`\n"
+            f"💰 **PRIX** : `{subtotal:.2f} CAD`"
+        )
+        
+        kb_item = InlineKeyboardMarkup([[InlineKeyboardButton("💳 Payer", callback_data=f"buynow:{pid}")]])
+        
+        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb_item, parse_mode="Markdown")
+        sent_cart_ids.append(m.message_id)
 
+    # 4. BULLE DE RÉSUMÉ FINAL (TOUT PAYER)
+    summary_txt = f"🧾 **TOTAL GÉNÉRAL : `{total_global:.2f} CAD`**"
+    
+    kb_final_rows = []
+    if len(items) > 1:
+        kb_final_rows.append([InlineKeyboardButton(f"🛍️ TOUT PAYER ({total_global:.2f} CAD)", callback_data="cart:checkout")])
+    
+    kb_final_rows.append([InlineKeyboardButton("🧹 Vider le panier", callback_data="cart:clear")])
+    kb_final_rows.append([InlineKeyboardButton(return_label, callback_data=return_target)])
+
+    m_final = await context.bot.send_message(chat_id=chat_id, text=summary_txt, reply_markup=InlineKeyboardMarkup(kb_final_rows), parse_mode="Markdown")
+    sent_cart_ids.append(m_final.message_id)
+
+    # On stocke les IDs pour pouvoir les effacer si on clique sur "Retour"
+    CATALOG_MSGS[chat_id] = sent_cart_ids
+    
+   
 async def cart_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if q: 
-        try: await q.answer()
-        except: pass
+    if q: await q.answer()
+    
     user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
     db: sqlite3.Connection = context.bot_data["db_conn"]
+    
+    # --- 1. NETTOYAGE DES BULLES ---
+    # On récupère les IDs des fiches du panier qu'on a stockés
+    from app import CATALOG_MSGS
+    
+    msgs_to_del = CATALOG_MSGS.pop(chat_id, [])
+    for mid in msgs_to_del:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except:
+            pass
+
+    # --- 2. VIDAGE DE LA BASE DE DONNÉES ---
     cart_clear(db, user_id)
-    await _send_or_edit(update, "🧹 Panier vidé.", reply_markup=_kb_cart_back_only())
+    
+    # --- 3. CONFIRMATION ---
+    return_target = context.user_data.get('cart_return_to', 'menu_accueil')
+    return_label = "⬅️ Retour aux Pro's" if return_target == "cat:propro" else "⬅️ Retour"
+    
+    kb_back = InlineKeyboardMarkup([[InlineKeyboardButton(return_label, callback_data=return_target)]])
+    
+    # On édite le dernier message (celui du total) pour dire que c'est vidé
+    await q.edit_message_text("🧹 **Le panier a été vidé.**", reply_markup=kb_back, parse_mode="Markdown")
 
 async def cart_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
