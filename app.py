@@ -5664,7 +5664,8 @@ def analyze_response():
 
     logger.info(f"🔎 Interprétation — Win={is_absolute_win}, Valid={valid}")
 
-    # === Sous-fonction notification ===
+
+   # === Sous-fonction notification ===
     def _maybe_finish_batch(add_result_text=None):
         async def _notify_serialized():
             br = batch_runs.get(batch_id)
@@ -5676,22 +5677,20 @@ def analyze_response():
                     state["resolved"] = True
                     br["resolved"] += 1 
 
-                # 2. Envoi du message au client (seulement si ce n'est pas une COMMANDE d'ID)
+                # 2. Envoi du message au client
                 if add_result_text:
-                    # Si "ORDER" est dans l'ID, le formulaire gère l'affichage, donc on reste silencieux
                     if "ORDER" not in str(batch_id):
-                        await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text)
+                        # J'ai ajouté parse_mode='Markdown' pour gérer ton message d'erreur stylisé
+                        await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text, parse_mode='Markdown')
                 
                 # 3. Fermeture du batch si tout est fini
                 if br["resolved"] >= br["total"] and not br["notified"]:
                     br["notified"] = True 
                     
-                    # Si c'est une commande d'ID, on logue mais on ne renvoie pas au menu
                     if "ORDER" in str(batch_id):
                         logger.info(f"✅ [POLLING] Batch Commande {batch_id} validé avec succès.")
                         return
 
-                    # Pour une vérification simple (/verifier), on renvoie au menu
                     await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
                     await show_main_menu(user_id)
                     
@@ -5700,10 +5699,7 @@ def analyze_response():
     try:
         # === CAS PERMIS VALIDE ===
         if valid and not state["notified"]:
-            # On prend les 2 derniers chiffres de la variante (ex: 03)
             real_suffix = variant[-2:] 
-            
-            # Nettoyage strict
             clean_var = re.sub(r'[^A-Z0-9]', '', variant.upper())
             
             if len(clean_var) == 13:
@@ -5714,10 +5710,10 @@ def analyze_response():
             logger.info(f"🎯 MATCH: {final_permis}")
             state["notified"] = True
             
-            # SAUVEGARDE DB (Indispensable pour débloquer le formulaire)
+            # SAUVEGARDE DB
             save_permit_history(user_id, fullname, final_permis, "valide")
             
-            # NOTIFICATION
+            # NOTIFICATION SUCCÈS
             _maybe_finish_batch(add_result_text=msg(user_id, "validation_ok", permis=final_permis, fullname=fullname))
 
         # === CAS INVALIDE ===
@@ -5729,103 +5725,24 @@ def analyze_response():
             if state["total"] >= 10 and not state["notified"]:
                 state["notified"] = True
                 save_permit_history(user_id, fullname, None, "aucun")
-                _maybe_finish_batch(add_result_text=msg(user_id, "aucun_permis", fullname=fullname))
-
-        # === SÉCURITÉ SIGNALWIRE (Redirection ou Fin) ===
-        r = VoiceResponse()
-        if not state["notified"]:
-            # Si pas encore trouvé, on laisse l'appel cycler
-            r.pause(length=2)
-            r.redirect(f"{SERVER_URL}/composer_code?uid={user_id}", method="POST")
-        else:
-            # Si trouvé, on raccroche cet appel spécifique
-            r.hangup()
-            
-        return Response(str(r), mimetype="text/xml")
-
-    finally:
-        try:
-            client.calls(call_sid).update(status="completed")
-        except Exception as e:
-            logger.warning(f"⚠️ Erreur fermeture appel: {e}")
-        active_calls.pop(call_sid, None)
-
-    # === Sous-fonction notification ===
-    def _maybe_finish_batch(add_result_text=None):
-        async def _notify_serialized():
-            br = batch_runs.get(batch_id)
-            if not br: return
-
-            async with br.setdefault("lock", asyncio.Lock()):
-                # 1. Mise à jour du compteur de résolution
-                # On ne l'incrémente que si ce n'est pas déjà fait pour ce permis
-                if not state["resolved"]:
-                    state["resolved"] = True
-                    br["resolved"] += 1 
-
-                # 2. Envoi du message au client (seulement si ce n'est pas une COMMANDE d'ID)
-                if add_result_text:
-                    # Si "ORDER" est dans l'ID, le formulaire gère l'affichage, donc on reste silencieux
-                    if "ORDER" not in str(batch_id):
-                        await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text)
                 
-                # 3. Fermeture du batch si tout est fini
-                if br["resolved"] >= br["total"] and not br["notified"]:
-                    br["notified"] = True 
-                    
-                    # Si c'est une commande d'ID, on logue mais on ne renvoie pas au menu
-                    if "ORDER" in str(batch_id):
-                        logger.info(f"✅ [POLLING] Batch Commande {batch_id} validé avec succès.")
-                        return
+                # --- MESSAGE D'ÉCHEC PERSONNALISÉ ---
+                msg_echec = (
+                    f"❌ *Recherche terminée - ÉCHEC*\n\n"
+                    f"📂 Dossier : `{fullname}`\n"
+                    f"⚠️ Résultat : *Aucun permis n'a été attribué à ce dossier.*\n\n"
+                    f"_Veuillez essayer un autre permis ou revoir les informations entrées._"
+                )
+                _maybe_finish_batch(add_result_text=msg_echec)
 
-                    # Pour une vérification simple (/verifier), on renvoie au menu
-                    await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
-                    await show_main_menu(user_id)
-                    
-        asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
-
-    try:
-        # Dans ta fonction analyze_response, remplace le bloc "Cas permis valide" :
-        if valid and not state["notified"]:
-            # On prend les 2 derniers chiffres de la variante (ex: 03)
-            real_suffix = variant[-2:] 
-            
-            # Nettoyage strict
-            clean_var = re.sub(r'[^A-Z0-9]', '', variant.upper())
-            
-            if len(clean_var) == 13:
-                final_permis = f"{clean_var[:5]}-{clean_var[5:11]}-{clean_var[11:]}"
-            else:
-                final_permis = formatted.replace("**", real_suffix) if formatted else clean_var
-
-            logger.info(f"🎯 MATCH: {final_permis}")
-            state["notified"] = True
-            
-            # SAUVEGARDE DB (Indispensable pour débloquer le formulaire)
-            save_permit_history(user_id, fullname, final_permis, "valide")
-            
-            # NOTIFICATION (C'est ici que bot_loop est utilisé)
-            _maybe_finish_batch(add_result_text=msg(user_id, "validation_ok", permis=final_permis, fullname=fullname))
-
-        # === CAS INVALIDE ===
-        else:
-            state["total"] += 1
-            logger.info(f"❌ [FAIL] Variante {variant[-2:]} rejetée ({state['total']}/10)")
-            
-            # Si on a testé les 10 variantes sans succès
-            if state["total"] >= 10 and not state["notified"]:
-                state["notified"] = True
-                save_permit_history(user_id, fullname, None, "aucun")
-                _maybe_finish_batch(add_result_text=msg(user_id, "aucun_permis", fullname=fullname))
-
-        # === SÉCURITÉ SIGNALWIRE (Redirection ou Fin) ===
+        # === SÉCURITÉ SIGNALWIRE ===
         r = VoiceResponse()
         if not state["notified"]:
             # Si pas encore trouvé, on laisse l'appel cycler
             r.pause(length=2)
             r.redirect(f"{SERVER_URL}/composer_code?uid={user_id}", method="POST")
         else:
-            # Si trouvé, on raccroche cet appel spécifique
+            # Si trouvé, on raccroche
             r.hangup()
             
         return Response(str(r), mimetype="text/xml")
