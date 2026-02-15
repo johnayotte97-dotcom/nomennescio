@@ -839,34 +839,28 @@ def codif_prenom(prenom: str) -> str:
     return mapping.get(letter, '0')
 
 def generer_permis(nom: str, prenom: str, date_txt: str):
-    """
-    Génère le numéro SAAQ.
-    Format QC: LNNN-P-JJMMAA-SEQ
-    ATTENTION: Au Québec, on n'ajoute PAS 50 au mois pour les femmes.
-    """
     try:
-        # Nettoyage date (On attend JJ-MM-AAAA)
+        # On force la lecture du format JJ-MM-AAAA
         date_obj = datetime.strptime(date_txt, "%d-%m-%Y")
         
-        # Formatage strict : JJ MM AA
-        day = f"{date_obj.day:02d}"
-        month = f"{date_obj.month:02d}"
-        year = date_obj.strftime("%y") # 99 pour 1999
+        day_str = date_obj.strftime("%d")    # 07
+        month_str = date_obj.strftime("%m")  # 05
+        year_str = date_obj.strftime("%y")   # 97
 
-        date_saaq = f"{day}{month}{year}"
+        # Assemblage Date SAAQ (JJMMAA)
+        date_saaq = f"{day_str}{month_str}{year_str}"
         
-        # Calcul des codes
-        code_nom = soundex(nom)       # L116 pour Lefebvre
-        code_prenom = codif_prenom(prenom) # 1 pour Alexandre
+        # Codes d'identité
+        code_nom = soundex(nom)            # P612
+        code_prenom = codif_prenom(prenom) # 1
         
-        # Assemblage
+        
         base = code_nom + code_prenom + date_saaq
         
-        # Format visuel : L1161-050499-**
+        # Format pour l'affichage Telegram
         formatted = f"{base[:5]}-{base[5:11]}-**"
         
         return formatted, base
-        
     except Exception as e:
         print(f"Erreur Gen Permis: {e}")
         return "ERREUR-DATE", "00000000000"
@@ -5331,12 +5325,15 @@ def is_system_open():
     tz = pytz.timezone("America/Toronto")
     now = datetime.now(tz)
     weekday = now.weekday()
+    # Semaine : Lundi, Mardi, Jeudi, Vendredi
     if weekday in [0, 1, 3, 4]:
         return (now.hour > 8 or (now.hour == 8 and now.minute >= 30)) and (now.hour < 16 or (now.hour == 16 and now.minute < 30))
+    # Mercredi
     elif weekday == 2:
         return (now.hour > 9 or (now.hour == 9 and now.minute >= 30)) and (now.hour < 16 or (now.hour == 16 and now.minute < 30))
+    
+    # Samedi (5) et Dimanche (6) -> Retourne False pour activer le menu de fin de semaine (1-1)
     return False
-
 
 async def launch_parallel_calls(base_code, user_id, num_calls=10, fullname="", formatted="", batch_id=None):
     if batch_id is None:
@@ -5373,15 +5370,16 @@ async def launch_parallel_calls(base_code, user_id, num_calls=10, fullname="", f
             user_validation_status[key]["notified"] = True
             
             # Message flash pour le client
-            await app_telegram.bot.send_message(
-                chat_id=int(user_id), 
-                text=f"♻️ **Permis déjà validé !**\n\nNous avons retrouvé le numéro dans vos archives :\n`{found_permis}`\n\n(Aucun crédit n'a été utilisé)."
-            )
+            if globals().get("app_telegram") and getattr(app_telegram, "bot", None):
+                await app_telegram.bot.send_message(
+                    chat_id=int(user_id), 
+                    text=f"♻️ **Permis déjà validé !**\n\nNous avons retrouvé le numéro dans vos archives :\n`{found_permis}`\n\n(Aucun crédit n'a été utilisé)."
+                )
             
             # Mise à jour de l'animation du batch (pour que l'UI passe à 1/1)
             br = batch_runs.get(batch_id)
             if br:
-                async with br["lock"]:
+                async with br.setdefault("lock", asyncio.Lock()):
                     br["resolved"] += 1
                     if br["resolved"] >= br["total"]:
                         br["notified"] = True
@@ -5442,10 +5440,12 @@ async def _launch_single_call(base_code, i, user_id, batch_id):
         # On capture l'erreur mais on ne l'envoie pas plus loin (Anti-Crash)
         log(f"⚠️ SignalWire a refusé la variante {variant} : {e}", user_id, "error")
 
-
-
 async def cancel_all_calls(batch_id: str | None = None, user_id: int | str | None = None):
-    loop = asyncio.get_running_loop()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return 0 # Pas de loop, pas d'appels
+
     to_cancel = []
     for sid, info in list(active_calls.items()):
         try:
@@ -5503,274 +5503,259 @@ async def cancel_all_calls(batch_id: str | None = None, user_id: int | str | Non
     log(f"cancel_all_calls: {canceled} appel(s) traités (batch_id={batch_id}, user_id={user_id})", "SYSTEM")
     return canceled
 
-# REMPLACE la fonction twilio_handler (ligne 1749) par CELLE-CI :
-
 def convertir_en_code_saaq(code):
     """Convertit un code en format SAAQ."""
-    # Ajoutez ici la logique de conversion
-    return code
+    # Mapping des lettres en chiffres pour la composition téléphonique
+    mapping = {
+        'A': '2', 'B': '2', 'C': '2',
+        'D': '3', 'E': '3', 'F': '3',
+        'G': '4', 'H': '4', 'I': '4',
+        'J': '5', 'K': '5', 'L': '5',
+        'M': '6', 'N': '6', 'O': '6',
+        'P': '7', 'Q': '7', 'R': '7',
+        'S': '7', 'T': '8', 'U': '8',
+        'V': '8', 'W': '9', 'X': '9',
+        'Y': '9', 'Z': '9'
+    }
+    result = ""
+    for char in code.upper():
+        if char.isdigit():
+            result += char
+        elif char in mapping:
+            result += mapping[char]
+    return result
 
-@app.route("/twilio_handler", methods=["GET", "POST"], endpoint="twilio_handler_main")
+# --- ÉTAPE 1 : ROUTEUR INITIAL ---
+@app.route("/twilio_handler", methods=["GET", "POST"])
 def twilio_handler():
     code = request.args.get("code", "")
     uid = request.args.get("uid")
-    
-    if not code or not uid:
-        logger.error("❌ Paramètres manquants : code ou uid")
-        return Response("<Response><Hangup/></Response>", mimetype="text/xml")
     bid = request.args.get("bid")
-    call_sid = request.form.get("CallSid", f"call_{datetime.now().timestamp()}")
-    
-    # --- MODIFICATION ---
-    # Charge les temps de pause depuis le fichier
     timings = get_ivr_timings()
-    # --- FIN MODIFICATION ---
-
-    print(f"📞 Appel reçu — CallSid: {call_sid} | UID: {uid} | Code: {code} | BID: {bid}")
-
-    active_calls[call_sid] = {
-        "user_id": uid,
-        "code": code,
-        "batch_id": bid
-    }
-
     r = VoiceResponse()
 
     if is_system_open():
-        print("🕐 SAAQ ouverte — Menu 4-4-6 déclenché")
-        # --- MODIFICATION ---
-        r.pause(length=timings.get("open_1", 55)) # Default 55
+        # LOGIQUE SEMAINE (4-4-6) - Direct car éprouvé
+        log(f"[IVR] Mode SEMAINE pour {code}", uid)
+        r.pause(length=timings.get("open_1", 55))
         r.play(digits="4")
-        r.pause(length=3) # Garde les petites pauses hard-codées
+        r.pause(length=3)
         r.play(digits="4")
         r.pause(length=3)
         r.play(digits="6")
-        r.pause(length=timings.get("open_2", 41)) # Default 41
-        # --- FIN MODIFICATION ---
+        r.pause(length=timings.get("open_2", 41))
+        r.redirect(f"{SERVER_URL}/composer_code?code={code}&uid={uid}&bid={bid}", method="POST")
     else:
-        print("🕐 SAAQ fermée — Menu 1-1 déclenché")
-        # --- MODIFICATION ---
-        r.pause(length=timings.get("closed_1", 40)) # Default 40
-        r.play(digits="1")
-        r.pause(length=3)
-        r.play(digits="1")
-        r.pause(length=timings.get("closed_2", 45)) # Default 45
-        # --- FIN MODIFICATION ---
-
-    redirect_url = f"{SERVER_URL}/composer_code?code={code}&uid={uid}"
-    print(f"🔁 Redirection vers: {redirect_url}")
-    r.redirect(redirect_url, method="POST")
-
+        # LOGIQUE FIN DE SEMAINE (1-1) - Structure par étapes (redirect) pour stabilité
+        log(f"[IVR] Mode FIN DE SEMAINE (1-1) pour {code}", uid)
+        r.pause(length=timings.get("closed_1", 40))
+        r.redirect(f"{SERVER_URL}/step_2?code={code}&uid={uid}&bid={bid}", method="POST")
+    
     return Response(str(r), mimetype="text/xml")
 
+# --- ÉTAPE 2 : PREMIER '1' (DIMANCHE) ---
+@app.route("/step_2", methods=["POST"])
+def step_2():
+    code = request.args.get("code", "")
+    uid = request.args.get("uid")
+    bid = request.args.get("bid")
+    r = VoiceResponse()
+    r.play(digits="1")
+    r.pause(length=5) # Règle : attend 5 secondes
+    r.redirect(f"{SERVER_URL}/step_3?code={code}&uid={uid}&bid={bid}", method="POST")
+    return Response(str(r), mimetype="text/xml")
+
+# --- ÉTAPE 3 : DEUXIÈME '1' + ATTENTE FINALE (DIMANCHE) ---
+@app.route("/step_3", methods=["POST"])
+def step_3():
+    code = request.args.get("code", "")
+    uid = request.args.get("uid")
+    bid = request.args.get("bid")
+    timings = get_ivr_timings()
+    r = VoiceResponse()
+    r.play(digits="1")
+    # Pause pour atteindre les 1m25 total (env. 38s-40s)
+    r.pause(length=timings.get("closed_2", 40)) 
+    r.redirect(f"{SERVER_URL}/composer_code?code={code}&uid={uid}&bid={bid}", method="POST")
+    return Response(str(r), mimetype="text/xml")
+
+# --- ÉTAPE 4 : COMPOSITION SÉCURISÉE ---
 @app.route("/composer_code", methods=["POST"], endpoint="composer_code_main")
 def composer_code():
     code = request.args.get("code", "")
     uid = request.args.get("uid")
+    bid = request.args.get("bid")
     code_saaq = convertir_en_code_saaq(code)
     r = VoiceResponse()
+    
+    # Composition sans micro ouvert (évite les bruits qui coupent la numérotation)
     for digit in code_saaq:
         r.play(digits=digit)
-        r.pause(length=0.5)
+        r.pause(length=0.2)
+    
+    # Une fois terminé, redirection vers l'écoute
+    r.redirect(f"{SERVER_URL}/listen_response?code={code}&uid={uid}&bid={bid}", method="POST")
+    return Response(str(r), mimetype="text/xml")
+
+# --- ÉTAPE 5 : OUVERTURE DU MICRO ---
+@app.route("/listen_response", methods=["POST"])
+def listen_response():
+    r = VoiceResponse()
     gather = r.gather(
         input="speech",
-        language="fr-FR",
-        timeout=15,
+        language="fr-CA", # Accent québécois pour la SAAQ
+        timeout=30,
         speech_timeout="auto",
         action=f"{SERVER_URL}/analyze_response",
         method="POST"
     )
-    gather.say("Merci. Veuillez répondre après le signal sonore.", language="fr-FR")
+    # Failsafe en cas de silence
+    r.redirect(f"{SERVER_URL}/analyze_response")
     return Response(str(r), mimetype="text/xml")
 
+# --- ÉTAPE 6 : ANALYSE DES RÉSULTATS ---
 @app.route("/analyze_response", methods=["POST"], endpoint="analyze_response_main")
 def analyze_response():
-    from twilio.twiml.voice_response import VoiceResponse
     import re
+    from twilio.twiml.voice_response import VoiceResponse
 
-    # === Logs d’entrée ===
     speech_raw = request.form.get("SpeechResult", "")
     speech = (speech_raw or "").lower().strip()
     speech_clean = speech.replace('.', '').replace(',', '')
     call_sid = request.form.get("CallSid")
-    logger.info(f"📞 [analyze_response] reçu — CallSid: {call_sid}")
-    logger.info(f"🗣️ Résultat vocal brut: {speech_raw}")
-    logger.info(f"🧽 Nettoyé: {speech}")
+    
+    log(f"📞 [analyze_response] CallSid: {call_sid} | Brut: {speech_raw}", "SYSTEM")
 
-    # === Vérif session ===
     if call_sid not in active_calls:
-        logger.warning(f"❌ CallSid inconnu : {call_sid}")
         return Response("<Response><Hangup/></Response>", mimetype="text/xml")
 
     current_call = active_calls[call_sid]
-    user_id = None
+    # Récupération sécurisée de l'ID utilisateur
     try:
-        user_id = int(current_call["user_id"]) if current_call.get("user_id") else None
-    except Exception as e:
-        logger.warning(f"⚠️ Erreur conversion user_id: {e}")
+        user_id = int(current_call.get("user_id", 0))
+    except:
+        user_id = "SYSTEM"
 
     variant = current_call.get("code", "")
     batch_id = current_call.get("batch_id")
-    if user_id is None or not variant or len(variant) < 13 or not batch_id:
-        logger.error(f"❌ Données manquantes (user_id={user_id}, variant={variant}, batch_id={batch_id})")
-        return Response("<Response><Hangup/></Response>", mimetype="text/xml")
-
     base_code = variant[:-2]
     key = f"{batch_id}:{base_code}"
+    
+    # Si la clé n'existe pas dans le cache de validation, on coupe
     if key not in user_validation_status:
-        user_validation_status[key] = {
-            "notified": False, "total": 0, "fullname": "",
-            "formatted": "", "resolved": False, "batch_id": batch_id
-        }
+        return Response("<Response><Hangup/></Response>", mimetype="text/xml")
 
     state = user_validation_status[key]
     fullname = state.get("fullname", "")
-    formatted = state.get("formatted", "")
-    logger.info(f"🧾 Analyse du code {variant} pour {fullname} / batch={batch_id}")
-
-    # === Détection vocale (AMÉLIORÉE) ===
-    # Nettoyage agressif pour la comparaison
-    speech_clean = speech.replace('.', '').replace(',', '')
-
-    # 1. Phrases GAGNANTES (Priorité absolue)
-    # Si le bot entend ça, c'est valide à 100%, peu importe le reste.
-    WINNING_PHRASES = [
-        "permis de conduire est valide",
-        "le dossier est valide",
-        "ce permis est valide",
-        "comprend la classe",
-        "comprend les classes",
-        "status is valid"
-    ]
-
+    
+    # Détection de succès
+    WINNING_PHRASES = ["valide", "comprend la classe", "dossier est", "valid"]
     is_absolute_win = any(phrase in speech_clean for phrase in WINNING_PHRASES)
 
-    # 2. Patterns négatifs (Échec)
-    neg_patterns = [
-        r"\binvalide\b", r"\bnon\s+valide\b", r"\bpas\s+valide\b",
-        r"n[\'’]est\s+pas\s+valide", r"\binvalid\b", r"\bnot\s+valid\b",
-        r"comporte une erreur", # Important : SAAQ dit ça quand le numéro est faux
-        r"ne correspond à aucun"
-    ]
+    # Détection d'échec
+    neg_patterns = [r"invalide", r"pas valide", r"erreur", r"aucun", r"incomplet"]
+    is_negative = any(re.search(p, speech_clean) for p in neg_patterns)
+    
+    valid = is_absolute_win or ("valide" in speech_clean and not is_negative)
 
-    # 3. Logique de décision
-    if is_absolute_win:
-        valid = True
-        logger.info("✅ DÉTECTION FORCÉE : Phrase gagnante trouvée !")
-    else:
-        is_negative = any(re.search(p, speech) for p in neg_patterns)
-        is_positive = bool(re.search(r"\b(valide|valid)\b", speech))
-        valid = is_positive and not is_negative
-
-    logger.info(f"🔎 Interprétation — Win={is_absolute_win}, Valid={valid}")
-
-
-   # === Sous-fonction notification ===
+    # Fonction de notification Telegram intégrée
     def _maybe_finish_batch(add_result_text=None):
         async def _notify_serialized():
             br = batch_runs.get(batch_id)
             if not br: return
-
             async with br.setdefault("lock", asyncio.Lock()):
-                # 1. Mise à jour du compteur de résolution
                 if not state["resolved"]:
                     state["resolved"] = True
                     br["resolved"] += 1 
-
-                # 2. Envoi du message au client
+                
+                # Notification Telegram si texte fourni
                 if add_result_text:
                     if "ORDER" not in str(batch_id):
-                        # J'ai ajouté parse_mode='Markdown' pour gérer ton message d'erreur stylisé
-                        await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text, parse_mode='Markdown')
+                        if globals().get("app_telegram") and getattr(app_telegram, "bot", None):
+                            try:
+                                await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text, parse_mode='Markdown')
+                            except Exception as e:
+                                log(f"Erreur envoi Telegram: {e}", user_id, "error")
                 
-                # 3. Fermeture du batch si tout est fini
+                # Fermeture du batch si terminé
                 if br["resolved"] >= br["total"] and not br["notified"]:
                     br["notified"] = True 
-                    
                     if "ORDER" in str(batch_id):
-                        logger.info(f"✅ [POLLING] Batch Commande {batch_id} validé avec succès.")
+                        log(f"✅ [ORDER] Batch {batch_id} validé.", user_id)
                         return
-
-                    await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
-                    await show_main_menu(user_id)
                     
-        asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
+                    if globals().get("app_telegram") and getattr(app_telegram, "bot", None):
+                        try:
+                            await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
+                            # On réaffiche le menu principal
+                            await show_main_menu(user_id)
+                        except: pass
+        
+        if globals().get("bot_loop"):
+            asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
 
-    try:
-        # === CAS PERMIS VALIDE ===
-        if valid and not state["notified"]:
-            real_suffix = variant[-2:] 
-            clean_var = re.sub(r'[^A-Z0-9]', '', variant.upper())
-            
-            if len(clean_var) == 13:
-                final_permis = f"{clean_var[:5]}-{clean_var[5:11]}-{clean_var[11:]}"
-            else:
-                final_permis = formatted.replace("**", real_suffix) if formatted else clean_var
+    r = VoiceResponse()
 
-            logger.info(f"🎯 MATCH: {final_permis}")
+    # Logique de décision Finale
+    if valid and not state["notified"]:
+        state["notified"] = True
+        real_suffix = variant[-2:]
+        # Construction du permis final (AAAA-123456-XX)
+        final_permis = f"{variant[:5]}-{variant[5:11]}-{real_suffix}"
+        
+        # Sauvegarde en DB
+        save_permit_history(user_id, fullname, final_permis, "valide")
+        
+        # Notification Client
+        _maybe_finish_batch(add_result_text=msg(user_id, "validation_ok", permis=final_permis, fullname=fullname))
+        r.hangup()
+        
+    else:
+        state["total"] += 1
+        # Si on a épuisé les 10 tentatives sans succès
+        if state["total"] >= 10 and not state["notified"]:
             state["notified"] = True
+            save_permit_history(user_id, fullname, None, "aucun")
             
-            # SAUVEGARDE DB
-            save_permit_history(user_id, fullname, final_permis, "valide")
-            
-            # NOTIFICATION SUCCÈS
-            _maybe_finish_batch(add_result_text=msg(user_id, "validation_ok", permis=final_permis, fullname=fullname))
-
-        # === CAS INVALIDE ===
-        else:
-            state["total"] += 1
-            logger.info(f"❌ [FAIL] Variante {variant[-2:]} rejetée ({state['total']}/10)")
-            
-            # Si on a testé les 10 variantes sans succès
-            if state["total"] >= 10 and not state["notified"]:
-                state["notified"] = True
-                save_permit_history(user_id, fullname, None, "aucun")
-                
-                # --- MESSAGE D'ÉCHEC PERSONNALISÉ ---
-                msg_echec = (
-                    f"❌ *Recherche terminée - ÉCHEC*\n\n"
-                    f"📂 Dossier : `{fullname}`\n"
-                    f"⚠️ Résultat : *Aucun permis n'a été attribué à ce dossier.*\n\n"
-                    f"_Veuillez essayer un autre permis ou revoir les informations entrées._"
-                )
-                _maybe_finish_batch(add_result_text=msg_echec)
-
-        # === SÉCURITÉ SIGNALWIRE ===
-        r = VoiceResponse()
-        if not state["notified"]:
-            # Si pas encore trouvé, on laisse l'appel cycler
-            r.pause(length=2)
-            r.redirect(f"{SERVER_URL}/composer_code?uid={user_id}", method="POST")
-        else:
-            # Si trouvé, on raccroche
+            msg_echec = (f"❌ *Recherche terminée - ÉCHEC*\n\n📂 Dossier : `{fullname}`\n"
+                         f"⚠️ Résultat : *Aucun permis valide trouvé.*")
+            _maybe_finish_batch(add_result_text=msg_echec)
             r.hangup()
             
-        return Response(str(r), mimetype="text/xml")
+        elif not state["notified"]:
+            # On n'a pas encore trouvé, on redirige vers le prochain code (boucle gérée par le client SignalWire/Twilio habituellement via URL status callback, mais ici on simplifie en raccrochant pour que la boucle python lance le suivant)
+            # NOTE: Dans ton architecture `launch_parallel_calls`, c'est la boucle Python qui lance les appels un par un.
+            # Donc ici on raccroche simplement pour que `launch_parallel_calls` passe au `i+1`.
+            r.hangup()
+        else:
+            r.hangup()
 
-    finally:
-        try:
-            client.calls(call_sid).update(status="completed")
-        except Exception as e:
-            logger.warning(f"⚠️ Erreur fermeture appel: {e}")
-        active_calls.pop(call_sid, None)
+    # Nettoyage de l'appel actif
+    active_calls.pop(call_sid, None)
+    return Response(str(r), mimetype="text/xml")
 
 
 
 # ========================== MENU/ROUTEUR CALLBACKS ==========================
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    
+    # --- RÉPONSE IMMÉDIATE POUR ÉVITER LE TIMEOUT ---
+    try:
+        await q.answer()
+    except Exception:
+        # Si la query est déjà expirée (plus de 30s), on ignore l'erreur et on continue
+        pass
 
     # --- DEBUT DU MOUCHARD ---
     import os
     pid = os.getpid()
-    query_data = update.callback_query.data
+    query_data = q.data
     user_id = update.effective_user.id
     print(f"\n[ESPION] 🕵️ REÇU callback: '{query_data}' | User: {user_id} | PID Processus: {pid}", flush=True)
     # --- FIN DU MOUCHARD ---
 
-    q = update.callback_query
-    await q.answer()
     print(f"[DBG] menu_handler triggered with data={q.data}", flush=True)
-
     data = q.data
 
     # --- LOGIQUE DE RETOUR PANIER ---
@@ -5783,15 +5768,12 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await hist_view_callback(update, context)
 
     # --- SOUS-SECTIONS HISTORIQUE (UX) ---
-    # 1. Historique des Pro's (Achats)
     if data == "hist:pros":
         return await hist_pros(update, context)
 
-    # 2. Historique des Permis (Générations)
     if data == "hist:permis":
         return await show_permis_history(update, context)
 
-    # 3. Historique des IDs (Formulaires)
     if data == "hist:ids":
         return await show_ids_history(update, context)
 
@@ -8779,17 +8761,16 @@ app_telegram.add_handler(CallbackQueryHandler(menu_handler))
 # ====================================================
 
 def run_bot_polling():
-    """Démarre le polling dans une nouvelle boucle d'événements"""
+    global bot_loop
     print("🤖 Bot Telegram en cours de démarrage...")
     try:
-        # Création d'une nouvelle boucle d'événements dédiée au thread du bot
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        bot_loop = loop  # <--- CETTE LIGNE EST ESSENTIELLE
         
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
         
-        # stop_signals=False est crucial pour ne pas interférer avec Flask/Gunicorn
         app_telegram.run_polling(close_loop=False, stop_signals=False)
     except Exception as e:
         print(f"❌ Erreur critique Bot: {e}")
