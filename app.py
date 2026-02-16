@@ -8701,9 +8701,7 @@ def setup_all_handlers(application):
 
     # -- B. BOUTIQUE (Priorité haute pour le paiement) --
     # Supporte 'buy:' et 'buynow:' pour tes fiches importées
-    application.add_handler(CallbackQueryHandler(
-        shop_helpers.handle_buy_callback, pattern=r"^(buy|buynow):\d+$"
-    ))
+    application.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
     application.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
     application.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
     application.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
