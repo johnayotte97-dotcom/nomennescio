@@ -8683,61 +8683,90 @@ conv_handler = ConversationHandler(
     ],
     name="main_conversation"
 )
+# ====================================================
+#      INITIALISATION ET CONFIGURATION DU BOT
+# ====================================================
+
+def setup_all_handlers(application):
+    """
+    Configure tous les handlers dans le bon ordre.
+    L'ordre est CRUCIAL : les boutons de vente en premier, le menu en dernier.
+    """
+    # 1. Sécurité - Auto-Lock (Toujours en premier, Group -1)
+    application.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
+
+    # 2. Handlers Boutique (Shop Helpers) - Gère "Buy Now"
+    # Le pattern accepte 'buy:123' ET 'buynow:123' pour être compatible avec tes imports
+    application.add_handler(CallbackQueryHandler(
+        shop_helpers.handle_buy_callback, pattern=r"^(buy|buynow):\d+$"
+    ))
+    application.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
+    application.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
+    application.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
+    application.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
+    application.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
+
+    # 3. Menus Admin - Gestion Tickets & Utilisateurs
+    application.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
+    application.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
+    application.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
+    
+    application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users"))
+    application.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_"))
+    application.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_"))
+    application.add_handler(MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive))
+    
+    application.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut"))
+    application.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
+    application.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
+
+    # 4. Menus Admin - Produits & Logistique
+    application.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:"))
+    application.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
+    application.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
+    application.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_"))
+    application.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
+    
+    application.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
+    application.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
+    application.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
+    application.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
+    application.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
+    application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
+
+    # 5. Conversations Complexes (Filtres, CSV, Paiements, Tickets)
+    application.add_handler(admin_search_conv, group=8)
+    application.add_handler(admin_csv_conv, group=6)
+    application.add_handler(admin_ivr_conv, group=7)
+    application.add_handler(history_filter_conv, group=5)
+    application.add_handler(catalog_filter_conv)
+    application.add_handler(ccs_catalog_filter_conv)
+    application.add_handler(payment_conv)
+    application.add_handler(id_docs_conv)
+    application.add_handler(admin_ticket_conv, group=9)
+    application.add_handler(conv_handler)
+
+    # 6. Pagination & Textes (Gestion du nombre par page)
+    application.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
+    application.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
+
+    # 7. Handler Menu Générique (Toujours en dernier)
+    application.add_handler(CallbackQueryHandler(menu_handler))
 
 # ====================================================
-#      INITIALISATION GLOBALE (POUR GUNICORN)
+#      FONCTIONS DE PAGINATION (LOGIQUE)
 # ====================================================
 
-# 1. On prépare l'application Telegram
-app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
-
-# --- DÉBUT DU CORRECTIF ---
-# 1. On crée une connexion spécifique pour le bot (indispensable pour SQLite)
-bot_db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-
-# 2. On injecte la base de données dans le "sac à dos" du bot
-app_telegram.bot_data["db_conn"] = bot_db_conn
-
-# 3. On injecte les fonctions pour gérer l'argent (sinon l'achat plantera après)
-app_telegram.bot_data["get_user_balance"] = get_user_balance
-app_telegram.bot_data["update_user_balance"] = update_user_balance
-# --- FIN DU CORRECTIF ---
-
-# 2. Configuration des Handlers (Copie de ta logique)
-app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
-
-# --- Handlers Boutique ---
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
-app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
-
-# --- Conversations ---
-app_telegram.add_handler(admin_search_conv, group=8)
-app_telegram.add_handler(admin_csv_conv, group=6)
-app_telegram.add_handler(admin_ivr_conv, group=7)
-app_telegram.add_handler(history_filter_conv, group=5)
-app_telegram.add_handler(catalog_filter_conv)
-app_telegram.add_handler(ccs_catalog_filter_conv)
-app_telegram.add_handler(payment_conv)
-app_telegram.add_handler(id_docs_conv)
-app_telegram.add_handler(admin_ticket_conv, group=9)
-app_telegram.add_handler(conv_handler)
-
-# --- Admin & Callbacks (Tes handlers existants ici...) ---
-app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_.*$"))
-app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_.*$"))
-# ... (garde tous tes autres add_handler ici) ...
-
-# --- Gestion Pagination ---
 async def set_pg_callback(update, context):
     q = update.callback_query
     user_id = str(update.effective_user.id)
     if "custom" in q.data:
         USER_STATES[int(user_id)] = "waiting_pagination_custom"
-        await q.message.edit_text("🔢 **Entrez le nombre souhaité :**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Annuler", callback_data="propro")]]), parse_mode="Markdown")
+        await q.message.edit_text("🔢 **Entrez le nombre souhaité (1-50) :**", 
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Annuler", callback_data="propro")]]), 
+                                  parse_mode="Markdown")
         return
     qty = int(q.data.split("_")[2])
     set_user_pagination(user_id, qty)
@@ -8755,120 +8784,43 @@ async def custom_pg_receive(update, context):
                 USER_STATES.pop(user_id, None)
                 await asyncio.sleep(1)
                 await show_products(update, context, page=0)
-        except: await update.message.reply_text("⚠️ Chiffre invalide.")
-
-app_telegram.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
-app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
-app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
-app_telegram.add_handler(CallbackQueryHandler(menu_handler))
-
-
-
+            else:
+                await update.message.reply_text("⚠️ Choisissez entre 1 et 50.")
+        except: 
+            await update.message.reply_text("⚠️ Chiffre invalide.")
 
 # ====================================================
-#      FONCTION DE LANCEMENT DU BOT (CORRIGÉE)
+#      FONCTION DE LANCEMENT DU BOT
 # ====================================================
 
 def run_bot_polling():
-    global bot_loop
-    global app_telegram  # CRUCIAL : Pour que la variable existe partout
+    global bot_loop, app_telegram
 
-    print("🤖 Bot Telegram en cours de démarrage...")
+    print("🤖 Bot Telegram : Préparation de l'instance...")
     
     try:
-        # 1. Création de la boucle asynchrone pour ce thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         bot_loop = loop 
         
-        # 2. Construction de l'Application
-        app_telegram = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        # Construction de l'Application
+        app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
 
-        # ====================================================
-        # 🔥 LE CORRECTIF EST ICI (DANS LA FONCTION) 🔥
-        # ====================================================
-        # On injecte la DB directement dans l'application qui vient d'être créée
-        print("🔌 Connexion DB pour le Bot...")
-        bot_db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        app_telegram.bot_data["db_conn"] = bot_db_conn
-        
-        # On injecte aussi les helpers de solde
+        # Injection de la DB et des Helpers pour les achats (bot_data)
+        print("🔌 Connexion DB et injection bot_data...")
+        db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        app_telegram.bot_data["db_conn"] = db_conn
         app_telegram.bot_data["get_user_balance"] = get_user_balance
         app_telegram.bot_data["update_user_balance"] = update_user_balance
-        # ====================================================
 
-        # 3. ENREGISTREMENT DES HANDLERS (CÂBLAGE DES BOUTONS)
-        
-        # A. Conversation Principale
-        app_telegram.add_handler(conv_handler)
+        # Chargement de tous les handlers (Boutons, Commandes, Convs)
+        setup_all_handlers(app_telegram)
 
-        # B. Menu Admin - Gestion Tickets
-        app_telegram.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
-        app_telegram.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
-        app_telegram.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
-
-        # C. Menu Admin - Utilisateurs & Solde
-        app_telegram.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_"))
-        app_telegram.add_handler(MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive))
-
-        # D. Menu Admin - Statuts
-        app_telegram.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
-
-        # E. Menu Admin - Produits (CC / Pros)
-        app_telegram.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
-        app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
-
-        # F. Menu Admin - Divers (Logistique, Reboot, IVR)
-        app_telegram.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
-        app_telegram.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
-        
-        # G. Conversations Spécifiques
-        app_telegram.add_handler(admin_search_conv, group=8)
-        app_telegram.add_handler(admin_csv_conv, group=6)
-        app_telegram.add_handler(admin_ivr_conv, group=7)
-        app_telegram.add_handler(history_filter_conv, group=5)
-        app_telegram.add_handler(catalog_filter_conv)
-        app_telegram.add_handler(ccs_catalog_filter_conv)
-        app_telegram.add_handler(payment_conv)
-        app_telegram.add_handler(id_docs_conv)
-        app_telegram.add_handler(admin_ticket_conv, group=9)
-
-        # H. Handlers Boutique (Shop Helpers)
-        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
-        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
-        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
-        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
-        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
-        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
-        
-        # I. Gestion Pagination et Menu
-        app_telegram.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
-        app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
-        app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
-        
-        # J. Handler générique (EN DERNIER)
-        app_telegram.add_handler(CallbackQueryHandler(menu_handler))
-        
-        # 4. Middleware de sécurité (Auto-Lock)
-        app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
-
-        # 5. Lancement du Job Queue
+        # Lancement du Job Queue (Inactivité)
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
         
-        print("✅ Polling démarré avec DB connectée !")
+        print("✅ Polling démarré. Bot en ligne !")
         app_telegram.run_polling(close_loop=False, stop_signals=False)
 
     except Exception as e:
@@ -8897,22 +8849,18 @@ def global_init():
         print(f"❌ Erreur Init DB: {e}")
 
 def start_everything():
-    """Initialise la DB et lance le bot en arrière-plan"""
+    """Lancement du thread Bot"""
     global_init()
     bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
     bot_thread.start()
-    print("✅ SYSTÈME INITIALISÉ (Bot tourne en arrière-plan)")
+    print("🚀 SYSTÈME INITIALISÉ (Bot en arrière-plan)")
 
-# Lancement auto pour Gunicorn
+# Lancement automatique pour Gunicorn
 start_everything()
 
-# ====================================================
-#      POINT D'ENTRÉE PRINCIPAL
-# ====================================================
-
 if __name__ == "__main__":
-    print("🌐 Démarrage du serveur Web Flask...")
+    print("🌐 Démarrage Flask sur le port 5001...")
     try:
         app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
     except KeyboardInterrupt:
-        print("🛑 Arrêt du système...")
+        print("🛑 Arrêt du système.")
