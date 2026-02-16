@@ -8765,6 +8765,10 @@ app_telegram.add_handler(CallbackQueryHandler(menu_handler))
 
 
 
+# ====================================================
+#      FONCTION DE LANCEMENT DU BOT (CORRIGÉE)
+# ====================================================
+
 def run_bot_polling():
     global bot_loop
     global app_telegram  # CRUCIAL : Pour que la variable existe partout
@@ -8778,12 +8782,22 @@ def run_bot_polling():
         bot_loop = loop 
         
         # 2. Construction de l'Application
-        # CORRECTION ICI : Utilisation de TELEGRAM_TOKEN et Application.builder()
         app_telegram = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
         # ====================================================
-        # 3. ENREGISTREMENT DES HANDLERS (CÂBLAGE DES BOUTONS)
+        # 🔥 LE CORRECTIF EST ICI (DANS LA FONCTION) 🔥
         # ====================================================
+        # On injecte la DB directement dans l'application qui vient d'être créée
+        print("🔌 Connexion DB pour le Bot...")
+        bot_db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        app_telegram.bot_data["db_conn"] = bot_db_conn
+        
+        # On injecte aussi les helpers de solde
+        app_telegram.bot_data["get_user_balance"] = get_user_balance
+        app_telegram.bot_data["update_user_balance"] = update_user_balance
+        # ====================================================
+
+        # 3. ENREGISTREMENT DES HANDLERS (CÂBLAGE DES BOUTONS)
         
         # A. Conversation Principale
         app_telegram.add_handler(conv_handler)
@@ -8818,6 +8832,7 @@ def run_bot_polling():
         app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
         app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
         app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
+        app_telegram.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
         
         # G. Conversations Spécifiques
         app_telegram.add_handler(admin_search_conv, group=8)
@@ -8843,41 +8858,39 @@ def run_bot_polling():
         app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
         app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
         
-        # J. Handler générique (DOIT ÊTRE EN DERNIER)
+        # J. Handler générique (EN DERNIER)
         app_telegram.add_handler(CallbackQueryHandler(menu_handler))
+        
+        # 4. Middleware de sécurité (Auto-Lock)
+        app_telegram.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
 
-        # 4. Lancement du Job Queue (Tâches de fond)
+        # 5. Lancement du Job Queue
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
         
-        print("✅ Tous les handlers sont chargés. Démarrage du polling...")
+        print("✅ Polling démarré avec DB connectée !")
         app_telegram.run_polling(close_loop=False, stop_signals=False)
 
     except Exception as e:
         print(f"❌ Erreur critique Bot: {e}")
         import traceback
-        traceback.print_exc() # Affiche l'erreur exacte dans les logs Gunicorn
+        traceback.print_exc()
 
 # ====================================================
-#      DÉMARRAGE GLOBAL (DB + BOT + FLASK)
+#      DÉMARRAGE GLOBAL
 # ====================================================
 
 def global_init():
     print("📦 Initialisation des bases de données...")
     try:
         db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        # Création des tables Shop/Tickets/Verif si absentes
         try: shop_helpers.ensure_shop_tables(db_conn)
         except: pass
-        
-        init_db() # Tables utilisateurs
-        
+        init_db() 
         try: tickets.patch_db_tickets()
         except: pass
-        
         ensure_verifications_table()
         ensure_payment_table()
-        
         db_conn.close()
         print("✅ Bases de données prêtes.")
     except Exception as e:
@@ -8886,15 +8899,11 @@ def global_init():
 def start_everything():
     """Initialise la DB et lance le bot en arrière-plan"""
     global_init()
-    
-    # On lance le bot dans un thread séparé (Daemon)
-    # Daemon = Le thread meurt quand le programme principal s'arrête
     bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
     bot_thread.start()
     print("✅ SYSTÈME INITIALISÉ (Bot tourne en arrière-plan)")
 
-# Appel immédiat pour que Gunicorn lance le bot au chargement
-# ATTENTION : Avec Gunicorn, utilisez l'option --workers 1 sinon vous aurez des conflits Telegram !
+# Lancement auto pour Gunicorn
 start_everything()
 
 # ====================================================
@@ -8902,7 +8911,7 @@ start_everything()
 # ====================================================
 
 if __name__ == "__main__":
-    print("🌐 Démarrage du serveur Web Flask (Mode Manuel)...")
+    print("🌐 Démarrage du serveur Web Flask...")
     try:
         app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
     except KeyboardInterrupt:
