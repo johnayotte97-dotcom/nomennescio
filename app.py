@@ -1225,12 +1225,12 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             f"🏙️ **VILLE** : `{city}`\n"
             f"📅 **ANNÉE** : `{year}`\n"
             f"📂 **BASE** : `{base}`\n"
-            f"💰 **PRIX** : `{price:.2f} CAD`"
+            f"💰 **PRIX** : `{price:.2f} USD`"
         )
         
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}"), 
-            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buynow:{p['id']}")
+            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{p['id']}")
         ]])
         
         try:
@@ -4302,7 +4302,7 @@ async def admin_prod_add_receive(update: Update, context: ContextTypes.DEFAULT_T
     if 'year'     in cols: fields.append('year');     values.append(data['year'])
     if 'stock'    in cols: fields.append('stock');    values.append(data['stock'])
     if 'category' in cols: fields.append('category'); values.append(category)
-    if 'currency' in cols: fields.append('currency'); values.append('CAD')
+    if 'currency' in cols: fields.append('currency'); values.append('USD')
     if 'is_active' in cols: fields.append('is_active'); values.append(1)
 
     q = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
@@ -4474,7 +4474,7 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
                 if 'year'     in cols: fields.append('year');     values.append(year)
                 if 'stock'    in cols: fields.append('stock');    values.append(1)
                 if 'category' in cols: fields.append('category'); values.append(category)
-                if 'currency' in cols: fields.append('currency'); values.append('CAD')
+                if 'currency' in cols: fields.append('currency'); values.append('USD')
                 if 'is_active' in cols: fields.append('is_active'); values.append(1)
 
                 q_sql = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
@@ -4656,7 +4656,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                 if 'year'     in cols: fields.append('year');     values.append(year)
                 if 'stock'    in cols: fields.append('stock');    values.append(stock)
                 if 'category' in cols: fields.append('category'); values.append(category)
-                if 'currency' in cols: fields.append('currency'); values.append('CAD')
+                if 'currency' in cols: fields.append('currency'); values.append('USD')
                 if 'is_active' in cols: fields.append('is_active'); values.append(1)
 
                 q = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
@@ -8687,16 +8687,20 @@ conv_handler = ConversationHandler(
 #      INITIALISATION ET CONFIGURATION DU BOT
 # ====================================================
 
+# ====================================================
+#      1. CONFIGURATION DES HANDLERS (LOGIQUE UNIQUE)
+# ====================================================
+
 def setup_all_handlers(application):
     """
-    Configure tous les handlers dans le bon ordre.
-    L'ordre est CRUCIAL : les boutons de vente en premier, le menu en dernier.
+    Enregistre tous les handlers sur l'instance active du bot.
+    L'ordre est CRUCIAL pour éviter les conflits.
     """
-    # 1. Sécurité - Auto-Lock (Toujours en premier, Group -1)
+    # -- A. SÉCURITÉ (Group -1) --
     application.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
 
-    # 2. Handlers Boutique (Shop Helpers) - Gère "Buy Now"
-    # Le pattern accepte 'buy:123' ET 'buynow:123' pour être compatible avec tes imports
+    # -- B. BOUTIQUE (Priorité haute pour le paiement) --
+    # Supporte 'buy:' et 'buynow:' pour tes fiches importées
     application.add_handler(CallbackQueryHandler(
         shop_helpers.handle_buy_callback, pattern=r"^(buy|buynow):\d+$"
     ))
@@ -8706,7 +8710,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
     application.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
 
-    # 3. Menus Admin - Gestion Tickets & Utilisateurs
+    # -- C. ADMIN (Tickets, Users, Produits) --
     application.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     application.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     application.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
@@ -8720,14 +8724,14 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
     application.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
 
-    # 4. Menus Admin - Produits & Logistique
     application.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:"))
     application.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
     application.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
     application.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_"))
     application.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
-    
+
+    # -- D. DIVERS ADMIN (Logistique, IVR, Reboot) --
     application.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
     application.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
     application.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
@@ -8735,7 +8739,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
     application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
 
-    # 5. Conversations Complexes (Filtres, CSV, Paiements, Tickets)
+    # -- E. CONVERSATIONS COMPLEXES (Filtres, Paiements, CSV) --
     application.add_handler(admin_search_conv, group=8)
     application.add_handler(admin_csv_conv, group=6)
     application.add_handler(admin_ivr_conv, group=7)
@@ -8745,18 +8749,18 @@ def setup_all_handlers(application):
     application.add_handler(payment_conv)
     application.add_handler(id_docs_conv)
     application.add_handler(admin_ticket_conv, group=9)
-    application.add_handler(conv_handler)
+    application.add_handler(conv_handler) # Menu principal
 
-    # 6. Pagination & Textes (Gestion du nombre par page)
+    # -- F. PAGINATION (Réglage vue) --
     application.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
     application.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
 
-    # 7. Handler Menu Générique (Toujours en dernier)
+    # -- G. HANDLER GÉNÉRIQUE (En dernier) --
     application.add_handler(CallbackQueryHandler(menu_handler))
 
 # ====================================================
-#      FONCTIONS DE PAGINATION (LOGIQUE)
+#      2. FONCTIONS DE PAGINATION
 # ====================================================
 
 async def set_pg_callback(update, context):
@@ -8785,82 +8789,66 @@ async def custom_pg_receive(update, context):
                 await asyncio.sleep(1)
                 await show_products(update, context, page=0)
             else:
-                await update.message.reply_text("⚠️ Choisissez entre 1 et 50.")
+                await update.message.reply_text("⚠️ Chiffre entre 1 et 50.")
         except: 
-            await update.message.reply_text("⚠️ Chiffre invalide.")
+            await update.message.reply_text("⚠️ Invalide.")
 
 # ====================================================
-#      FONCTION DE LANCEMENT DU BOT
+#      3. LANCEMENT DU BOT (POLLING)
 # ====================================================
 
 def run_bot_polling():
     global bot_loop, app_telegram
 
-    print("🤖 Bot Telegram : Préparation de l'instance...")
-    
+    print("🤖 Bot Telegram : Initialisation...")
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         bot_loop = loop 
         
-        # Construction de l'Application
+        # INSTANCE UNIQUE
         app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
 
-        # Injection de la DB et des Helpers pour les achats (bot_data)
-        print("🔌 Connexion DB et injection bot_data...")
+        # Injection bot_data
+        print("🔌 Connexion DB et Helpers...")
         db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         app_telegram.bot_data["db_conn"] = db_conn
         app_telegram.bot_data["get_user_balance"] = get_user_balance
         app_telegram.bot_data["update_user_balance"] = update_user_balance
 
-        # Chargement de tous les handlers (Boutons, Commandes, Convs)
+        # Configuration des Handlers
         setup_all_handlers(app_telegram)
 
-        # Lancement du Job Queue (Inactivité)
+        # JobQueue
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
         
-        print("✅ Polling démarré. Bot en ligne !")
+        print("✅ BOT EN LIGNE !")
         app_telegram.run_polling(close_loop=False, stop_signals=False)
-
     except Exception as e:
         print(f"❌ Erreur critique Bot: {e}")
-        import traceback
-        traceback.print_exc()
 
 # ====================================================
-#      DÉMARRAGE GLOBAL
+#      4. INITIALISATION ET DÉMARRAGE
 # ====================================================
 
-def global_init():
-    print("📦 Initialisation des bases de données...")
+def start_everything():
+    print("📦 Préparation DB...")
     try:
         db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        try: shop_helpers.ensure_shop_tables(db_conn)
-        except: pass
         init_db() 
-        try: tickets.patch_db_tickets()
-        except: pass
+        shop_helpers.ensure_shop_tables(db_conn)
+        tickets.patch_db_tickets()
         ensure_verifications_table()
         ensure_payment_table()
         db_conn.close()
-        print("✅ Bases de données prêtes.")
-    except Exception as e:
-        print(f"❌ Erreur Init DB: {e}")
+    except: pass
 
-def start_everything():
-    """Lancement du thread Bot"""
-    global_init()
     bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
     bot_thread.start()
-    print("🚀 SYSTÈME INITIALISÉ (Bot en arrière-plan)")
+    print("🚀 SYSTÈME PRÊT")
 
-# Lancement automatique pour Gunicorn
 start_everything()
 
 if __name__ == "__main__":
-    print("🌐 Démarrage Flask sur le port 5001...")
-    try:
-        app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
-    except KeyboardInterrupt:
-        print("🛑 Arrêt du système.")
+    app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
