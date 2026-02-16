@@ -168,6 +168,7 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         pid = int(q.data.split(":")[-1])
         user_id = str(update.effective_user.id)
+        chat_id = update.effective_chat.id
         db = context.bot_data.get("db_conn")
         c = db.cursor()
 
@@ -186,28 +187,60 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if balance < price:
             return await q.message.reply_text(f"⚠️ Solde insuffisant ({balance:.2f} USD).")
 
-        # Débit et Log
+        # --- 1. NETTOYAGE VISUEL IMMÉDIAT ---
+        # On récupère tous les IDs de messages du catalogue et du panier pour les effacer
+        msgs_to_kill = []
+        msgs_to_kill += context.user_data.pop("catalog_msg_ids", [])
+        msgs_to_kill += context.user_data.pop("cart_msg_ids", [])
+        msgs_to_kill += CATALOG_MSGS.pop(chat_id, [])
+        
+        # On ajoute le message actuel (celui du bouton Payer)
+        try: await q.message.delete()
+        except: pass
+
+        for mid in set(msgs_to_kill):
+            try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+            except: pass
+
+        # --- 2. TRAITEMENT DE LA TRANSACTION ---
         update_user_balance(user_id, -price)
         c.execute("INSERT INTO purchases (user_id, product_id, price, full_data, status, title, amount) VALUES (?,?,?,?,'paid',?,?)",
                   (user_id, pid, price, json.dumps(prod), prod.get("title"), price))
         c.execute("UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0", (pid,))
+        
+        # Nettoyage de l'article du panier s'il y était
+        c.execute("DELETE FROM cart_items WHERE user_id=? AND product_id=?", (user_id, pid))
         db.commit()
 
+        # --- 3. AFFICHAGE DU RÉSULTAT ET RETOUR ACCUEIL ---
         details = full_product_text(prod)
-        await q.message.delete()
-        sent = await context.bot.send_message(chat_id=update.effective_chat.id, 
-                                              text=f"✅ **ACHAT RÉUSSI**\n_Fiche visible 60s_\n\n{details}", 
-                                              parse_mode="Markdown")
+        sent = await context.bot.send_message(
+            chat_id=chat_id, 
+            text=f"✅ **ACHAT RÉUSSI**\n_Fiche visible 60s_\n\n{details}", 
+            parse_mode="Markdown"
+        )
         
+        # Petit message flash de redirection
+        redir = await context.bot.send_message(chat_id=chat_id, text="🔄 Retour au menu principal...")
+        
+        # Tâche de suppression de la fiche après 60s
         async def _del(m):
             await asyncio.sleep(60)
             try: await m.delete()
             except: pass
         asyncio.create_task(_del(sent))
 
+        # Redirection réelle après un court instant
+        await asyncio.sleep(1.5)
+        try: await redir.delete()
+        except: pass
+        
+        # Appel du menu principal propre
+        return await show_main_menu(int(user_id), clear=True)
+
     except Exception as e:
         logger.error(f"Buy Error: {e}")
-        await q.message.reply_text("❌ Erreur lors de la transaction.")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Erreur lors de la transaction.")
 
 async def cart_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -220,33 +253,149 @@ async def cart_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer("✅ Ajouté au panier (USD) !")
 
 async def cart_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user_id = str(update.effective_user.id)
-    db = context.bot_data["db_conn"]
-    c = db.cursor()
-    c.execute("SELECT p.*, ci.qty FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE ci.user_id=?", (user_id,))
-    rows = c.fetchall()
-    if not rows: return await q.message.reply_text("🛒 Votre panier est vide.")
+    """Affiche le panier (une bulle par article) en nettoyant tout l'écran avant."""
+    query = update.callback_query
+    try: await query.answer()
+    except: pass
     
-    total = 0.0
-    colnames = [d[0] for d in c.description]
-    for row in rows:
-        p = dict(zip(colnames[:-1], row[:-1]))
-        f = _parse_product_fields(p)
-        total += f['price']
-        await context.bot.send_message(chat_id=user_id, text=f"📦 {f['first_up']} - {f['price']:.2f} USD",
-                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Payer", callback_data=f"buy:{p['id']}")]]))
+    chat_id = update.effective_chat.id
+    user_id = str(update.effective_user.id)
 
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🛍️ TOUT PAYER ({total:.2f} USD)", callback_data="cart:checkout")],
-                               [InlineKeyboardButton("🧹 Vider", callback_data="cart:clear")]])
-    await context.bot.send_message(chat_id=user_id, text=f"🧾 **TOTAL : {total:.2f} USD**", reply_markup=kb, parse_mode="Markdown")
+    # === 🧹 GRAND NETTOYAGE ===
+    msgs_to_kill = []
+    
+    # 1. Le bouton sur lequel on a cliqué
+    try: await query.message.delete()
+    except: pass
 
-async def cart_clear_callback(update, context):
+    # 2. Les listes de messages à détruire
+    msgs_to_kill += context.user_data.pop('catalog_msg_ids', []) # <-- Récupère les IDs du catalogue
+    msgs_to_kill += context.user_data.pop('cart_msg_ids', [])    # <-- Récupère les anciens paniers
+    msgs_to_kill += context.user_data.pop('filter_msgs', [])
+    msgs_to_kill += CATALOG_MSGS.pop(chat_id, []) # Par sécurité (ancien système)
+    
+    # Exécution du nettoyage
+    for mid in set(msgs_to_kill):
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except: pass
+    # ==========================
+    
+    # 1. Récupération DB
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT p.* FROM cart_items c JOIN products p ON c.product_id = p.id WHERE c.user_id = ?", (user_id,))
+    items = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    sent_ids = [] # Liste des nouveaux messages du panier
+
+    # Panier vide
+    if not items:
+        m = await context.bot.send_message(chat_id=chat_id, text="🛒 **Votre panier est vide.**", reply_markup=kb_back_to_menu(), parse_mode="Markdown")
+        context.user_data['cart_msg_ids'] = [m.message_id]
+        return
+
+    # 2. Affichage INDIVIDUEL (Une bulle par produit)
+    for item in items:
+        f = _parse_product_fields(item)
+        
+        def escape(t): return str(t).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+        
+        nom = f"{f.get('first', '')} {f.get('last', '')}".strip().upper()
+        if len(nom) < 2: nom = item['title'].split('•')[0].strip()
+        
+        city = f.get('city', item.get('city', 'N/A')).upper()
+        year = f.get('year', item.get('year', 'N/A'))
+        price = item['price']
+
+        txt = (
+            f"🔹 **{escape(nom)}**\n"
+            f"🏙️ {escape(city)} | 📅 {year}\n"
+            f"💰 **{price:.2f} USD**"
+        )
+        
+        kb_item = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("💳 Payer", callback_data=f"buy:{item['id']}"),
+                InlineKeyboardButton("🗑 Retirer", callback_data=f"cart:del:{item['id']}")
+            ]
+        ])
+        
+        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb_item, parse_mode="Markdown")
+        sent_ids.append(m.message_id)
+
+    # 3. Résumé final en bas
+    total = sum(item['price'] for item in items)
+    msg_total = f"🧾 **TOTAL GLOBAL : {total:.2f} USD**\n_Paiement groupé ou individuel ci-dessus._"
+    
+    kb_total = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🛍️ TOUT PAYER ({total:.2f} USD)", callback_data="cart:checkout")],
+        [InlineKeyboardButton("🧹 Tout Vider", callback_data="cart:clear")],
+        [InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")]
+    ])
+    
+    m_tot = await context.bot.send_message(chat_id=chat_id, text=msg_total, reply_markup=kb_total, parse_mode="Markdown")
+    sent_ids.append(m_tot.message_id)
+
+    # On sauvegarde ces nouveaux messages pour pouvoir les effacer plus tard
+    context.user_data['cart_msg_ids'] = sent_ids
+
+async def cart_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Vide le panier, efface les messages du panier et retourne au catalogue."""
+    import asyncio
+    import sqlite3
+    
+    q = update.callback_query
+    try: await q.answer("🗑 Panier vidé !")
+    except: pass
+    
+    user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
+
+    # 1. VIDER LA BASE DE DONNÉES
+    con = sqlite3.connect(DB_NAME)
+    con.execute("DELETE FROM cart_items WHERE user_id=?", (user_id,))
+    con.commit()
+    con.close()
+
+    # 2. NETTOYAGE VISUEL (Supprime toutes les bulles du panier)
+    # On récupère la liste des messages affichés par le panier
+    msgs_to_kill = context.user_data.pop('cart_msg_ids', [])
+    
+    # On ajoute le message du bouton "Tout Vider" lui-même
+    try: msgs_to_kill.append(q.message.message_id)
+    except: pass
+    
+    # Suppression en boucle
+    for mid in set(msgs_to_kill):
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except: pass
+
+    # 3. MESSAGE DE CONFIRMATION (Temporaire)
+    m = await context.bot.send_message(chat_id=chat_id, text="🗑 **Panier vidé.** Retour au catalogue...", parse_mode="Markdown")
+    await asyncio.sleep(1.0) # Pause courte pour que l'utilisateur lise
+    try: await m.delete()
+    except: pass
+
+    # 4. RETOUR AU CATALOGUE (Pro's)
+    # On appelle show_products pour réafficher la liste des produits
+    # Note: On remet page=0 pour revenir au début
+    return await show_products(update, context, page=0, tier=None)
+
+async def cart_remove_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Retire un seul article du panier et rafraîchit l'affichage."""
+    q = update.callback_query
+    pid = int(q.data.split(":")[-1])
+    user_id = str(update.effective_user.id)
+    
     db = context.bot_data["db_conn"]
-    db.execute("DELETE FROM cart_items WHERE user_id=?", (str(update.effective_user.id),))
+    db.execute("DELETE FROM cart_items WHERE user_id=? AND product_id=?", (user_id, pid))
     db.commit()
-    await update.callback_query.edit_message_text("🧹 Panier vidé.")
+    
+    await q.answer("🗑 Article retiré !")
+    # On recharge le panier pour voir le changement
+    await cart_view_callback(update, context)
 
 async def cart_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Gère le paiement global du panier."""
@@ -1312,47 +1461,43 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     import sqlite3
     from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 
-    # --- RÉCUPÉRATION INFOS ---
     query = getattr(update, "callback_query", None)
     chat_id = query.message.chat_id if query else update.effective_chat.id
     user_id = str(update.effective_user.id)
     
     context.user_data['cart_return_to'] = "cat:propro"
     
-    # 1. Message de chargement (Minimaliste pour la rapidité)
-    loading_msg = None
-    if not from_filter:
-        try: loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
-        except: pass
-
-    # 2. Nettoyage (Batch intelligent)
-    if query:
-        try: await query.answer()
-        except: pass
-        if not from_filter:
-            try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
-            except: pass
-
-    # Nettoyage des messages précédents
-    msgs_to_del = context.user_data.pop("filter_fiches_msg_ids", []) if from_filter else CATALOG_MSGS.pop(chat_id, [])
+    # --- NETTOYAGE PRÉALABLE ---
+    # On efface tout ce qui traîne (filtres, anciens catalogues, paniers)
+    msgs_to_del = []
+    msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
     msgs_to_del += context.user_data.pop("filter_msgs", [])
+    msgs_to_del += context.user_data.pop("catalog_msg_ids", []) # <-- On récupère les anciens IDs
+    msgs_to_del += context.user_data.pop("cart_msg_ids", [])     # <-- On efface le panier si ouvert
     
-    if msgs_to_del:
-        for mid in set(msgs_to_del):
-            try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-            except: pass
+    if query and not from_filter:
+        try: await query.message.delete()
+        except: pass
 
-    # 3. REQUÊTE SQL TURBO
+    for mid in set(msgs_to_del):
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except: pass
+    # ---------------------------
+
+    # 1. Message de chargement
+    loading_msg = None
+    try: loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
+    except: pass
+
+    # 2. REQUÊTE SQL TURBO
     try:
-        # a. Pagination utilisateur
         PER_PAGE = get_user_pagination(user_id)
-
-        # b. Construction de la requête optimisée
-        # On définit d'abord la base du WHERE pour profiter de l'index (category, is_active, stock)
+        
+        # Filtres
+        filters = context.user_data.get('active_filters', {})
         where_clause = "WHERE category='propro' AND is_active=1 AND stock > 0"
         params = []
 
-        filters = context.user_data.get('active_filters', {})
         if filters.get('city'):
             where_clause += " AND city LIKE ?"
             params.append(f"%{filters['city']}%")
@@ -1367,20 +1512,15 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         con.row_factory = sqlite3.Row
         cur = con.cursor()
         
-        # --- OPTIMISATION : COUNT RAPIDE ---
-        # Si on n'a pas de filtres complexes, on peut utiliser une estimation ou limiter le scan
         cur.execute(f"SELECT COUNT(id) FROM products {where_clause}", params)
         total_items = cur.fetchone()[0]
 
-        # --- RÉCUPÉRATION DATA ---
-        # L'utilisation de l'INDEX sur l'ID DESC rend cette requête quasi-instantanée
         query_sql = f"SELECT * FROM products {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
         cur.execute(query_sql, params + [PER_PAGE, page * PER_PAGE])
         chunk = [dict(row) for row in cur.fetchall()]
         con.close()
 
     except Exception as e:
-        logger.error(f"SQL Error: {e}")
         if loading_msg: await loading_msg.edit_text("⚠️ Erreur technique.")
         return
 
@@ -1388,18 +1528,18 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         try: await loading_msg.delete()
         except: pass
 
-    # 5. Calcul des pages
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, total_pages - 1))
+    
+    # Liste pour mémoriser les nouveaux messages affichés
     sent_ids = []
 
-    # 6. Affichage des Produits (Plus rapide avec f-strings pré-calculées)
     if not chunk:
         m = await context.bot.send_message(chat_id=chat_id, text="❌ Aucun produit trouvé.", reply_markup=kb_back_to_menu())
-        if from_filter: context.user_data['filter_msgs'] = [m.message_id]
-        else: CATALOG_MSGS[chat_id] = [m.message_id]
+        context.user_data['catalog_msg_ids'] = [m.message_id]
         return
 
+    # 3. Affichage des Produits
     for p in chunk:
         txt = (
             f"👤 **NOM** : `{p['title'].split('•')[0].strip()}`\n"
@@ -1419,7 +1559,7 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             sent_ids.append(m.message_id)
         except: pass
 
-    # 7. Menu Navigation (Récupération simplifiée du panier)
+    # 4. Menu Navigation
     con = sqlite3.connect(DB_NAME)
     cart_count = con.execute("SELECT count(*) FROM cart_items WHERE user_id=?", (user_id,)).fetchone()[0]
     con.close()
@@ -1440,11 +1580,11 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     m = await context.bot.send_message(chat_id=chat_id, text="🔻 **Navigation** 🔻", reply_markup=InlineKeyboardMarkup(kb_final))
     sent_ids.append(m.message_id)
     
+    # 5. SAUVEGARDE CRITIQUE (Pour que le panier puisse les effacer)
     if from_filter:
         context.user_data['filter_fiches_msg_ids'] = sent_ids
-        context.user_data['filter_msgs'] = [m.message_id]
     else:
-        CATALOG_MSGS[chat_id] = sent_ids
+        context.user_data['catalog_msg_ids'] = sent_ids # <-- C'est ici que ça se joue
 
         
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
@@ -1489,161 +1629,160 @@ def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = Non
     kb.append([InlineKeyboardButton("⬅️ Annuler (logue)", callback_data="filter_cancel")])
     return InlineKeyboardMarkup(kb)
 
+# ==============================================================================
+# 🕵️ VERSION DEBUG DU SYSTÈME DE FILTRE
+# ==============================================================================
+
 async def filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Démarre la conversation de filtre."""
+    print("\n[DEBUG] 🟢 filter_start : L'utilisateur a cliqué sur Filter", flush=True)
     q = update.callback_query
     await q.answer()
     chat_id = q.message.chat_id
 
-    # Initialise les filtres en attente
+    # Reset
     context.user_data['pending_filters'] = {}
-    context.user_data.pop('active_filters', None) # Vide les filtres actifs
+    context.user_data.pop('active_filters', None)
+    print("[DEBUG] Filtres nettoyés. Envoi du menu...", flush=True)
     
-    # Nettoie les anciens messages du catalogue
+    # Nettoyage visuel
     old_catalog_msgs = CATALOG_MSGS.pop(chat_id, [])
     for mid in old_catalog_msgs:
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-        except Exception:
-            pass
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except: pass
 
-    # Construit le menu
     kb = _build_filter_menu(context)
-    m = await q.message.reply_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb) # Envoie un nouveau message
+    # On supprime l'ancien message et on envoie du neuf pour éviter les bugs d'ID
+    try: await q.message.delete()
+    except: pass
     
-    # Stocke l'ID du menu de filtre pour le nettoyer
-    context.user_data['filter_msgs'] = [m.message_id] 
+    m = await q.message.reply_text("🔎 **MODE FILTRE ACTIVÉ**\nChoisissez un critère ci-dessous :", reply_markup=kb)
+    context.user_data['filter_msgs'] = [m.message_id]
+    
+    print("[DEBUG] Menu filtre affiché. Passage état CATALOG_FILTER_MAIN", flush=True)
     return CATALOG_FILTER_MAIN
 
 async def filter_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """L'utilisateur a choisi un type de filtre (ex: Name). Demande la valeur."""
     q = update.callback_query
     await q.answer()
     
-    field = q.data.split(':', 1)[1]  # name|city|base|price|year
+    field = q.data.split(':', 1)[1]
     context.user_data['current_filter_key'] = field
+    print(f"\n[DEBUG] 🟡 filter_select_type : Catégorie choisie = {field}", flush=True)
     
+    # Suppression du menu pour afficher la question
+    try: await q.message.delete()
+    except: pass
+
     prompts = {
-        'name':  "Type a name fragment (ex: John):",
-        'city':  "Type a city fragment (ex: Toronto):",
-        'base':  "Type a base fragment (ex: Montreal Pack / FAKEPERSON):",
-        'price': "Max price (number, e.g. 12):",
-        'year':  "Year digits (e.g. 1991):",
+        'name':  "✍️ **FILTRE NOM**\nEntrez une partie du nom (ex: `Tremblay`) :",
+        'city':  "✍️ **FILTRE VILLE**\nEntrez la ville (ex: `Montreal`) :",
+        'base':  "✍️ **FILTRE BASE**\nEntrez la base (ex: `PROPRO`) :",
+        'price': "✍️ **FILTRE PRIX**\nEntrez le prix max (ex: `10`) :",
+        'year':  "✍️ **FILTRE ANNÉE**\nEntrez l'année (ex: `1995`) :",
     }
+    txt = prompts.get(field, f"Entrez la valeur pour {field} :")
+
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=txt,
+        reply_markup=kb_back_cancel(), 
+        parse_mode="Markdown"
+    )
+    context.user_data['filter_prompt_id'] = msg.message_id
     
-    # Modifie le menu de filtre en question
-    await q.message.edit_text(prompts[field], reply_markup=kb_back_cancel())
+    print("[DEBUG] Question posée. Passage état CATALOG_FILTER_AWAIT_VALUE", flush=True)
     return CATALOG_FILTER_AWAIT_VALUE
 
 async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = context.user_data.get('current_filter_key')
+    print(f"\n[DEBUG] 🔵 filter_receive_value : Texte reçu = '{update.message.text}'", flush=True)
     
-    # Sécurité : Si la session est perdue
+    user_id = update.effective_chat.id
+    key = context.user_data.get('current_filter_key')
+
     if not key:
-        await update.message.reply_text("⚠️ Session expirée. Veuillez rouvrir le filtre.", reply_markup=kb_back_to_menu())
-        return ConversationHandler.END
-        
+        print("[DEBUG] ❌ ERREUR : Pas de clé", flush=True)
+        await context.bot.send_message(chat_id=user_id, text="⚠️ Erreur session. Recommencez.")
+        return await show_products(update, context, page=0)
+
+    # 1. Sauvegarde de la valeur
     value = update.message.text.strip()
     context.user_data.setdefault('pending_filters', {})[key] = value
     
-    # 1. On nettoie le message de l'utilisateur (le "1997")
-    try: await update.message.delete()
-    except: pass
-    
-    # 2. Préparation de la réponse
+    # 2. 🧹 NETTOYAGE VISUEL (La solution à ton problème)
+    try:
+        # Supprime ton message (ex: "1997")
+        await update.message.delete() 
+        
+        # Supprime la question du bot (ex: "Entrez l'année")
+        prompt_id = context.user_data.get('filter_prompt_id')
+        if prompt_id:
+            await context.bot.delete_message(chat_id=user_id, message_id=prompt_id)
+            print(f"[DEBUG] Question {prompt_id} supprimée.", flush=True)
+    except Exception as e:
+        print(f"[DEBUG] Erreur nettoyage : {e}", flush=True)
+
+    # 3. Reconstruction et Envoi du menu de résumé
     kb = _build_filter_menu(context)
-    txt = f"✅ **Filtre Ajouté**\n{key.capitalize()} = `{value}`\n\nAppuyez sur **Search** pour lancer."
+    summary = "🔎 **FILTRES EN COURS**\n\n"
+    for k, v in context.user_data.get('pending_filters', {}).items():
+        summary += f"• {k.capitalize()}: `{v}`\n"
+    summary += "\n👇 Ajoutez un autre critère ou cliquez sur **Search**."
+
+    m = await context.bot.send_message(chat_id=user_id, text=summary, reply_markup=kb, parse_mode="Markdown")
     
-    # 3. TENTATIVE D'ÉDITION
-    edited = False
-    msg_ids = context.user_data.get('filter_msgs', [])
-    
-    if msg_ids:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id,
-                message_id=msg_ids[0],
-                text=txt,
-                reply_markup=kb,
-                parse_mode="Markdown"
-            )
-            edited = True
-        except Exception as e:
-            print(f"Edit failed: {e}")
-            
-    # 4. FALLBACK (LA SOLUTION !)
-    # Si on n'a pas pu modifier l'ancien message, on en envoie un nouveau !
-    if not edited:
-        m = await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=txt,
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-        context.user_data['filter_msgs'] = [m.message_id]
+    # On mémorise ce nouveau message pour pouvoir le supprimer au prochain tour
+    context.user_data['filter_msgs'] = [m.message_id]
     
     return CATALOG_FILTER_MAIN
 
 async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Applique les filtres et lance la recherche."""
+    print("\n[DEBUG] 🟣 filter_search : Bouton Search cliqué", flush=True)
     q = update.callback_query
     
-
-    context.user_data['active_filters'] = context.user_data.get('pending_filters', {})
+    pending = context.user_data.get('pending_filters', {})
+    print(f"[DEBUG] Filtres à appliquer : {pending}", flush=True)
     
- 
+    context.user_data['active_filters'] = pending
+    
+    # Appel du catalogue
+    print("[DEBUG] Appel de show_products...", flush=True)
     await show_products(update, context, page=0, tier=None, from_filter=True)
     
-
+    print("[DEBUG] Fin recherche. Retour CATALOG_FILTER_MAIN", flush=True)
     return CATALOG_FILTER_MAIN
 
-
-
 async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Réinitialise les filtres et nettoie les fiches produits."""
+    print("\n[DEBUG] 🟠 filter_reset cliqué", flush=True)
     q = update.callback_query
     await q.answer("Filtres réinitialisés")
     
-    # Vide tous les filtres (en attente et actifs)
     context.user_data.pop('pending_filters', None)
     context.user_data.pop('active_filters', None)
     
-    # --- CORRECTION: Nettoie les fiches produits affichées ---
-    prev_filter_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
-    for mid in prev_filter_fiches:
-         try:
-             await context.bot.delete_message(chat_id=q.message.chat_id, message_id=mid)
-         except: 
-             pass # Ignore les erreurs si le message est déjà supprimé
-    # --- FIN DE LA CORRECTION ---
+    # Nettoyage fiches
+    prev = context.user_data.pop("filter_fiches_msg_ids", [])
+    for mid in prev:
+        try: await context.bot.delete_message(chat_id=q.message.chat_id, message_id=mid)
+        except: pass
 
-    # Ré-affiche le menu de filtre (maintenant vide et SANS pagination)
-    kb = _build_filter_menu(context, page_info=None) # Force la suppression de la pagination
-    await q.message.edit_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
-
-    return CATALOG_FILTER_MAIN # On reste dans la conversation
+    kb = _build_filter_menu(context)
+    await q.message.edit_text("🔎 **FILTRES VIDE**\nRecommencez :", reply_markup=kb, parse_mode="Markdown")
+    return CATALOG_FILTER_MAIN
 
 async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Annule le filtre et force la fin de la conversation."""
+    print("\n[DEBUG] 🔴 filter_cancel cliqué", flush=True)
     q = update.callback_query
-    await q.answer("Filtre annulé.")
+    await q.answer()
     
-    # On nettoie les données temporaires
+    # Nettoyage
     context.user_data.pop('pending_filters', None)
     context.user_data.pop('current_filter_key', None)
-    
-    # Supprimer le menu de filtre pour ne pas laisser de boutons morts
-    try:
-        await q.message.delete()
-    except:
-        pass
+    try: await q.message.delete()
+    except: pass
 
-    # Affiche le catalogue normal (page 0)
+    print("[DEBUG] Retour catalogue normal", flush=True)
     await show_products(update, context, page=0, tier=None, from_filter=False)
-    
-    # --- LE PLUS IMPORTANT ---
     return ConversationHandler.END
-
 
 CCS_CATALOG_MSGS = {} 
 
@@ -2207,61 +2346,63 @@ from telegram.ext import ConversationHandler
 
 
 async def goto_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ferme proprement l’écran courant et affiche un menu tout neuf."""
+    """Ferme proprement l'écran courant, nettoie TOUT et affiche le menu principal."""
     q = getattr(update, "callback_query", None)
-    user_id = update.effective_user.id # On récupère l'ID utilisateur ici
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
 
     if q:
-        # stoppe le spinner (animation bleue Telegram)
-        try:
-            await q.answer()
-        except:
-            pass
-        # supprime la bulle actuelle (FAQ, Support, Admin, etc.)
-        try:
-            await q.message.delete()
-        except:
-            pass
-            
-    # --- CORRECTION MISE À JOUR (POUR CCS) ---
-    # Récupère TOUTES les listes de messages temporaires
-    hist_msgs = context.user_data.pop("hist_msgs", []) # De l'historique
-    verif_msgs = context.user_data.pop("verif_flow_msg_ids", []) # Du flux de vérification
-    
-    # Filtres Pro's
-    filter_msgs = context.user_data.pop("filter_msgs", []) 
-    filter_fiches = context.user_data.pop("filter_fiches_msg_ids", [])
-    catalog_msgs = CATALOG_MSGS.pop(user_id, []) 
-    
-    # --- LIGNES AJOUTÉES POUR CCS ---
-    ccs_filter_msgs = context.user_data.pop("ccs_filter_msgs", [])
-    ccs_filter_fiches = context.user_data.pop("ccs_filter_fiches_msg_ids", [])
-    ccs_catalog_msgs = CCS_CATALOG_MSGS.pop(user_id, [])
-    
-    # Combine et dédoublonne TOUTES les listes
-    all_msgs_to_delete = list(set(
-        hist_msgs + verif_msgs + 
-        catalog_msgs + filter_msgs + filter_fiches +
-        ccs_catalog_msgs + ccs_filter_msgs + ccs_filter_fiches # <-- AJOUTÉ
-    )) 
+        try: await q.answer()
+        except: pass
+        # Supprime le message sur lequel on a cliqué (le bouton Retour)
+        try: await q.message.delete()
+        except: pass
 
-    if all_msgs_to_delete:
-        for mid in all_msgs_to_delete:
-            try:
-                # Utilise user_id car chat_id n'est pas dispo ici
-                await context.bot.delete_message(chat_id=user_id, message_id=mid)
-            except:
-                pass # Ignore les messages déjà supprimés
-    # --- FIN DE LA CORRECTION ---
+    # === 🧹 GRAND NETTOYAGE (Le "Kärcher") ===
+    # On liste toutes les clés de mémoire qui peuvent contenir des IDs de messages à supprimer
+    keys_to_clean = [
+        "catalog_msg_ids",          # Catalogue Pro's (Nouveau)
+        "cart_msg_ids",             # Panier (Nouveau)
+        "filter_msgs",              # Menu Filtre Pro's
+        "filter_fiches_msg_ids",    # Résultats Filtre Pro's
+        "ccs_filter_msgs",          # Menu Filtre CCS
+        "ccs_filter_fiches_msg_ids",# Résultats Filtre CCS
+        "hist_msgs",                # Historique
+        "verif_flow_msg_ids",       # Vérification Permis
+        "cleanup_ids"               # Formulaires ID
+    ]
 
-    # nettoie tout l’état de la conversation (sauf les listes qu'on vient de pop)
+    msgs_to_kill = []
+
+    # 1. On vide la mémoire utilisateur
+    for key in keys_to_clean:
+        msgs_to_kill += context.user_data.pop(key, [])
+
+    # 2. On vide les dictionnaires globaux (Ancien système, par sécurité)
+    if chat_id in CATALOG_MSGS:
+        msgs_to_kill += CATALOG_MSGS.pop(chat_id)
+    if user_id in CATALOG_MSGS: # Parfois stocké par user_id
+        msgs_to_kill += CATALOG_MSGS.pop(user_id)
+    
+    if chat_id in CCS_CATALOG_MSGS:
+        msgs_to_kill += CCS_CATALOG_MSGS.pop(chat_id)
+    if user_id in CCS_CATALOG_MSGS:
+        msgs_to_kill += CCS_CATALOG_MSGS.pop(user_id)
+
+    # 3. Exécution de la suppression
+    for mid in set(msgs_to_kill):
+        try: 
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except: 
+            pass # Message déjà supprimé ou trop vieux
+    
+    # 4. Nettoyage final des données temporaires
     context.user_data.clear()
 
-    # affiche le menu principal proprement
-    # On utilise clear=True pour que show_main_ nettoie les messages de 'bot_messages' (sécurité)
+    # 5. Affichage du Menu Principal
+    # clear=True demande à show_main_menu de supprimer aussi les anciens messages 'bot_messages'
     await show_main_menu(user_id, clear=True) 
 
-    # stoppe toute attente de réponse (empêche "1 ou 2")
     return ConversationHandler.END
 
 async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, batch_id: str, lang: str):
@@ -5052,34 +5193,41 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Déclenche l'écoute du montant pour l'admin de façon robuste."""
     q = update.callback_query
     await q.answer()
 
-    # Extraction ID
+    # 1. Extraction propre de l'ID cible
     target_id = q.data.split("_")[-1]
     
-    # 🔥 SAUVEGARDE BLINDÉE (Clés Uniques)
+    # 2. Sécurisation des données en session
     context.user_data["SOLDE_TARGET_ID"] = target_id
-    context.user_data["SOLDE_EDIT_MODE"] = True   # On active le mode édition
-    
-    # On sauvegarde aussi dans la variable générique au cas où
     context.user_data["target_user"] = target_id 
+    context.user_data["SOLDE_EDIT_MODE"] = True   
 
+    # 3. NETTOYAGE VISUEL (On supprime le vieux menu pour éviter l'erreur "Not Modified")
+    try:
+        await q.message.delete()
+    except:
+        pass
+
+    # 4. ENVOI DU NOUVEAU MESSAGE (Plus de crash BadRequest possible)
     kb = [[InlineKeyboardButton("🔙 Annuler", callback_data=f"admin_adjust_{target_id}")]]
-
-    msg = await q.edit_message_text(
-        f"✍️ **MODIFICATION SOLDE**\n"
-        f"👤 Cible : `{target_id}`\n\n"
-        f"Entrez le montant à ajouter (+) ou retirer (-).\n"
-        f"Exemple : `50` pour ajouter, `-20` pour retirer.",
+    
+    msg = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=f"✍️ **MODIFICATION SOLDE**\n"
+             f"━━━━━━━━━━━━━━━━━━\n"
+             f"👤 Cible : `{target_id}`\n\n"
+             f"Veuillez entrer le montant (ex: `50` ou `-20`) :",
         reply_markup=InlineKeyboardMarkup(kb),
         parse_mode="Markdown"
     )
     
     context.user_data['prompt_msg_id'] = msg.message_id
     
-    # On retourne ConversationHandler.END car on gère ça manuellement avec le Flag
-    return ConversationHandler.END
+    # On retourne l'état 1 pour que le prochain message (+30) soit capté par l'admin
+    return 1
 
 
 async def admin_customamount_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7135,9 +7283,23 @@ async def admin_prod_add_start_dummy(u,c): pass
 
 # 3. AUTRES CONVERSATIONS (ADMIN, PAIEMENT, FILTRES)
 admin_search_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(admin_search_user_start, pattern="^admin_search_user_start$")],
-    states={ ADMIN_WAIT_SEARCH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_receive)] },
-    fallbacks=[CommandHandler("start", goto_menu), CallbackQueryHandler(admin_users, pattern="^admin_users")]
+    entry_points=[
+        CallbackQueryHandler(admin_search_user_start, pattern="^admin_search_user_start$"),
+        CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_")
+    ],
+    states={ 
+        # État recherche d'ID
+        ADMIN_WAIT_SEARCH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_receive)],
+        
+        # État attente du montant (L'état "1" retourné au dessus)
+        1: [MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive)] 
+    },
+    fallbacks=[
+        CallbackQueryHandler(admin_users, pattern="^admin_users"),
+        CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")
+    ],
+    allow_reentry=True,
+    name="admin_solde_conversation"
 )
 
 payment_conv = ConversationHandler(
@@ -8604,6 +8766,7 @@ async def enforcement_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             # On bloque tout le reste
             raise ApplicationHandlerStop
+        
 
 async def check_inactivity_job(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -8788,52 +8951,52 @@ conv_handler = ConversationHandler(
     ],
     name="main_conversation"
 )
-# ====================================================
-#      INITIALISATION ET CONFIGURATION DU BOT
-# ====================================================
 
-# ====================================================
-#      1. CONFIGURATION DES HANDLERS (LOGIQUE UNIQUE)
-# ====================================================
 
 def setup_all_handlers(application):
-    """
-    Enregistre tous les handlers. 
-    NOTE : On a enlevé 'shop_helpers.' devant car les fonctions sont maintenant ICI.
-    """
-    # -- A. SÉCURITÉ --
-    application.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
-
-    # -- B. BOUTIQUE (Intégré dans app.py) --
+    # ====================================================
+    # GROUPE -1 : SYSTÈME & DÉBUG (Priorité maximale)
+    # ====================================================
+    
+    # 1. L'ESPION (Affiche les messages dans la console sans les arrêter)
+    async def espion(update, context):
+        if update.message and update.message.text:
+            print(f"🕵️ ESPION: Message reçu -> '{update.message.text}'", flush=True)
+            
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, espion), group=-1)
+    application.add_handler(catalog_filter_conv)      # Filtre Pro's
+    application.add_handler(ccs_catalog_filter_conv)  # Filtre Cc's
+    
+    # 5. BOUTIQUE (Actions sur produits)
     application.add_handler(CallbackQueryHandler(handle_buy_callback, pattern=r"^buy:\d+$"))
     application.add_handler(CallbackQueryHandler(cart_add_callback, pattern=r"^cart:add:\d+$"))
     application.add_handler(CallbackQueryHandler(handle_view_callback, pattern=r"^prod:view:\d+$"))
     application.add_handler(CallbackQueryHandler(cart_view_callback, pattern=r"^cart:view$"))
     application.add_handler(CallbackQueryHandler(cart_clear_callback, pattern=r"^cart:clear$"))
     application.add_handler(CallbackQueryHandler(cart_checkout_callback, pattern=r"^cart:checkout$"))
+    application.add_handler(CallbackQueryHandler(cart_remove_single, pattern=r"^cart:del:\d+$"))
 
-    # -- C. ADMIN --
+    # 6. AUTRES FLUX (ID Docs, Paiement, Menu Principal)
+    application.add_handler(payment_conv)
+    application.add_handler(id_docs_conv)
+    application.add_handler(conv_handler) # Ceci gère le /start et menu_accueil
+
+    # 7. ADMIN (Callbacks simples)
     application.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     application.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     application.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
-    
     application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users"))
     application.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_"))
     application.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_"))
-    application.add_handler(MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive))
-    
     application.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut"))
     application.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
     application.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
-
     application.add_handler(CallbackQueryHandler(admin_category_menu, pattern="^admin_cat_menu:"))
     application.add_handler(CallbackQueryHandler(admin_prod_list, pattern="^admin_prod_list$"))
     application.add_handler(CallbackQueryHandler(admin_prod_del, pattern="^admin_prod_del$"))
     application.add_handler(CallbackQueryHandler(admin_prod_del_confirm, pattern="^admin_prod_del_"))
     application.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
-
-    # -- D. DIVERS --
     application.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
     application.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
     application.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
@@ -8841,26 +9004,22 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
     application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
 
-    # -- E. CONVERSATIONS --
-    application.add_handler(admin_search_conv, group=8)
-    application.add_handler(admin_csv_conv, group=6)
-    application.add_handler(admin_ivr_conv, group=7)
-    application.add_handler(history_filter_conv, group=5)
-    application.add_handler(catalog_filter_conv)
-    application.add_handler(ccs_catalog_filter_conv)
-    application.add_handler(payment_conv)
-    application.add_handler(id_docs_conv)
-    application.add_handler(admin_ticket_conv, group=9)
-    application.add_handler(conv_handler)
-
-    # -- F. VUE --
+    # 8. VUE & NAVIGATION
     application.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
     application.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
 
-    # -- G. GÉNÉRIQUE --
-    application.add_handler(CallbackQueryHandler(menu_handler))
+    # ====================================================
+    # GROUPES SECONDAIRES (Conversations Admin & Hist)
+    # ====================================================
+    application.add_handler(history_filter_conv, group=5)
+    application.add_handler(admin_csv_conv, group=6)
+    application.add_handler(admin_ivr_conv, group=7)
+    application.add_handler(admin_search_conv, group=8)
+    application.add_handler(admin_ticket_conv, group=9)
 
+    # 9. HANDLER GÉNÉRIQUE (Tout clic non géré revient ici)
+    application.add_handler(CallbackQueryHandler(menu_handler))
 # ====================================================
 #      2. FONCTIONS DE PAGINATION
 # ====================================================
