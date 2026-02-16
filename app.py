@@ -1536,57 +1536,52 @@ async def filter_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return CATALOG_FILTER_AWAIT_VALUE
 
 async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        key = context.user_data.get('current_filter_key')
-        if not key:
-            return CATALOG_FILTER_MAIN
-            
-        value = update.message.text.strip()
-        # On enregistre la valeur (ex: name = Mohammed)
-        context.user_data.setdefault('pending_filters', {})[key] = value
+    key = context.user_data.get('current_filter_key')
+    
+    # Sécurité : Si la session est perdue
+    if not key:
+        await update.message.reply_text("⚠️ Session expirée. Veuillez rouvrir le filtre.", reply_markup=kb_back_to_menu())
+        return ConversationHandler.END
         
-        # Nettoyage des messages
-        try: await update.message.delete()
-        except: pass
-        
-        # On réaffiche le menu de filtre avec le bouton "SEARCH"
-        kb = _build_filter_menu(context)
-        
-        # On édite le message de question précédent
-        prompt_id = context.user_data.get('filter_msgs', [None])[0]
-        if prompt_id:
+    value = update.message.text.strip()
+    context.user_data.setdefault('pending_filters', {})[key] = value
+    
+    # 1. On nettoie le message de l'utilisateur (le "1997")
+    try: await update.message.delete()
+    except: pass
+    
+    # 2. Préparation de la réponse
+    kb = _build_filter_menu(context)
+    txt = f"✅ **Filtre Ajouté**\n{key.capitalize()} = `{value}`\n\nAppuyez sur **Search** pour lancer."
+    
+    # 3. TENTATIVE D'ÉDITION
+    edited = False
+    msg_ids = context.user_data.get('filter_msgs', [])
+    
+    if msg_ids:
+        try:
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
-                message_id=prompt_id,
-                text=f"✅ Filtre ajouté : `{key}={value}`\nAppuyez sur **Search** pour voir les résultats.",
+                message_id=msg_ids[0],
+                text=txt,
                 reply_markup=kb,
                 parse_mode="Markdown"
             )
-        
-        return CATALOG_FILTER_MAIN # On retourne à l'état principal du filtre
-
-    except Exception as e:
-        print(f"Error in filter_receive: {e}")
-        return CATALOG_FILTER_MAIN
-
-# Petite fonction utilitaire pour supprimer sans bloquer
-async def delete_later(msg, delay):
-    await asyncio.sleep(delay)
-    try: await msg.delete()
-    except: pass
-
-async def filter_page_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère la navigation de page PENDANT un filtre."""
-    q = update.callback_query
+            edited = True
+        except Exception as e:
+            print(f"Edit failed: {e}")
+            
+    # 4. FALLBACK (LA SOLUTION !)
+    # Si on n'a pas pu modifier l'ancien message, on en envoie un nouveau !
+    if not edited:
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=txt,
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        context.user_data['filter_msgs'] = [m.message_id]
     
-    try:
-        page = int(q.data.split(":")[-1])
-    except Exception:
-        page = 0
-        
-
-    await show_products(update, context, page=page, tier=None, from_filter=True)
- 
     return CATALOG_FILTER_MAIN
 
 async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1787,67 +1782,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
         sent_ids.append(m.message_id)
         CCS_CATALOG_MSGS[chat_id] = sent_ids
 
-    def fmt_product(p):
-        # Utilise le parseur complet de shop_helpers pour tout récupérer
-        f = shop_helpers._parse_product_fields(p)
-
-        # Crée les lignes
-        lines = []
-
-  
-        if f.get("cc"):
-            # Affiche seulement les 6 premiers chiffres (le BIN)
-            lines.append(f"BINS: {f['cc'][:6]}") # <-- Affiche "BINS: 123456"
-        if f.get("exp"):
-            lines.append(f"EXP: {f['exp']}")
-        # --- FIN MODIFICATION ---
-
-  
-        lines.append(f"FIRST NAME: {f.get('first_up', 'N/A')}")
-        lines.append(f"DOB: {f.get('year') or f.get('dob', 'N/A')}")
-        lines.append(f"CITY: {f.get('city') or '—'}")
-        lines.append(f"BASE: {f.get('base', 'N/A')}")
-        lines.append(f"PRICE: {f.get('price', 0.0):.2f} {f.get('currency', 'CAD')}")
-
-        return "\n".join(lines)
-    
-    for idx, p in enumerate(chunk, start=1):
-        txt = fmt_product(p)
-        pid = p.get("id")
-        kb_rows = [[
-            InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"),
-            InlineKeyboardButton("🛒 Add to Cart", callback_data=f"cart:add:{pid}"),
-        ]]
-        kb = InlineKeyboardMarkup(kb_rows)
-        m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
-        sent_ids.append(m.message_id) 
-
-    # Affiche le bon menu en bas
-    if from_filter:
-        context.user_data['ccs_filter_fiches_msg_ids'] = sent_ids
-        page_info = {'page': page, 'total_pages': total_pages}
-        kb_with_nav = _build_filter_menu_ccs(context, page_info=page_info) # Fonction CCS
-        m_nav = await context.bot.send_message(
-            chat_id=chat_id, 
-            text=f"Filtre actif - Page {page+1}/{total_pages}", 
-            reply_markup=kb_with_nav
-        )
-        context.user_data['ccs_filter_msgs'] = [m_nav.message_id]
-    else:
-        kb_nav = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔎 Filter", callback_data="ccs_filter_open")], # Callback CCS
-            [
-                InlineKeyboardButton("«", callback_data=f"ccs:page:{max(0, page-1)}"), # Callback CCS
-                InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
-                InlineKeyboardButton("»", callback_data=f"ccs:page:{min(total_pages-1, page+1)}"), # Callback CCS
-            ],
-            [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
-        ])
-        m_nav = await context.bot.send_message(chat_id=chat_id, text=f"Page {page+1}/{total_pages}", reply_markup=kb_nav)
-        sent_ids.append(m_nav.message_id)
-        CCS_CATALOG_MSGS[chat_id] = sent_ids
-        return CCS_FILTER_MAIN      
-
+ 
 # --- Fonctions de filtre (Clone pour CCS) ---
 
 def _build_filter_menu_ccs(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
@@ -1943,31 +1878,45 @@ async def filter_select_type_ccs(update: Update, context: ContextTypes.DEFAULT_T
     return CCS_FILTER_AWAIT_VALUE
 
 async def filter_receive_value_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    key = context.user_data.pop('ccs_current_filter_key', None)
+    # On utilise .get() pour ne pas perdre la clé en cas d'erreur
+    key = context.user_data.get('ccs_current_filter_key') 
+    
     if not key:
         return CCS_FILTER_MAIN
         
     value = update.message.text.strip()
     context.user_data.setdefault('ccs_pending_filters', {})[key] = value
     
-    try:
-        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=context.user_data['ccs_filter_msgs'][0])
-    except: pass
-    try:
-        await update.message.delete()
+    try: await update.message.delete()
     except: pass
         
-    notif_msg = await update.message.reply_text(f"✅ Filtre '{key}' mis à jour: {value}", quote=False)
-    
     kb = _build_filter_menu_ccs(context)
-    m = await update.message.reply_text("Appliquez vos filtres et cliquez sur 'Search' :", reply_markup=kb)
-    context.user_data['ccs_filter_msgs'] = [m.message_id] 
+    txt = f"✅ **Filtre Ajouté (CCS)**\n{key.capitalize()} = `{value}`\n\nAppuyez sur **Search** pour lancer."
     
-    await asyncio.sleep(2)
-    try:
-        await notif_msg.delete()
-    except:
-        pass
+    edited = False
+    msg_ids = context.user_data.get('ccs_filter_msgs', [])
+    
+    if msg_ids:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=msg_ids[0],
+                text=txt,
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
+            edited = True
+        except: pass
+    
+    # LA SÉCURITÉ ICI AUSSI
+    if not edited:
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=txt,
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        context.user_data['ccs_filter_msgs'] = [m.message_id] 
     
     return CCS_FILTER_MAIN
 
@@ -7217,14 +7166,15 @@ catalog_filter_conv = ConversationHandler(
             CallbackQueryHandler(filter_select_type, pattern="^filter:(name|city|base|price|year)$"),
             CallbackQueryHandler(filter_search, pattern="^filter_search$"),
             CallbackQueryHandler(filter_reset, pattern="^filter_reset$"),
-            CallbackQueryHandler(filter_page_nav, pattern="^filter:page:\d+$"),
+            CallbackQueryHandler(filter_cancel, pattern="^filter_cancel$"),
+            # J'ai supprimé la ligne 'filter_page_nav' qui faisait planter
         ],
-        
-        CATALOG_FILTER_AWAIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value)],
+        CATALOG_FILTER_AWAIT_VALUE: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value)
+        ],
     },
     fallbacks=[CallbackQueryHandler(filter_cancel, pattern="^filter_cancel$")],
-    persistent=False,
-    allow_reentry=True # AJOUTÉ pour permettre de changer de filtre
+    allow_reentry=True
 )
 
 ccs_catalog_filter_conv = ConversationHandler(
