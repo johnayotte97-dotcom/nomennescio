@@ -1,52 +1,54 @@
-import re
-import base58
-from bip_utils import Bip32Secp256k1, P2WPKHAddr
-import sqlite3
-from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin as BTC
-import shop_helpers
-from telegram.ext import CallbackQueryHandler, CommandHandler
 import os
 import sys
 import io
+import re
 import csv
+import time
 import atexit
+import random
+import string
 import asyncio
 import logging
-logger = logging.getLogger("SYSTEM")
-import threading
-import time
-import requests
 import sqlite3
+import threading
 import subprocess
 from datetime import datetime
-import pytz
-from dotenv import load_dotenv
 
+# --- TIERCE PARTIES ---
+import pytz
+import base58
+import requests
+import sentry_sdk
+from dotenv import load_dotenv
+from mnemonic import Mnemonic
+from PIL import Image, ImageOps, ImageColor
+from bip_utils import Bip32Secp256k1, P2WPKHAddr
+from hdwallet import HDWallet
+from hdwallet.cryptocurrencies import Bitcoin as BTC
+from sentry_sdk.integrations.flask import FlaskIntegration
+
+# --- WEB & TÉLÉPHONIE ---
 from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
-from mnemonic import Mnemonic
-import tickets  # Importe notre nouveau fichier
-import random
-import string
-import sentry_sdk
-from sentry_sdk.integrations.flask import FlaskIntegration
-from PIL import Image, ImageOps, ImageColor
-import io
 
-
-
-
-
+# --- TELEGRAM (CORRIGÉ AVEC ApplicationBuilder) ---
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
+    Application, ApplicationBuilder,  # <--- L'AJOUT CRITIQUE EST ICI
+    CommandHandler, MessageHandler, filters,
     ConversationHandler, ContextTypes, CallbackQueryHandler,
     TypeHandler, ApplicationHandlerStop
 )
+
+# --- MODULES LOCAUX ---
+import tickets
+import shop_helpers
+
+# --- CONFIG LOGGING ---
+logger = logging.getLogger("SYSTEM")
 
 load_dotenv()
 
@@ -8761,9 +8763,7 @@ app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_
 app_telegram.add_handler(CallbackQueryHandler(menu_handler))
 
 
-# ====================================================
-#      FONCTION DE LANCEMENT DU BOT (THREAD SAFE)
-# ====================================================
+
 
 def run_bot_polling():
     global bot_loop
@@ -8778,7 +8778,8 @@ def run_bot_polling():
         bot_loop = loop 
         
         # 2. Construction de l'Application
-        app_telegram = ApplicationBuilder().token(TOKEN).build()
+        # CORRECTION ICI : Utilisation de TELEGRAM_TOKEN et Application.builder()
+        app_telegram = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
         # ====================================================
         # 3. ENREGISTREMENT DES HANDLERS (CÂBLAGE DES BOUTONS)
@@ -8817,9 +8818,33 @@ def run_bot_polling():
         app_telegram.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
         app_telegram.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
         app_telegram.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
+        
+        # G. Conversations Spécifiques
+        app_telegram.add_handler(admin_search_conv, group=8)
+        app_telegram.add_handler(admin_csv_conv, group=6)
+        app_telegram.add_handler(admin_ivr_conv, group=7)
+        app_telegram.add_handler(history_filter_conv, group=5)
+        app_telegram.add_handler(catalog_filter_conv)
+        app_telegram.add_handler(ccs_catalog_filter_conv)
+        app_telegram.add_handler(payment_conv)
+        app_telegram.add_handler(id_docs_conv)
+        app_telegram.add_handler(admin_ticket_conv, group=9)
 
-        # G. Handler de secours (boutons génériques)
-        app_telegram.add_handler(CallbackQueryHandler(button_handler))
+        # H. Handlers Boutique (Shop Helpers)
+        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
+        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
+        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
+        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
+        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
+        app_telegram.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
+        
+        # I. Gestion Pagination et Menu
+        app_telegram.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
+        app_telegram.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
+        app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
+        
+        # J. Handler générique (DOIT ÊTRE EN DERNIER)
+        app_telegram.add_handler(CallbackQueryHandler(menu_handler))
 
         # 4. Lancement du Job Queue (Tâches de fond)
         if app_telegram.job_queue:
@@ -8830,6 +8855,8 @@ def run_bot_polling():
 
     except Exception as e:
         print(f"❌ Erreur critique Bot: {e}")
+        import traceback
+        traceback.print_exc() # Affiche l'erreur exacte dans les logs Gunicorn
 
 # ====================================================
 #      DÉMARRAGE GLOBAL (DB + BOT + FLASK)
@@ -8866,18 +8893,17 @@ def start_everything():
     bot_thread.start()
     print("✅ SYSTÈME INITIALISÉ (Bot tourne en arrière-plan)")
 
+# Appel immédiat pour que Gunicorn lance le bot au chargement
+# ATTENTION : Avec Gunicorn, utilisez l'option --workers 1 sinon vous aurez des conflits Telegram !
+start_everything()
+
 # ====================================================
 #      POINT D'ENTRÉE PRINCIPAL
 # ====================================================
 
 if __name__ == "__main__":
-    # 1. On lance tout (DB + Bot)
-    start_everything()
-    
-    print("🌐 Démarrage du serveur Web Flask...")
+    print("🌐 Démarrage du serveur Web Flask (Mode Manuel)...")
     try:
-        # Flask prend le relais du thread principal
-        # use_reloader=False est important pour éviter de lancer le bot 2 fois
         app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
     except KeyboardInterrupt:
         print("🛑 Arrêt du système...")
