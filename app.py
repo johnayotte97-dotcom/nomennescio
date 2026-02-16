@@ -3,6 +3,7 @@ import sys
 import io
 import re
 import csv
+import json
 import time
 import atexit
 import random
@@ -13,7 +14,7 @@ import sqlite3
 import threading
 import subprocess
 from datetime import datetime
-
+import tickets
 # --- TIERCE PARTIES ---
 import pytz
 import base58
@@ -26,6 +27,7 @@ from bip_utils import Bip32Secp256k1, P2WPKHAddr
 from hdwallet import HDWallet
 from hdwallet.cryptocurrencies import Bitcoin as BTC
 from sentry_sdk.integrations.flask import FlaskIntegration
+
 
 # --- WEB & TÉLÉPHONIE ---
 from flask import Flask, request, Response
@@ -42,10 +44,10 @@ from telegram.ext import (
     ConversationHandler, ContextTypes, CallbackQueryHandler,
     TypeHandler, ApplicationHandlerStop
 )
-
+from typing import Dict, Any, List, Tuple
 # --- MODULES LOCAUX ---
-import tickets
-import shop_helpers
+
+
 
 # --- CONFIG LOGGING ---
 logger = logging.getLogger("SYSTEM")
@@ -91,7 +93,217 @@ else:
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
 
 
+def _coerce_price(raw) -> float:
+    if raw is None: return 0.0
+    try: return float(str(raw).replace(',', '.').replace('$', '').strip())
+    except: return 0.0
 
+def _mask_first(name: str) -> str:
+    if not name: return "***"
+    f = name.strip().split()[0]
+    return (f[:1] + "***") if f else "***"
+
+def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "first": "", "last": "", "dob": "N/A", "address": "N/A", "city": "N/A",
+        "postal": "", "email": "", "phone": "", "sin": "", "dl": "", 
+        "password": "", "base": "N/A", "price": 0.0, "all_data": {}
+    }
+    
+    content = (p.get("content") or "").strip()
+    
+    parsed_content = {}
+    for line in content.splitlines():
+        if ":" in line:
+            # On sépare la clé et la valeur
+            parts = line.split(":", 1)
+            # 🧹 NETTOYAGE : On enlève les émojis et on met en MAJUSCULES
+            raw_key = parts[0].strip()
+            clean_key = re.sub(r'[^\w\s]', '', raw_key).strip().upper() 
+            val = parts[1].strip()
+            parsed_content[clean_key] = val
+
+    out["all_data"] = parsed_content 
+
+    # --- MAPPING BASÉ SUR TES RÉSULTATS DB ---
+    out["first"] = parsed_content.get("NOM") or p.get("firstname") or ""
+    out["sin"] = parsed_content.get("SIN") or parsed_content.get("NAS") or ""
+    out["phone"] = parsed_content.get("TEL") or parsed_content.get("PHONE") or ""
+    out["dob"] = parsed_content.get("DOB") or parsed_content.get("DATE") or "N/A"
+    out["address"] = parsed_content.get("ADR") or parsed_content.get("ADDRESS") or "N/A"
+    out["city"] = parsed_content.get("VILLE") or p.get("city") or "N/A"
+    
+    # Technique
+    out["base"] = p.get("tier") or parsed_content.get("BASE") or "propro"
+    out["price"] = _coerce_price(p.get("price")) or 0.72
+    
+    return out
+
+def full_product_text(p: Dict[str, Any]) -> str:
+    f = _parse_product_fields(p)
+    
+    lines = [
+        "✅ **ACHAT RÉUSSI (LIVRAISON)**",
+        "━━━━━━━━━━━━━━━━━━",
+        f"👤 **NOM COMPLET**: `{f['first']}`",
+        f"🎂 **DATE DE NAISSANCE**: `{f['dob']}`",
+        f"🧾 **SIN (NAS)**: `{f['sin'] or 'Non disponible'}`",
+        f"📞 **TÉLÉPHONE**: `{f['phone'] or 'Non disponible'}`",
+        f"🏠 **ADRESSE**: `{f['address']}`",
+        f"🏙️ **VILLE**: `{f['city']}`",
+        "━━━━━━━━━━━━━━━━━━",
+        f"💰 **PRIX**: `{f['price']:.2f} USD`",
+        f"📂 **CATÉGORIE**: `PROPRO`"
+    ]
+    
+    # On ajoute les champs bonus s'ils existent (ex: LANGUE)
+    if "LANGUE" in f["all_data"]:
+        lines.insert(8, f"🗣️ **LANGUE**: `{f['all_data']['LANGUE']}`")
+
+    return "\n".join(lines)
+
+async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    try:
+        pid = int(q.data.split(":")[-1])
+        user_id = str(update.effective_user.id)
+        db = context.bot_data.get("db_conn")
+        c = db.cursor()
+
+        c.execute("SELECT * FROM products WHERE id=?", (pid,))
+        row = c.fetchone()
+        if not row: return await q.message.reply_text("❌ Produit introuvable.")
+
+        colnames = [d[0] for d in c.description]
+        prod = dict(zip(colnames, row))
+        parsed = _parse_product_fields(prod)
+        prod.update(parsed)
+
+        price = prod["price"]
+        balance = get_user_balance(user_id)
+
+        if balance < price:
+            return await q.message.reply_text(f"⚠️ Solde insuffisant ({balance:.2f} USD).")
+
+        # Débit et Log
+        update_user_balance(user_id, -price)
+        c.execute("INSERT INTO purchases (user_id, product_id, price, full_data, status, title, amount) VALUES (?,?,?,?,'paid',?,?)",
+                  (user_id, pid, price, json.dumps(prod), prod.get("title"), price))
+        c.execute("UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0", (pid,))
+        db.commit()
+
+        details = full_product_text(prod)
+        await q.message.delete()
+        sent = await context.bot.send_message(chat_id=update.effective_chat.id, 
+                                              text=f"✅ **ACHAT RÉUSSI**\n_Fiche visible 60s_\n\n{details}", 
+                                              parse_mode="Markdown")
+        
+        async def _del(m):
+            await asyncio.sleep(60)
+            try: await m.delete()
+            except: pass
+        asyncio.create_task(_del(sent))
+
+    except Exception as e:
+        logger.error(f"Buy Error: {e}")
+        await q.message.reply_text("❌ Erreur lors de la transaction.")
+
+async def cart_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    pid = int(q.data.split(":")[-1])
+    user_id = str(update.effective_user.id)
+    db = context.bot_data["db_conn"]
+    c = db.cursor()
+    c.execute("INSERT INTO cart_items (user_id, product_id, qty) VALUES (?,?,1)", (user_id, pid))
+    db.commit()
+    await q.answer("✅ Ajouté au panier (USD) !")
+
+async def cart_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user_id = str(update.effective_user.id)
+    db = context.bot_data["db_conn"]
+    c = db.cursor()
+    c.execute("SELECT p.*, ci.qty FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE ci.user_id=?", (user_id,))
+    rows = c.fetchall()
+    if not rows: return await q.message.reply_text("🛒 Votre panier est vide.")
+    
+    total = 0.0
+    colnames = [d[0] for d in c.description]
+    for row in rows:
+        p = dict(zip(colnames[:-1], row[:-1]))
+        f = _parse_product_fields(p)
+        total += f['price']
+        await context.bot.send_message(chat_id=user_id, text=f"📦 {f['first_up']} - {f['price']:.2f} USD",
+                                       reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Payer", callback_data=f"buy:{p['id']}")]]))
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"🛍️ TOUT PAYER ({total:.2f} USD)", callback_data="cart:checkout")],
+                               [InlineKeyboardButton("🧹 Vider", callback_data="cart:clear")]])
+    await context.bot.send_message(chat_id=user_id, text=f"🧾 **TOTAL : {total:.2f} USD**", reply_markup=kb, parse_mode="Markdown")
+
+async def cart_clear_callback(update, context):
+    db = context.bot_data["db_conn"]
+    db.execute("DELETE FROM cart_items WHERE user_id=?", (str(update.effective_user.id),))
+    db.commit()
+    await update.callback_query.edit_message_text("🧹 Panier vidé.")
+
+async def cart_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le paiement global du panier."""
+    q = update.callback_query
+    await q.answer()
+    
+    user_id = str(update.effective_user.id)
+    db = context.bot_data["db_conn"]
+    c = db.cursor()
+    
+    # 1. Récupérer les items du panier
+    c.execute("SELECT p.*, ci.qty FROM cart_items ci JOIN products p ON p.id=ci.product_id WHERE ci.user_id=?", (user_id,))
+    rows = c.fetchall()
+    
+    if not rows:
+        return await q.message.reply_text("🛒 Votre panier est vide.")
+
+    # 2. Calculer le total
+    total = 0.0
+    colnames = [d[0] for d in c.description]
+    items_to_buy = []
+    for row in rows:
+        prod = dict(zip(colnames[:-1], row[:-1]))
+        qty = row[-1]
+        price = _coerce_price(prod.get("price"))
+        total += price * qty
+        items_to_buy.append((prod, qty, price))
+
+    # 3. Vérifier le solde
+    balance = get_user_balance(user_id)
+    if balance < total:
+        return await q.message.reply_text(f"⚠️ Solde insuffisant ({balance:.2f} USD / Requis: {total:.2f} USD).")
+
+    # 4. Traiter l'achat pour chaque item
+    update_user_balance(user_id, -total)
+    for prod, qty, price in items_to_buy:
+        pid = prod['id']
+        # Enregistrer l'achat
+        c.execute("INSERT INTO purchases (user_id, product_id, price, full_data, status, title, amount) VALUES (?,?,?,?,'paid',?,?)",
+                  (user_id, pid, price, json.dumps(prod), prod.get("title"), price))
+        # Décrémenter le stock
+        c.execute("UPDATE products SET stock = stock - ? WHERE id=? AND stock >= ?", (qty, pid, qty))
+    
+    # 5. Vider le panier et confirmer
+    c.execute("DELETE FROM cart_items WHERE user_id=?", (user_id,))
+    db.commit()
+
+    await q.message.edit_text(f"✅ **PAIEMENT RÉUSSI !**\nTotal débité : `{total:.2f} USD`.\n\nConsultez votre historique pour voir vos produits.", parse_mode="Markdown")
+
+async def handle_view_callback(update, context):
+    q = update.callback_query
+    pid = int(q.data.split(":")[-1])
+    db = context.bot_data["db_conn"]
+    row = db.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+    if row:
+        colnames = [d[0] for d in db.execute("SELECT * FROM products LIMIT 1").description]
+        await q.message.reply_text(full_product_text(dict(zip(colnames, row))), parse_mode="Markdown")
 
 def generate_ref_number():
     """Génère un numéro de référence au format standard (ex: R4MV-5A2B)"""
@@ -1105,16 +1317,15 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     chat_id = query.message.chat_id if query else update.effective_chat.id
     user_id = str(update.effective_user.id)
     
-    # ✅ FIX RETOUR : On marque qu'on est dans les Pro's
     context.user_data['cart_return_to'] = "cat:propro"
     
-    # 1. Message de chargement
+    # 1. Message de chargement (Minimaliste pour la rapidité)
     loading_msg = None
-    try:
-        loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
-    except: pass
+    if not from_filter:
+        try: loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
+        except: pass
 
-    # 2. Nettoyage
+    # 2. Nettoyage (Batch intelligent)
     if query:
         try: await query.answer()
         except: pass
@@ -1122,110 +1333,80 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
             try: await context.bot.delete_message(chat_id=chat_id, message_id=query.message.message_id)
             except: pass
 
-    try:
-        msgs_to_del = []
-        if from_filter:
-            msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
-            msgs_to_del += context.user_data.pop("filter_msgs", [])
-        else:
-            msgs_to_del += CATALOG_MSGS.pop(chat_id, [])
-            msgs_to_del += context.user_data.pop("filter_msgs", [])
-        
+    # Nettoyage des messages précédents
+    msgs_to_del = context.user_data.pop("filter_fiches_msg_ids", []) if from_filter else CATALOG_MSGS.pop(chat_id, [])
+    msgs_to_del += context.user_data.pop("filter_msgs", [])
+    
+    if msgs_to_del:
         for mid in set(msgs_to_del):
             try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
             except: pass
-    except: pass
 
-    # 3. REQUÊTE SQL
+    # 3. REQUÊTE SQL TURBO
     try:
-        # a. Pagination
-        try:
-            con_pg = sqlite3.connect(DB_NAME)
-            cur_pg = con_pg.cursor()
-            cur_pg.execute("SELECT pagination FROM users WHERE telegram_id=?", (user_id,))
-            row_pg = cur_pg.fetchone()
-            con_pg.close()
-            PER_PAGE = int(row_pg[0]) if row_pg and row_pg[0] else 2
-        except:
-            PER_PAGE = 2
+        # a. Pagination utilisateur
+        PER_PAGE = get_user_pagination(user_id)
 
-        # b. Filtres & SQL
-        filters = context.user_data.get('active_filters', {})
-        sql = "SELECT * FROM products WHERE category='propro' AND is_active=1 AND stock > 0"
+        # b. Construction de la requête optimisée
+        # On définit d'abord la base du WHERE pour profiter de l'index (category, is_active, stock)
+        where_clause = "WHERE category='propro' AND is_active=1 AND stock > 0"
         params = []
 
-        if tier:
-            sql += " AND tier=?"
-            params.append(tier)
-        
+        filters = context.user_data.get('active_filters', {})
         if filters.get('city'):
-            sql += " AND city LIKE ?"
+            where_clause += " AND city LIKE ?"
             params.append(f"%{filters['city']}%")
         if filters.get('year'):
-            sql += " AND (title LIKE ? OR content LIKE ?)"
-            yr = filters['year']
-            params.append(f"%{yr}%")
-            params.append(f"%{yr}%")
-        
+            where_clause += " AND year = ?"
+            params.append(filters['year'])
+        if tier:
+            where_clause += " AND tier = ?"
+            params.append(tier)
+
         con = sqlite3.connect(DB_NAME)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
         
-        cur.execute(f"SELECT count(*) FROM ({sql})", params)
+        # --- OPTIMISATION : COUNT RAPIDE ---
+        # Si on n'a pas de filtres complexes, on peut utiliser une estimation ou limiter le scan
+        cur.execute(f"SELECT COUNT(id) FROM products {where_clause}", params)
         total_items = cur.fetchone()[0]
 
-        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
-        params.append(PER_PAGE)
-        params.append(page * PER_PAGE)
-        
-        cur.execute(sql, params)
+        # --- RÉCUPÉRATION DATA ---
+        # L'utilisation de l'INDEX sur l'ID DESC rend cette requête quasi-instantanée
+        query_sql = f"SELECT * FROM products {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
+        cur.execute(query_sql, params + [PER_PAGE, page * PER_PAGE])
         chunk = [dict(row) for row in cur.fetchall()]
         con.close()
 
     except Exception as e:
-        if loading_msg:
-            try: await loading_msg.edit_text(f"⚠️ Erreur SQL: {e}")
-            except: pass
+        logger.error(f"SQL Error: {e}")
+        if loading_msg: await loading_msg.edit_text("⚠️ Erreur technique.")
         return
 
-    # 4. Suppression du chargement
     if loading_msg:
         try: await loading_msg.delete()
         except: pass
 
-    # 5. Gestion Page Vide
+    # 5. Calcul des pages
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     page = max(0, min(page, total_pages - 1))
     sent_ids = []
 
+    # 6. Affichage des Produits (Plus rapide avec f-strings pré-calculées)
     if not chunk:
-        text = "❌ Aucun produit trouvé."
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]])
-        m = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        m = await context.bot.send_message(chat_id=chat_id, text="❌ Aucun produit trouvé.", reply_markup=kb_back_to_menu())
         if from_filter: context.user_data['filter_msgs'] = [m.message_id]
         else: CATALOG_MSGS[chat_id] = [m.message_id]
         return
 
-    # 6. Affichage des Produits
     for p in chunk:
-        raw_title = str(p.get('title', 'Unknown')).replace("*", "").replace("`", "")
-        name = raw_title.split('•')[0].strip()
-        city = str(p.get('city', 'N/A')).replace("*", "")
-        year = str(p.get('year', ''))
-        if not year or year == 'N/A':
-            parts = raw_title.split('•')
-            year = parts[1].strip() if len(parts) > 1 else "N/A"
-            
-        base = str(p.get('tier', 'N/A')).replace("*", "")
-        try: price = float(p.get('price', 0.0))
-        except: price = 0.0
-        
         txt = (
-            f"👤 **NOM** : `{name}`\n"
-            f"🏙️ **VILLE** : `{city}`\n"
-            f"📅 **ANNÉE** : `{year}`\n"
-            f"📂 **BASE** : `{base}`\n"
-            f"💰 **PRIX** : `{price:.2f} USD`"
+            f"👤 **NOM** : `{p['title'].split('•')[0].strip()}`\n"
+            f"🏙️ **VILLE** : `{p.get('city', 'N/A')}`\n"
+            f"📅 **ANNÉE** : `{p.get('year', 'N/A')}`\n"
+            f"📂 **BASE** : `{p.get('tier', 'N/A')}`\n"
+            f"💰 **PRIX** : `{p['price']:.2f} USD`"
         )
         
         kb = InlineKeyboardMarkup([[
@@ -1236,48 +1417,33 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         try:
             m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
             sent_ids.append(m.message_id)
-        except: 
-            try:
-                m = await context.bot.send_message(chat_id=chat_id, text=txt.replace('*','').replace('`',''), reply_markup=kb)
-                sent_ids.append(m.message_id)
-            except: pass
+        except: pass
 
-    # 7. Menu Navigation
-    try:
-        con_cart = sqlite3.connect(DB_NAME)
-        cur_cart = con_cart.cursor()
-        cur_cart.execute("SELECT count(*) FROM cart_items WHERE user_id=?", (user_id,))
-        cart_count = cur_cart.fetchone()[0]
-        con_cart.close()
-    except:
-        cart_count = 0
+    # 7. Menu Navigation (Récupération simplifiée du panier)
+    con = sqlite3.connect(DB_NAME)
+    cart_count = con.execute("SELECT count(*) FROM cart_items WHERE user_id=?", (user_id,)).fetchone()[0]
+    con.close()
 
-    kb_rows = []
-    if cart_count > 0:
-        kb_rows.append([InlineKeyboardButton(f"🧺 Voir Panier ({cart_count})", callback_data="cart:view")])
-
-    kb_rows.append([
-        InlineKeyboardButton("🔎 Filter", callback_data="filter_open"),
-        InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")
-    ])
-    kb_rows.append([
+    nav_row = [
         InlineKeyboardButton("«", callback_data=f"prod:page:{max(0, page-1)}"), 
         InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), 
         InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")
-    ])
-    kb_rows.append([InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")])
+    ]
 
-    kb = InlineKeyboardMarkup(kb_rows)
+    kb_final = []
+    if cart_count > 0:
+        kb_final.append([InlineKeyboardButton(f"🧺 Voir Panier ({cart_count})", callback_data="cart:view")])
+    kb_final.append([InlineKeyboardButton("🔎 Filter", callback_data="filter_open"), InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")])
+    kb_final.append(nav_row)
+    kb_final.append([InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")])
 
-    navigation_text = "🔻 Menu de Navigation 🔻" 
+    m = await context.bot.send_message(chat_id=chat_id, text="🔻 **Navigation** 🔻", reply_markup=InlineKeyboardMarkup(kb_final))
+    sent_ids.append(m.message_id)
     
     if from_filter:
         context.user_data['filter_fiches_msg_ids'] = sent_ids
-        m = await context.bot.send_message(chat_id=chat_id, text=navigation_text, reply_markup=kb)
         context.user_data['filter_msgs'] = [m.message_id]
     else:
-        m = await context.bot.send_message(chat_id=chat_id, text=navigation_text, reply_markup=kb)
-        sent_ids.append(m.message_id)
         CATALOG_MSGS[chat_id] = sent_ids
 
         
@@ -1370,45 +1536,37 @@ async def filter_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return CATALOG_FILTER_AWAIT_VALUE
 
 async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Réception de la valeur du filtre (Année, Prix, etc.) avec sécurité anti-crash."""
     try:
-        # 1. Vérification de la clé
         key = context.user_data.get('current_filter_key')
         if not key:
-            # Si la clé est perdue (ex: redémarrage), on renvoie au menu principal proprement
-            kb = _build_filter_menu(context)
-            await update.message.reply_text("⚠️ Session expirée. Refaites votre choix.", reply_markup=kb)
             return CATALOG_FILTER_MAIN
             
-        # 2. Nettoyage de la valeur
         value = update.message.text.strip()
+        # On enregistre la valeur (ex: name = Mohammed)
         context.user_data.setdefault('pending_filters', {})[key] = value
         
-
-        try:
-            prev_msg_id = context.user_data.get('filter_msgs', [])[0]
-            await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        # Nettoyage des messages
+        try: await update.message.delete()
         except: pass
         
-        try:
-            await update.message.delete()
-        except: pass
-            
-
-        
+        # On réaffiche le menu de filtre avec le bouton "SEARCH"
         kb = _build_filter_menu(context)
-        m = await update.message.reply_text("Filtres appliqués. Cliquez sur 'Search' :", reply_markup=kb)
-        context.user_data['filter_msgs'] = [m.message_id] # Mise à jour de l'ID
         
-        # 6. Nettoyage de la clé temporaire
-        context.user_data.pop('current_filter_key', None)
+        # On édite le message de question précédent
+        prompt_id = context.user_data.get('filter_msgs', [None])[0]
+        if prompt_id:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=prompt_id,
+                text=f"✅ Filtre ajouté : `{key}={value}`\nAppuyez sur **Search** pour voir les résultats.",
+                reply_markup=kb,
+                parse_mode="Markdown"
+            )
         
-        return CATALOG_FILTER_MAIN
+        return CATALOG_FILTER_MAIN # On retourne à l'état principal du filtre
 
     except Exception as e:
-        # AIRBAG : Si ça plante, on te le dit !
-        print(f"[CRASH FILTER] {e}")
-        await update.message.reply_text(f"🔥 Erreur dans le filtre : {e}")
+        print(f"Error in filter_receive: {e}")
         return CATALOG_FILTER_MAIN
 
 # Petite fonction utilitaire pour supprimer sans bloquer
@@ -1471,15 +1629,24 @@ async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return CATALOG_FILTER_MAIN # On reste dans la conversation
 
 async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Annule le filtre et recharge le catalogue."""
+    """Annule le filtre et force la fin de la conversation."""
     q = update.callback_query
-    await q.answer()
+    await q.answer("Filtre annulé.")
     
-
+    # On nettoie les données temporaires
     context.user_data.pop('pending_filters', None)
-    context.user_data.pop('active_filters', None)
- 
-    await show_products(update, context, page=0, tier=None, from_filter=False) # from_filter=False pour recharger
+    context.user_data.pop('current_filter_key', None)
+    
+    # Supprimer le menu de filtre pour ne pas laisser de boutons morts
+    try:
+        await q.message.delete()
+    except:
+        pass
+
+    # Affiche le catalogue normal (page 0)
+    await show_products(update, context, page=0, tier=None, from_filter=False)
+    
+    # --- LE PLUS IMPORTANT ---
     return ConversationHandler.END
 
 
@@ -2532,7 +2699,6 @@ async def show_ids_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche l'historique des produits achetés, avec pagination ET FILTRE."""
-    from shop_helpers import full_product_text
     import json
 
     q = update.callback_query
@@ -4065,7 +4231,6 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========================== ADMIN: PRODUITS PROPRO ==========================
 def _get_db_from_context(context):
-    # db_conn a été déposé dans bot_data au démarrage (shop_helpers.ensure_shop_tables)
     return context.application.bot_data.get('db_conn')
 
 def _guess_columns(cur):
@@ -5742,35 +5907,25 @@ def analyze_response():
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     
-    # --- RÉPONSE IMMÉDIATE POUR ÉVITER LE TIMEOUT ---
-    try:
-        await q.answer()
-    except Exception:
-        # Si la query est déjà expirée (plus de 30s), on ignore l'erreur et on continue
-        pass
+    # Réponse immédiate
+    try: await q.answer()
+    except: pass
 
-    # --- DEBUT DU MOUCHARD ---
-    import os
-    pid = os.getpid()
-    query_data = q.data
-    user_id = update.effective_user.id
-    print(f"\n[ESPION] 🕵️ REÇU callback: '{query_data}' | User: {user_id} | PID Processus: {pid}", flush=True)
-    # --- FIN DU MOUCHARD ---
-
-    print(f"[DBG] menu_handler triggered with data={q.data}", flush=True)
     data = q.data
+    user_id = update.effective_user.id
+    print(f"[DBG] menu_handler triggered with data={data}", flush=True)
 
-    # --- LOGIQUE DE RETOUR PANIER ---
+    # --- LOGIQUE DE RETOUR / ACCUEIL ---
     if data == "menu_accueil":
         context.user_data['cart_return_to'] = "menu_accueil"
         return await goto_menu(update, context)
 
-    # --- SECTION HISTORIQUE (MENU) ---
+    # --- SECTION HISTORIQUE (Navigation & Affichage) ---
     if data == "hist:view":
         return await hist_view_callback(update, context)
 
-    # --- SOUS-SECTIONS HISTORIQUE (UX) ---
-    if data == "hist:pros":
+    # AJOUT ICI : Gestion des flèches de l'historique Pro's
+    if data.startswith("hist:pros"):
         return await hist_pros(update, context)
 
     if data == "hist:permis":
@@ -5779,20 +5934,18 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "hist:ids":
         return await show_ids_history(update, context)
 
-    # --- SECTION PRO'S (BOUTIQUE) ---
+    # --- SECTION BOUTIQUE (PROPRO) ---
     if data == "propro" or data == "cat:propro":
         context.user_data["prod_tier"] = None
         context.user_data['cart_return_to'] = "cat:propro"
         return await show_products(update, context, page=0, tier=None)
 
-    # --- PAGINATION PRO'S ---
     if data.startswith("prod:page:"):
         page = int(data.split(":")[2])
         tier = context.user_data.get("prod_tier")
-        context.user_data['cart_return_to'] = "cat:propro"
         return await show_products(update, context, page=page, tier=tier)
 
-    # --- SECTION CCS ---
+    # --- SECTION BOUTIQUE (CCS) ---
     if data.startswith("ccs:page:"):
         page = int(data.split(":")[2])
         tier = context.user_data.get("prod_tier")
@@ -7066,10 +7219,12 @@ catalog_filter_conv = ConversationHandler(
             CallbackQueryHandler(filter_reset, pattern="^filter_reset$"),
             CallbackQueryHandler(filter_page_nav, pattern="^filter:page:\d+$"),
         ],
+        
         CATALOG_FILTER_AWAIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, filter_receive_value)],
     },
     fallbacks=[CallbackQueryHandler(filter_cancel, pattern="^filter_cancel$")],
-    persistent=False
+    persistent=False,
+    allow_reentry=True # AJOUTÉ pour permettre de changer de filtre
 )
 
 ccs_catalog_filter_conv = ConversationHandler(
@@ -8693,22 +8848,21 @@ conv_handler = ConversationHandler(
 
 def setup_all_handlers(application):
     """
-    Enregistre tous les handlers sur l'instance active du bot.
-    L'ordre est CRUCIAL pour éviter les conflits.
+    Enregistre tous les handlers. 
+    NOTE : On a enlevé 'shop_helpers.' devant car les fonctions sont maintenant ICI.
     """
-    # -- A. SÉCURITÉ (Group -1) --
+    # -- A. SÉCURITÉ --
     application.add_handler(TypeHandler(Update, enforcement_handler), group=-1)
 
-    # -- B. BOUTIQUE (Priorité haute pour le paiement) --
-    # Supporte 'buy:' et 'buynow:' pour tes fiches importées
-    application.add_handler(CallbackQueryHandler(shop_helpers.handle_buy_callback, pattern=r"^buy:\d+$"))
-    application.add_handler(CallbackQueryHandler(shop_helpers.cart_add_callback, pattern=r"^cart:add:\d+$"))
-    application.add_handler(CallbackQueryHandler(shop_helpers.handle_view_callback, pattern=r"^prod:view:\d+$"))
-    application.add_handler(CallbackQueryHandler(shop_helpers.cart_view_callback, pattern=r"^cart:view$"))
-    application.add_handler(CallbackQueryHandler(shop_helpers.cart_clear_callback, pattern=r"^cart:clear$"))
-    application.add_handler(CallbackQueryHandler(shop_helpers.cart_checkout_callback, pattern=r"^cart:checkout$"))
+    # -- B. BOUTIQUE (Intégré dans app.py) --
+    application.add_handler(CallbackQueryHandler(handle_buy_callback, pattern=r"^buy:\d+$"))
+    application.add_handler(CallbackQueryHandler(cart_add_callback, pattern=r"^cart:add:\d+$"))
+    application.add_handler(CallbackQueryHandler(handle_view_callback, pattern=r"^prod:view:\d+$"))
+    application.add_handler(CallbackQueryHandler(cart_view_callback, pattern=r"^cart:view$"))
+    application.add_handler(CallbackQueryHandler(cart_clear_callback, pattern=r"^cart:clear$"))
+    application.add_handler(CallbackQueryHandler(cart_checkout_callback, pattern=r"^cart:checkout$"))
 
-    # -- C. ADMIN (Tickets, Users, Produits) --
+    # -- C. ADMIN --
     application.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     application.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     application.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
@@ -8729,7 +8883,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_prod_add_start, pattern="^admin_prod_add$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_prod_add_receive))
 
-    # -- D. DIVERS ADMIN (Logistique, IVR, Reboot) --
+    # -- D. DIVERS --
     application.add_handler(CallbackQueryHandler(admin_all_orders_list, pattern="^admin_all_orders$"))
     application.add_handler(CallbackQueryHandler(admin_view_order_detail, pattern="^adm_ord_view_"))
     application.add_handler(CallbackQueryHandler(admin_repost_to_channel, pattern="^adm_repost_"))
@@ -8737,7 +8891,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
     application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
 
-    # -- E. CONVERSATIONS COMPLEXES (Filtres, Paiements, CSV) --
+    # -- E. CONVERSATIONS --
     application.add_handler(admin_search_conv, group=8)
     application.add_handler(admin_csv_conv, group=6)
     application.add_handler(admin_ivr_conv, group=7)
@@ -8747,14 +8901,14 @@ def setup_all_handlers(application):
     application.add_handler(payment_conv)
     application.add_handler(id_docs_conv)
     application.add_handler(admin_ticket_conv, group=9)
-    application.add_handler(conv_handler) # Menu principal
+    application.add_handler(conv_handler)
 
-    # -- F. PAGINATION (Réglage vue) --
+    # -- F. VUE --
     application.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
     application.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
 
-    # -- G. HANDLER GÉNÉRIQUE (En dernier) --
+    # -- G. GÉNÉRIQUE --
     application.add_handler(CallbackQueryHandler(menu_handler))
 
 # ====================================================
@@ -8776,6 +8930,10 @@ async def set_pg_callback(update, context):
     await show_products(update, context, page=0)
 
 async def custom_pg_receive(update, context):
+    # Sécurité : Si pas d'utilisateur, on ignore
+    if not update.effective_user:
+        return
+        
     user_id = update.effective_user.id
     if USER_STATES.get(user_id) == "waiting_pagination_custom":
         try:
@@ -8833,14 +8991,12 @@ def run_bot_polling():
 def start_everything():
     print("📦 Préparation DB...")
     try:
-        db_conn = sqlite3.connect(DB_NAME, check_same_thread=False)
         init_db() 
-        shop_helpers.ensure_shop_tables(db_conn)
         tickets.patch_db_tickets()
         ensure_verifications_table()
         ensure_payment_table()
-        db_conn.close()
-    except: pass
+    except Exception as e:
+        print(f"⚠️ Erreur DB au démarrage: {e}")
 
     bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
     bot_thread.start()
