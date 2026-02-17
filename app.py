@@ -5193,27 +5193,23 @@ async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Déclenche l'écoute du montant pour l'admin de façon robuste."""
     q = update.callback_query
     await q.answer()
 
-    # 1. Extraction propre de l'ID cible
+    # Extraction de l'ID depuis le bouton (admin_customamount_12345)
     target_id = q.data.split("_")[-1]
     
-    # 2. Sécurisation des données en session
+    # Sécurisation des variables
     context.user_data["SOLDE_TARGET_ID"] = target_id
     context.user_data["target_user"] = target_id 
     context.user_data["SOLDE_EDIT_MODE"] = True   
 
-    # 3. NETTOYAGE VISUEL (On supprime le vieux menu pour éviter l'erreur "Not Modified")
-    try:
-        await q.message.delete()
-    except:
-        pass
+    # On supprime l'ancien message pour éviter les bugs d'affichage
+    try: await q.message.delete()
+    except: pass
 
-    # 4. ENVOI DU NOUVEAU MESSAGE (Plus de crash BadRequest possible)
     kb = [[InlineKeyboardButton("🔙 Annuler", callback_data=f"admin_adjust_{target_id}")]]
-    
+
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=f"✍️ **MODIFICATION SOLDE**\n"
@@ -5226,7 +5222,7 @@ async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT
     
     context.user_data['prompt_msg_id'] = msg.message_id
     
-    # On retourne l'état 1 pour que le prochain message (+30) soit capté par l'admin
+    # 🔥 IMPORTANT : On renvoie "1" pour activer le filtre Regex dans admin_search_conv
     return 1
 
 
@@ -7282,17 +7278,22 @@ async def admin_prod_add_start_dummy(u,c): pass
 
 
 # 3. AUTRES CONVERSATIONS (ADMIN, PAIEMENT, FILTRES)
+# --- À REMPLACER COMPLÈTEMENT DANS APP.PY ---
 admin_search_conv = ConversationHandler(
     entry_points=[
+        # 1. Entrée par recherche d'ID
         CallbackQueryHandler(admin_search_user_start, pattern="^admin_search_user_start$"),
+        
+        # 2. 🔥 ENTREE CRUCIALE AJOUTÉE ICI 🔥
+        # C'est ça qui manquait : le bouton "Modifier solde" déclenche l'écoute
         CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_")
     ],
-    states={ 
-        # État recherche d'ID
+    states={
+        # État A : Recherche ID
         ADMIN_WAIT_SEARCH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_user_receive)],
         
-        # État attente du montant (L'état "1" retourné au dessus)
-        1: [MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive)] 
+        # État B : Attente du montant (L'état "1")
+        1: [MessageHandler(filters.Regex(r"^-?\d+([.,]\d+)?$"), admin_customamount_receive)]
     },
     fallbacks=[
         CallbackQueryHandler(admin_users, pattern="^admin_users"),
@@ -8987,7 +8988,6 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
     application.add_handler(CallbackQueryHandler(admin_users, pattern="^admin_users"))
     application.add_handler(CallbackQueryHandler(admin_adjust_user, pattern="^admin_adjust_"))
-    application.add_handler(CallbackQueryHandler(admin_customamount_start, pattern="^admin_customamount_"))
     application.add_handler(CallbackQueryHandler(admin_setstatut, pattern="^admin_setstatut"))
     application.add_handler(CallbackQueryHandler(admin_userstatut, pattern="^admin_userstatut_"))
     application.add_handler(CallbackQueryHandler(admin_setstatut_final, pattern="^admin_statut_"))
@@ -9058,9 +9058,6 @@ async def custom_pg_receive(update, context):
         except: 
             await update.message.reply_text("⚠️ Invalide.")
 
-# ====================================================
-#      3. LANCEMENT DU BOT (POLLING)
-# ====================================================
 
 def run_bot_polling():
     global bot_loop, app_telegram
@@ -9097,6 +9094,27 @@ def run_bot_polling():
 #      4. INITIALISATION ET DÉMARRAGE
 # ====================================================
 
+def check_and_restore_default_ids():
+    """Force l'apparition des produits QC/ON dans Physical ID."""
+    try:
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        cur.execute("SELECT count(*) FROM products WHERE category='physical'")
+        if cur.fetchone()[0] == 0:
+            print("⚠️ Restauration des produits Physical ID...")
+            prods = [
+                ('physical', 'Quebec Driver License (Full)', 150.0, 'USD', 999, 'QC', 1, 'BASE: QC'),
+                ('physical', 'Ontario Driver License', 150.0, 'USD', 999, 'ON', 1, 'BASE: ON')
+            ]
+            cur.executemany("""
+                INSERT INTO products (category, title, price, currency, stock, tier, is_active, content)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", prods)
+            con.commit()
+            print("✅ Produits Physical ID restaurés.")
+        con.close()
+    except Exception as e:
+        print(f"⚠️ Erreur restauration : {e}")
+
 def start_everything():
     print("📦 Préparation DB...")
     try:
@@ -9104,6 +9122,10 @@ def start_everything():
         tickets.patch_db_tickets()
         ensure_verifications_table()
         ensure_payment_table()
+        
+        # 🔥 AJOUT CRITIQUE ICI
+        check_and_restore_default_ids()
+        
     except Exception as e:
         print(f"⚠️ Erreur DB au démarrage: {e}")
 
@@ -9111,7 +9133,7 @@ def start_everything():
     bot_thread.start()
     print("🚀 SYSTÈME PRÊT")
 
-start_everything()
-
 if __name__ == "__main__":
+    start_everything()
+    # Lancement du serveur Web pour l'IVR
     app.run(host="0.0.0.0", port=5001, debug=False, use_reloader=False)
