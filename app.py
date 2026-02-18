@@ -3679,12 +3679,10 @@ SIM_API_KEY = os.environ.get("SIM_API_KEY")
 
 # --- Configuration des prix (Marge incluse) ---
 SMS_CATALOG = {
-    "whatsapp": {"price": 2.50, "label": "WhatsApp", "5sim_product": "whatsapp"},
-    "telegram": {"price": 2.50, "label": "Telegram", "5sim_product": "telegram"},
-    "google":   {"price": 2.00, "label": "Google/Gmail", "5sim_product": "google"},
-    "uber":     {"price": 2.00, "label": "Uber", "5sim_product": "uber"},
-    "tinder":   {"price": 2.00, "label": "Tinder", "5sim_product": "tinder"},
-    "paypal":   {"price": 2.25, "label": "PayPal", "5sim_product": "paypal"}
+    "google":       {"price": 2.00, "label": "Google / Gmail", "5sim_product": "google"},
+    "creditkarma":  {"price": 2.50, "label": "Credit Karma",   "5sim_product": "creditkarma"},
+    "paypal":       {"price": 2.25, "label": "PayPal",         "5sim_product": "paypal"},
+    "uber":         {"price": 2.00, "label": "Uber",           "5sim_product": "uber"}
 }
 
 def api_5sim_buy(product, country="usa", operator="virtual51"):
@@ -3738,8 +3736,7 @@ async def show_sms_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await replace_view(
         q,
-        "🇺🇸 **SMS ACTIVATIONS (USA - Virtual51)**\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
+        "🇺🇸 **SMS ACTIVATIONS **\n"
         "Choisissez le service.\n"
         "⚡ _Numéros virtuels haute qualité._\n"
         "🔄 _Bouton 'Ban/Rembourser' disponible si le numéro ne marche pas._",
@@ -9132,7 +9129,8 @@ def start_everything():
     bot_thread = threading.Thread(target=run_bot_polling, daemon=True)
     bot_thread.start()
     print("🚀 SYSTÈME PRÊT")
-
+ 
+    
 if __name__ == "__main__":
     start_everything()
     # Lancement du serveur Web pour l'IVR
