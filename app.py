@@ -188,7 +188,7 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         parsed = _parse_product_fields(prod)
         prod.update(parsed)
 
-        price = prod["price"]
+        price = get_final_price(user_id, prod["price"])
         balance = get_user_balance(user_id)
 
         if balance < price:
@@ -428,6 +428,7 @@ async def cart_checkout_callback(update: Update, context: ContextTypes.DEFAULT_T
         prod = dict(zip(colnames[:-1], row[:-1]))
         qty = row[-1]
         price = _coerce_price(prod.get("price"))
+        price = get_final_price(user_id, price)
         total += price * qty
         items_to_buy.append((prod, qty, price))
 
@@ -745,7 +746,7 @@ FORFAITS = {
     "silver":   {"min": 175,  "price": 5.50, "label": "⬜️ Silver"},  
     "gold":     {"min": 350,  "price": 4.25, "label": "🟨 Gold"},    
     "platinum": {"min": 700,  "price": 2.80, "label": "⬛️ Platinum"}, 
-    "admin":    {"min": 0,     "price": 0.00,   "label": "👑 ADMIN"},
+    "admin":    {"min": 0,     "price": 0.00,   "label": "👑 Admin"},
 }
 
 # ========================== GLOBALS ==========================
@@ -2296,41 +2297,136 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    order_id = int(q.data.split("_")[-1])
-    await q.answer("🔍 Vérification...")
+    query = update.callback_query
+    await query.answer()
     
-    con = sqlite3.connect(DB_NAME)
-    cur = con.cursor()
-    cur.execute("SELECT address, amount_btc_expected, status, amount_cad FROM crypto_payments WHERE id=?", (order_id,))
-    row = cur.fetchone()
-    
-    if not row or row[2] == 'paid':
-        con.close()
-        await q.message.reply_text("✅ Déjà payé ou introuvable.")
-        return
+    # ... (Récupération order_id, SQL, etc... gardez votre code existant pour ça) ...
+    # Je vous remets le bloc de récupération pour être sûr :
+    try:
+        order_id = int(query.data.split("_")[-1])
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT user_id, btc_address, status FROM crypto_payments WHERE id=?", (order_id,))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row: return await query.message.reply_text("❌ Commande introuvable.")
+        user_id, btc_addr, status = row
+        if status == 'paid': return await query.message.reply_text("✅ Déjà payé.")
+    except: return
 
-    address, expected, status, cad_val = row
-    received = check_payment_status(address)
+    # --- VÉRIFICATION SÉCURISÉE ---
+    try:
+        # On récupère les infos de l'adresse ET la hauteur de bloc actuelle (Tip)
+        r_addr = requests.get(f"https://mempool.space/api/address/{btc_addr}")
+        r_tip  = requests.get("https://mempool.space/api/blocks/tip/height")
+        
+        data = r_addr.json()
+        current_block_height = r_tip.json()
+        
+        satoshis_confirmed = data['chain_stats']['funded_txo_sum']
+        satoshis_pending   = data['mempool_stats']['funded_txo_sum']
+        
+    except:
+        return await query.message.reply_text("⚠️ Erreur API Blockchain.")
+
+    # CALCUL DES CONFIRMATIONS (Approximation via chain_stats)
+    # Si chain_stats > 0, on a au moins 1 confirmation.
+    # Pour avoir le nombre exact, il faudrait parser les TXs, mais pour simplifier :
+    # Si c'est dans Mempool, c'est 0 conf.
     
-    if received >= (expected * 0.95):
-        cur.execute("UPDATE crypto_payments SET status='paid' WHERE id=?", (order_id,))
-        con.commit()
-        con.close()
-        new_bal, _ = credit_and_upgrade(str(q.from_user.id), cad_val)
-        await q.message.reply_text(f"✅ **Reçu !**\nNouveau solde : {new_bal:.2f}$", parse_mode="Markdown")
-        await show_main_menu(q.from_user.id)
-    else:
-        con.close()
-        # Message rassurant
-        await q.message.reply_text(
-            f"⏳ **Paiement détecté, en attente de validation...**\n"
-            f"Reçu: {received:.8f} BTC\n"
-            f"Attendu: {expected:.8f} BTC\n\n"
-            f"⚠️ **Note :** La Blockchain Bitcoin nécessite environ ~10 minutes pour confirmer une transaction. Réessayez ce bouton dans quelques minutes.",
-            quote=True,
+    # CAS A : C'est dans le Mempool (0 Conf) -> ON RASSURE MAIS ON ATTEND
+    if satoshis_pending > 0 and satoshis_confirmed == 0:
+        msg = await query.message.reply_text(
+            f"👀 **Transaction Détectée !**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"Le réseau voit bien votre paiement en attente.\n"
+            f"🔒 **Sécurité :** En attente de 2 confirmations.\n"
+            f"⏳ _Votre solde sera ajouté automatiquement dans ~20 min._\n\n"
+            f"⚠️ _Ce message va disparaître._",
             parse_mode="Markdown"
         )
+        # Autodestruction du message dans 10 secondes
+        await asyncio.sleep(10)
+        try: await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg.message_id)
+        except: pass
+        return
+
+    # CAS B : C'est confirmé (Au moins 1 fois) -> On laisse la tâche de fond gérer les 2 confs
+    elif satoshis_confirmed > 0:
+        await query.message.reply_text("✅ Paiement confirmé sur la Blockchain ! Le solde arrive...")
+        # (La tâche automatique ci-dessous fera le crédit final)
+        
+    else:
+        await query.message.reply_text("❌ Rien reçu pour l'instant. Envoyez les BTC.")
+
+async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
+    """Vérifie les paiements et crédite UNIQUEMENT si >= 2 Confirmations."""
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, user_id, btc_address FROM crypto_payments WHERE status='pending'")
+    pending_orders = c.fetchall()
+    
+    # On récupère la hauteur actuelle de la blockchain (le dernier bloc)
+    try:
+        tip_req = requests.get("https://mempool.space/api/blocks/tip/height", timeout=5)
+        current_height = int(tip_req.text)
+    except:
+        conn.close()
+        return # Si on ne peut pas avoir la hauteur, on ne fait rien par sécurité
+
+    for row in pending_orders:
+        order_id, user_id, btc_addr = row
+        
+        try:
+            # On demande la liste des transactions de cette adresse
+            r = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", timeout=5)
+            txs = r.json()
+            
+            total_btc_recu = 0.0
+            confirmations_max = 0
+            
+            # On analyse les transactions entrantes
+            for tx in txs:
+                # Si la TX est confirmée (elle a un block_height)
+                if tx['status']['confirmed']:
+                    tx_height = tx['status']['block_height']
+                    confs = current_height - tx_height + 1
+                    confirmations_max = max(confirmations_max, confs)
+                    
+                    # On additionne les montants reçus sur notre adresse
+                    for out in tx['vout']:
+                        if out['scriptpubkey_address'] == btc_addr:
+                            total_btc_recu += out['value'] / 100_000_000.0
+
+            # --- LE VERDICT : EST-CE QU'ON A 2 CONFIRMATIONS ? ---
+            if confirmations_max >= 2 and total_btc_recu > 0:
+                
+                # C'est bon, c'est sécurisé -> ON CRÉDITE
+                price_btc = get_btc_price()
+                valeur_usd = total_btc_recu * price_btc
+                frais = valeur_usd * 0.03
+                montant_final = valeur_usd - frais
+                
+                c.execute("UPDATE crypto_payments SET status='paid', btc_received=? WHERE id=?", (total_btc_recu, order_id))
+                conn.commit()
+                
+                update_user_balance(str(user_id), montant_final)
+                
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"✅ **Paiement Validé (2/2 Confirmations)**\n"
+                             f"💰 Crédité : +{montant_final:.2f}$",
+                        parse_mode="Markdown"
+                    )
+                except: pass
+                
+        except Exception as e:
+            print(f"Erreur check {btc_addr}: {e}")
+            continue
+
+    conn.close()
         
 async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3653,7 +3749,7 @@ async def tool_ask_hlr(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def tool_process_hlr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     phone = update.message.text.strip()
-    price = 0.50
+    price = get_final_price(user_id, 0.50)
 
     # Vérification solde
     balance = get_user_balance(user_id)
