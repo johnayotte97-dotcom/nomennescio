@@ -1345,15 +1345,10 @@ async def show_main_menu(user_id: int, clear: bool = True):
 # ========================== CATALOGUE PRODUITS ==========================
 
 def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=None):
-    """
-    Moteur de recherche SQL V6 (Précision Stricte).
-    Règle le problème de chevauchement des villes.
-    """
     con = sqlite3.connect(DB_NAME)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
     
-    # 1. Base des conditions
     conditions = ["category=?", "is_active=1", "stock>0"]
     params = [category]
     
@@ -1361,9 +1356,8 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
         conditions.append("tier=?")
         params.append(tier)
         
-    # 2. Application des filtres intelligents
     if filters:
-        # PRIX : Filtrage numérique strict
+        # PRIX : Strict
         if filters.get('price'):
             try:
                 raw = str(filters['price']).replace(',', '.').replace('$', '').strip()
@@ -1371,42 +1365,38 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
                 params.append(float(raw))
             except: pass 
 
-        # VILLE : Recherche ciblée sur la colonne city uniquement
+        # VILLE : Ciblée + Insensible à la casse
         if filters.get('city'):
-            val = filters['city'].strip()
-            conditions.append("city LIKE ?")
-            params.append(f"%{val}%")
+            conditions.append("city LIKE ? COLLATE NOCASE")
+            params.append(f"%{filters['city'].strip()}%")
 
-        # BINS (Spécifique Cc's) : Recherche dans le contenu technique
+        # BINS : Spécifique Cc's
         if filters.get('bins'):
-             val = filters['bins'].strip()
              conditions.append("content LIKE ?")
-             params.append(f"%{val}%")
+             params.append(f"%{filters['bins'].strip()}%")
 
-        # AUTRES (Année, Nom, Base) : Recherche textuelle large
-        # Note : 'city' a été retiré de cette boucle pour éviter les doublons
-        for key in ['year', 'name', 'base']:
+        # NOM / TITRE : Correction ici (title au lieu de name)
+        if filters.get('name'):
+            conditions.append("title LIKE ? COLLATE NOCASE")
+            params.append(f"%{filters['name'].strip()}%")
+
+        # AUTRES : Base et Année
+        for key in ['year', 'base']:
             if filters.get(key):
                 val = filters[key].strip()
-                conditions.append("(title LIKE ? OR content LIKE ?)")
-                params.append(f"%{val}%")
-                params.append(f"%{val}%")
+                conditions.append("(title LIKE ? OR content LIKE ? OR tier LIKE ?)")
+                params.extend([f"%{val}%", f"%{val}%", f"%{val}%"])
 
     where_sql = " AND ".join(conditions)
 
     try:
-        # 3. Comptage du total (pour la pagination)
-        count_query = f"SELECT COUNT(*) FROM products WHERE {where_sql}"
-        cur.execute(count_query, params)
+        cur.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params)
         total_count = cur.fetchone()[0]
 
-        # 4. Récupération des données avec tri par ID descendant (plus récents en premier)
         data_query = f"SELECT * FROM products WHERE {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
-        full_params = params + [per_page, page * per_page]
-        rows = cur.execute(data_query, full_params).fetchall()
+        rows = cur.execute(data_query, params + [per_page, page * per_page]).fetchall()
         con.close()
 
-        # 5. Formatage des résultats
         prods = []
         for row in rows:
             p = dict(row)
@@ -1414,21 +1404,15 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
                 "id": p['id'], 
                 "title": p['title'], 
                 "price": float(p['price'] or 0),
-                "currency": p['currency'] or "CAD", 
                 "stock": p['stock'], 
                 "tier": p['tier'], 
-                "category": category, 
-                "content": p['content'],
-                "city": p.get('city', 'N/A'), # <-- AJOUTER CETTE LIGNE
-                "year": p.get('year', 'N/A')  # <-- AJOUTER CETTE LIGNE
+                "city": p.get('city', 'N/A'),
+                "year": p.get('year', 'N/A'),
+                "content": p.get('content', '')
             })
-            
         return prods, total_count
-
     except Exception as e:
         print(f"[SQL ERROR] {e}")
-        try: con.close()
-        except: pass
         return [], 0
 
 def _fmt_price(p):
@@ -1477,95 +1461,59 @@ async def open_pagination_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-
 async def show_products(update, context, page=0, tier=None, from_filter=False):
-    import asyncio 
-    import os
-    import sqlite3
-    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-
-    query = getattr(update, "callback_query", None)
-    chat_id = query.message.chat_id if query else update.effective_chat.id
+    query = update.callback_query
     user_id = str(update.effective_user.id)
+    chat_id = update.effective_chat.id
     
-    context.user_data['cart_return_to'] = "cat:propro"
-    
-    # --- NETTOYAGE PRÉALABLE ---
-    # On efface tout ce qui traîne (filtres, anciens catalogues, paniers)
-    msgs_to_del = []
-    msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
-    msgs_to_del += context.user_data.pop("filter_msgs", [])
-    msgs_to_del += context.user_data.pop("catalog_msg_ids", []) # <-- On récupère les anciens IDs
-    msgs_to_del += context.user_data.pop("cart_msg_ids", [])     # <-- On efface le panier si ouvert
-    
+    # --- 1. SUPPRESSION DU MENU D'ACCUEIL (OU PRÉCÉDENT) ---
+    # Si on arrive du menu principal (pas d'un filtre), on efface le menu d'accueil
     if query and not from_filter:
-        try: await query.message.delete()
-        except: pass
+        try:
+            await query.message.delete()
+        except:
+            pass
 
-    for mid in set(msgs_to_del):
-        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-        except: pass
-    # ---------------------------
-
-    # 1. Message de chargement
-    loading_msg = None
-    try: loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳")
-    except: pass
-
-    # 2. REQUÊTE SQL TURBO
-    try:
-        PER_PAGE = get_user_pagination(user_id)
-        
-        # Filtres
-        filters = context.user_data.get('active_filters', {})
-        where_clause = "WHERE category='propro' AND is_active=1 AND stock > 0"
-        params = []
-
-        if filters.get('city'):
-            where_clause += " AND city LIKE ?"
-            params.append(f"%{filters['city']}%")
-        if filters.get('year'):
-            where_clause += " AND year = ?"
-            params.append(filters['year'])
-        if tier:
-            where_clause += " AND tier = ?"
-            params.append(tier)
-
-        con = sqlite3.connect(DB_NAME)
-        con.row_factory = sqlite3.Row
-        cur = con.cursor()
-        
-        cur.execute(f"SELECT COUNT(id) FROM products {where_clause}", params)
-        total_items = cur.fetchone()[0]
-
-        query_sql = f"SELECT * FROM products {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
-        cur.execute(query_sql, params + [PER_PAGE, page * PER_PAGE])
-        chunk = [dict(row) for row in cur.fetchall()]
-        con.close()
-
-    except Exception as e:
-        if loading_msg: await loading_msg.edit_text("⚠️ Erreur technique.")
-        return
-
-    if loading_msg:
-        try: await loading_msg.delete()
-        except: pass
-
-    total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
+    # --- 2. NETTOYAGE DES ANCIENNES FICHES ET NAVIGATION ---
+    msgs_to_del = context.user_data.pop("catalog_msg_ids", [])
     
-    # Liste pour mémoriser les nouveaux messages affichés
-    sent_ids = []
+    # Si on vient du filtre, on nettoie spécifiquement les messages de l'interface filtre
+    if from_filter:
+        msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
+        msgs_to_del += context.user_data.pop("filter_msgs", []) # Efface le menu "🔎 MODE FILTRE"
+        # On efface aussi le message de confirmation du filtre si présent
+        if query:
+            msgs_to_del.append(query.message.message_id)
+
+    # Exécution de la suppression
+    for mid in set(msgs_to_del):
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except:
+            pass
+
+    # --- 3. RÉCUPÉRATION DES DONNÉES ---
+    PER_PAGE = get_user_pagination(user_id)
+    filters = context.user_data.get('active_filters', {})
+    
+    # Utilisation du moteur SQL V6
+    chunk, total_items = _get_products_optimized("propro", page, PER_PAGE, filters, tier)
 
     if not chunk:
         m = await context.bot.send_message(chat_id=chat_id, text="❌ Aucun produit trouvé.", reply_markup=kb_back_to_menu())
         context.user_data['catalog_msg_ids'] = [m.message_id]
         return
 
-    # 3. Affichage des Produits
+    total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
+    sent_ids = []
+
+    # --- 4. AFFICHAGE DES PRODUITS (EN PREMIER) ---
     for p in chunk:
+        # Sécurité pour le nom (title contient souvent NOM • VILLE)
+        clean_name = p['title'].split('•')[0].strip()
+        
         txt = (
-            f"👤 **NOM** : `{p['title'].split('•')[0].strip()}`\n"
+            f"👤 **NOM** : `{clean_name}`\n"
             f"🏙️ **VILLE** : `{p.get('city', 'N/A')}`\n"
             f"📅 **ANNÉE** : `{p.get('year', 'N/A')}`\n"
             f"📂 **BASE** : `{p.get('tier', 'N/A')}`\n"
@@ -1580,9 +1528,10 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         try:
             m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
             sent_ids.append(m.message_id)
-        except: pass
+        except:
+            pass
 
-    # 4. Menu Navigation
+    # --- 5. MENU DE NAVIGATION (EN DERNIER -> TOUJOURS EN BAS) ---
     con = sqlite3.connect(DB_NAME)
     cart_count = con.execute("SELECT count(*) FROM cart_items WHERE user_id=?", (user_id,)).fetchone()[0]
     con.close()
@@ -1592,22 +1541,28 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), 
         InlineKeyboardButton("»", callback_data=f"prod:page:{min(total_pages-1, page+1)}")
     ]
-
+    
     kb_final = []
     if cart_count > 0:
         kb_final.append([InlineKeyboardButton(f"🧺 Voir Panier ({cart_count})", callback_data="cart:view")])
-    kb_final.append([InlineKeyboardButton("🔎 Filter", callback_data="filter_open"), InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")])
+    
+    kb_final.append([
+        InlineKeyboardButton("🔎 Filter", callback_data="filter_open"), 
+        InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")
+    ])
     kb_final.append(nav_row)
     kb_final.append([InlineKeyboardButton("⬅️ Retour Menu", callback_data="menu_accueil")])
 
-    m = await context.bot.send_message(chat_id=chat_id, text="🔻 **Navigation** 🔻", reply_markup=InlineKeyboardMarkup(kb_final))
-    sent_ids.append(m.message_id)
+    m_nav = await context.bot.send_message(
+        chat_id=chat_id, 
+        text="🔻 **Navigation** 🔻", 
+        reply_markup=InlineKeyboardMarkup(kb_final),
+        parse_mode="Markdown"
+    )
+    sent_ids.append(m_nav.message_id)
     
-    # 5. SAUVEGARDE CRITIQUE (Pour que le panier puisse les effacer)
-    if from_filter:
-        context.user_data['filter_fiches_msg_ids'] = sent_ids
-    else:
-        context.user_data['catalog_msg_ids'] = sent_ids # <-- C'est ici que ça se joue
+    # Sauvegarde pour le prochain tour
+    context.user_data['catalog_msg_ids'] = sent_ids
 
         
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
@@ -1904,10 +1859,10 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
             raw_title = str(p.get('title', '')).split('•')[0].strip()
             lines.append(f"FIRST NAME: {raw_title}")
             lines.append(f"BASE: {p.get('tier', 'N/A')}")
-            lines.append(f"PRICE: {p.get('price', 0.0):.2f} CAD")
+            lines.append(f"PRICE: {p.get('price', 0.0):.2f} USD")
             return "\n".join(lines)
         except:
-            return f"💳 {p.get('title')}\n{p.get('price')} CAD"
+            return f"💳 {p.get('title')}\n{p.get('price')} USD"
 
     # 5. Gestion vide
     if not chunk:
@@ -4498,7 +4453,7 @@ def _parse_manual_block(text: str):
             return 0.0
 
     price    = _parse_price(pick('PRICE'))
-    currency = pick('CURRENCY', default='CAD')
+    currency = pick('CURRENCY', default='USD')
 
     try:
         stock = int(pick('STOCK', default='1') or 1)
@@ -4817,7 +4772,7 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
                     f"CITY: {city}",
                     f"PHONE NUMBER: {phone}",
                     f"BASE: {base}",
-                    f"PRICE: {price:.2f} CAD"
+                    f"PRICE: {price:.2f} USD"
                 ]
                 
                 # Ajoute l'ID original à la fin
@@ -4995,7 +4950,7 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
                     f"EMAIL: {email}", f"PHONE NUMBER: {phone}",
                     f"PASSWORD: {password}",
                     f"BASE: {base}",            # Affiche ta base (ex: BASE: DEJ)
-                    f"PRICE: {price:.2f} CAD",  # Affiche ton prix (ex: PRICE: 2.00 CAD)
+                    f"PRICE: {price:.2f} USD",  # Affiche ton prix (ex: PRICE: 2.00 CAD)
                 ]
 
                 # --- 4. LE RAMASSE-MIETTES (Ajoute ID, ignore LANGUE) ---
