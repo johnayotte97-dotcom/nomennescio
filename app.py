@@ -92,6 +92,13 @@ else:
 # Ton lien Healthchecks personnel
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
 
+def get_final_price(user_id, base_price):
+    """Renvoie 0.0 si l'utilisateur est admin, sinon le prix normal."""
+    statut = get_user_statut(str(user_id))
+    if statut == "admin":
+        return 0.0
+    return float(base_price)
+
 
 def _coerce_price(raw) -> float:
     if raw is None: return 0.0
@@ -532,6 +539,19 @@ def get_barcode_balance():
     except Exception as e:
         print(f"Erreur Barcode: {e}")
         return "Erreur Connexion"
+    
+def api_5sim_get_balance():
+    """Récupère le solde 5SIM pour l'affichage admin."""
+    if not SIM_API_KEY: return "Non Configuré"
+    try:
+        headers = {"Authorization": "Bearer " + SIM_API_KEY, "Accept": "application/json"}
+        r = requests.get("https://5sim.net/v1/user/profile", headers=headers, timeout=3)
+        if r.status_code == 200:
+            bal = r.json().get("balance", 0.0)
+            return f"{bal} RUB" # ou changez RUB par $ si votre compte est en dollars
+        return "Erreur API"
+    except:
+        return "Erreur"
 
 def start_heartbeat():
     while True:
@@ -721,10 +741,11 @@ ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
 
 # Paliers
 FORFAITS = {
-    "bronze":   {"min": 0,    "price": 7.00, "label": "🟫 Bronze"},   # Équivalent de ~10 CAD
-    "silver":   {"min": 175,  "price": 5.50, "label": "⬜️ Silver"},   # Équivalent de ~8 CAD
-    "gold":     {"min": 350,  "price": 4.25, "label": "🟨 Gold"},     # Équivalent de ~6 CAD
-    "platinum": {"min": 700,  "price": 2.80, "label": "⬛️ Platinum"}, # Équivalent de ~4 CAD
+    "bronze":   {"min": 0,    "price": 7.00, "label": "🟫 Bronze"},   
+    "silver":   {"min": 175,  "price": 5.50, "label": "⬜️ Silver"},  
+    "gold":     {"min": 350,  "price": 4.25, "label": "🟨 Gold"},    
+    "platinum": {"min": 700,  "price": 2.80, "label": "⬛️ Platinum"}, 
+    "admin":    {"min": 0,     "price": 0.00,   "label": "👑 ADMIN"},
 }
 
 # ========================== GLOBALS ==========================
@@ -1291,19 +1312,20 @@ async def show_main_menu(user_id: int, clear: bool = True):
     statut_code = get_user_statut(str(user_id)) 
     lang = get_user_lang(str(user_id))
     
+    
     # --- LOGIQUE ADMIN INFO ---
     admin_info = ""
     if str(user_id) in ADMIN_IDS:
         sw_bal = get_signalwire_balance()
         bc_bal = get_barcode_balance()
-        admin_info = f"\n🏦 SignalWire: {sw_bal}\n🪪 BarcodeSolution: {bc_bal}"
+        sim_bal = api_5sim_get_balance()
 
-    # --- CORRECTION : AFFICHAGE DYNAMIQUE ---
-    # On récupère le dictionnaire complet du forfait (ex: {'min': 0, 'label': '🟫 Bronze', ...})
-    # Si le statut est inconnu, on prend 'bronze' par défaut.
+        admin_info = f"\n🏦 SignalWire: {sw_bal}\n🪪 BarcodeSolution: {bc_bal}\n📱 5SIM: {sim_bal}"
+
+ 
     details_forfait = FORFAITS.get(statut_code, FORFAITS["bronze"])
     
-    # On utilise le label qui contient déjà l'émoji (ex: "🟫 Bronze")
+
     statut_label = f"🏆 Statut : {details_forfait['label']}"
     # ----------------------------------------
 
@@ -3758,7 +3780,7 @@ async def handle_buy_sms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not item: return
     
     user_id = str(q.from_user.id)
-    price = item['price']
+    price = get_final_price(user_id, item['price'])
     
     # 1. Solde
     if get_user_balance(user_id) < price:
@@ -8891,6 +8913,7 @@ conv_handler = ConversationHandler(
         
         # --- BOÎTE À OUTILS ---
         SELECT_TOOL: [
+            CallbackQueryHandler(show_tools_menu, pattern="^section_tools$"),
             CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
             CallbackQueryHandler(tool_ask_hlr, pattern="^tool_hlr$"),
             CallbackQueryHandler(show_sms_menu, pattern="^tool_5sim$"),
@@ -9000,6 +9023,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
     application.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
     application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
+    
 
     # 8. VUE & NAVIGATION
     application.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
