@@ -5778,7 +5778,7 @@ async def launch_parallel_calls(base_code, user_id, num_calls=10, fullname="", f
         # Délai de 6 secondes entre chaque variante pour rester "propre"
         if i < num_calls - 1: # Pas besoin de dormir après le dernier appel
             log(f"⏳ Pause 6s avant la variante {i+1}...", user_id)
-            await asyncio.sleep(6)
+            await asyncio.sleep(3)
 
     log(f"🏁 Séquence de batch terminée pour {batch_id}", user_id)
 
