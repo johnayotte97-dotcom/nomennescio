@@ -27,7 +27,7 @@ from bip_utils import Bip32Secp256k1, P2WPKHAddr
 from hdwallet import HDWallet
 from hdwallet.cryptocurrencies import Bitcoin as BTC
 from sentry_sdk.integrations.flask import FlaskIntegration
-
+from telegram.ext import PicklePersistence
 
 # --- WEB & TÉLÉPHONIE ---
 from flask import Flask, request, Response
@@ -1716,6 +1716,13 @@ async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYP
 async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print("\n[DEBUG] 🟣 filter_search : Bouton Search cliqué", flush=True)
     q = update.callback_query
+    
+    # --- AJOUT DU SABLIER ---
+    try:
+        await q.answer("⏳")
+    except:
+        pass
+    # -----------------------
     
     pending = context.user_data.get('pending_filters', {})
     print(f"[DEBUG] Filtres à appliquer : {pending}", flush=True)
@@ -5947,6 +5954,7 @@ def listen_response():
 @app.route("/analyze_response", methods=["POST"], endpoint="analyze_response_main")
 def analyze_response():
     import re
+    import asyncio
     from twilio.twiml.voice_response import VoiceResponse
 
     speech_raw = request.form.get("SpeechResult", "")
@@ -5960,7 +5968,6 @@ def analyze_response():
         return Response("<Response><Hangup/></Response>", mimetype="text/xml")
 
     current_call = active_calls[call_sid]
-    # Récupération sécurisée de l'ID utilisateur
     try:
         user_id = int(current_call.get("user_id", 0))
     except:
@@ -5971,25 +5978,22 @@ def analyze_response():
     base_code = variant[:-2]
     key = f"{batch_id}:{base_code}"
     
-    # Si la clé n'existe pas dans le cache de validation, on coupe
     if key not in user_validation_status:
         return Response("<Response><Hangup/></Response>", mimetype="text/xml")
 
     state = user_validation_status[key]
     fullname = state.get("fullname", "")
     
-    # Détection de succès
     WINNING_PHRASES = ["valide", "comprend la classe", "dossier est", "valid"]
     is_absolute_win = any(phrase in speech_clean for phrase in WINNING_PHRASES)
 
-    # Détection d'échec
     neg_patterns = [r"invalide", r"pas valide", r"erreur", r"aucun", r"incomplet"]
     is_negative = any(re.search(p, speech_clean) for p in neg_patterns)
     
     valid = is_absolute_win or ("valide" in speech_clean and not is_negative)
 
-    # Fonction de notification Telegram intégrée
-    def _maybe_finish_batch(add_result_text=None):
+    # Fonction de notification Telegram avec suppression GLOBALE après 60s
+    def _maybe_finish_batch(add_result_text=None, is_success=False):
         async def _notify_serialized():
             br = batch_runs.get(batch_id)
             if not br: return
@@ -5998,16 +6002,26 @@ def analyze_response():
                     state["resolved"] = True
                     br["resolved"] += 1 
                 
-                # Notification Telegram si texte fourni
+                msgs_to_delete = [] # Liste pour le nettoyage auto
+
                 if add_result_text:
                     if "ORDER" not in str(batch_id):
                         if globals().get("app_telegram") and getattr(app_telegram, "bot", None):
                             try:
-                                await app_telegram.bot.send_message(chat_id=user_id, text=add_result_text, parse_mode='Markdown')
+                                final_text = add_result_text
+                                # Ajout du disclaimer de sécurité UX
+                                final_text += "\n\n⏱️ _Sécurité : Ce bloc sera supprimé dans 60s._"
+
+                                sent_msg = await app_telegram.bot.send_message(
+                                    chat_id=user_id, 
+                                    text=final_text, 
+                                    parse_mode='Markdown'
+                                )
+                                msgs_to_delete.append(sent_msg.message_id)
                             except Exception as e:
                                 log(f"Erreur envoi Telegram: {e}", user_id, "error")
                 
-                # Fermeture du batch si terminé
+                # Si c'est la fin du décryptage (dernier appel du batch)
                 if br["resolved"] >= br["total"] and not br["notified"]:
                     br["notified"] = True 
                     if "ORDER" in str(batch_id):
@@ -6016,54 +6030,70 @@ def analyze_response():
                     
                     if globals().get("app_telegram") and getattr(app_telegram, "bot", None):
                         try:
-                            await app_telegram.bot.send_message(chat_id=user_id, text="🔓 Fin du décryptage.")
-                            # On réaffiche le menu principal
+                            # Message de fin (UX : Clean & Pro)
+                            m_fin = await app_telegram.bot.send_message(
+                                chat_id=user_id, 
+                                text="🔓 **Décryptage terminé.**\n_Nettoyage des données sensibles en cours..._"
+                            )
+                            msgs_to_delete.append(m_fin.message_id)
+                            
+                            # On réaffiche le menu principal (lui reste affiché)
                             await show_main_menu(user_id)
                         except: pass
-        
+
+                # PROGRAMMATION DE LA SUPPRESSION (si nécessaire)
+                if msgs_to_delete:
+                    async def delayed_cleanup(m_ids):
+                        await asyncio.sleep(60) # Délai de 1 minute
+                        for mid in m_ids:
+                            try:
+                                await app_telegram.bot.delete_message(chat_id=user_id, message_id=mid)
+                            except: pass
+                    
+                    asyncio.create_task(delayed_cleanup(msgs_to_delete))
+
         if globals().get("bot_loop"):
             asyncio.run_coroutine_threadsafe(_notify_serialized(), bot_loop)
 
     r = VoiceResponse()
 
-    # Logique de décision Finale
     if valid and not state["notified"]:
         state["notified"] = True
         real_suffix = variant[-2:]
-        # Construction du permis final (AAAA-123456-XX)
+        # Construction du permis final
         final_permis = f"{variant[:5]}-{variant[5:11]}-{real_suffix}"
         
-        # Sauvegarde en DB
         save_permit_history(user_id, fullname, final_permis, "valide")
         
-        # Notification Client
-        _maybe_finish_batch(add_result_text=msg(user_id, "validation_ok", permis=final_permis, fullname=fullname))
+        # UX : Message de succès plus visuel
+        succes_txt = (
+            f"✅ **PERMIS TROUVÉ !**\n\n"
+            f"👤 **NOM** : `{fullname}`\n"
+            f"🪪 **NUMÉRO** : `{final_permis}`"
+        )
+        
+        _maybe_finish_batch(add_result_text=succes_txt, is_success=True)
         r.hangup()
         
     else:
         state["total"] += 1
-        # Si on a épuisé les 10 tentatives sans succès
+        # Si on a épuisé les tentatives (Échec total)
         if state["total"] >= 10 and not state["notified"]:
             state["notified"] = True
             save_permit_history(user_id, fullname, None, "aucun")
             
-            msg_echec = (f"❌ *Recherche terminée - ÉCHEC*\n\n📂 Dossier : `{fullname}`\n"
-                         f"⚠️ Résultat : *Aucun permis valide trouvé.*")
-            _maybe_finish_batch(add_result_text=msg_echec)
-            r.hangup()
+            msg_echec = (f"❌ **RECHERCHE TERMINÉE**\n\n"
+                         f"📂 Dossier : `{fullname}`\n"
+                         f"⚠️ Statut : *Aucun permis valide trouvé.*")
             
-        elif not state["notified"]:
-            # On n'a pas encore trouvé, on redirige vers le prochain code (boucle gérée par le client SignalWire/Twilio habituellement via URL status callback, mais ici on simplifie en raccrochant pour que la boucle python lance le suivant)
-            # NOTE: Dans ton architecture `launch_parallel_calls`, c'est la boucle Python qui lance les appels un par un.
-            # Donc ici on raccroche simplement pour que `launch_parallel_calls` passe au `i+1`.
+            # On supprime aussi le message d'échec après 60s pour garder le chat propre
+            _maybe_finish_batch(add_result_text=msg_echec, is_success=True)
             r.hangup()
         else:
             r.hangup()
 
-    # Nettoyage de l'appel actif
     active_calls.pop(call_sid, None)
     return Response(str(r), mimetype="text/xml")
-
 
 
 # ========================== MENU/ROUTEUR CALLBACKS ==========================
@@ -9140,8 +9170,16 @@ def run_bot_polling():
         asyncio.set_event_loop(loop)
         bot_loop = loop 
         
-        # INSTANCE UNIQUE
-        app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
+        # 🌟 CRÉATION DU FICHIER DE SAUVEGARDE DE MÉMOIRE (La magie opère ici)
+        my_persistence = PicklePersistence(filepath='bot_memory.pickle')
+
+        # INSTANCE UNIQUE AVEC PERSISTANCE
+        app_telegram = (
+            Application.builder()
+            .token(TELEGRAM_TOKEN)
+            .persistence(persistence=my_persistence) # <--- Ligne ajoutée
+            .build()
+        )
 
         # Injection bot_data
         print("🔌 Connexion DB et Helpers...")
@@ -9157,7 +9195,7 @@ def run_bot_polling():
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
         
-        print("✅ BOT EN LIGNE !")
+        print("✅ BOT EN LIGNE (Mémoire persistante activée) !")
         app_telegram.run_polling(close_loop=False, stop_signals=False)
     except Exception as e:
         print(f"❌ Erreur critique Bot: {e}")
