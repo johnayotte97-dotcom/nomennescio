@@ -590,9 +590,18 @@ def kb_back_to_menu():
 
 async def replace_view(q, text, reply_markup=None, parse_mode=None):
     try:
+        # 1. Tente de modifier le message actuel (Fonctionne si c'était déjà un texte)
         await q.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception:
-        await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        # 2. Si ça échoue (parce que l'ancien message est une image/photo)
+        try:
+            # On supprime l'ancienne image pour garder le chat propre
+            await q.message.delete()
+        except Exception:
+            pass
+        
+        # 3. On envoie le nouveau menu texte à la place
+        await q.message.chat.send_message(text, reply_markup=reply_markup, parse_mode=parse_mode)
 
 def kb_back_cancel():
     # Pour les flows (ex: Vérifier mon permis) → retourne au menu et annule
@@ -2716,8 +2725,10 @@ async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await replace_view(q, intro_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print("🟢 [DEBUG] Entrée dans la fonction callback_faq réussie !", flush=True)
     q = update.callback_query
-    await q.answer()
+    try: await q.answer()
+    except: pass
     lang = get_user_lang(str(update.effective_user.id))
     
     if lang == "fr":
@@ -2765,6 +2776,10 @@ async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def acces_channel_prive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     
+    # Sécurité anti-crash dès le début de la fonction (évite le bug "Double Answer")
+    try: await q.answer()
+    except: pass
+    
     # TON ID (Celui qui est correct)
     ID_DU_CANAL = -1003536878473
 
@@ -2797,7 +2812,10 @@ async def acces_channel_prive(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         # 3. SI TU N'ES PAS MEMBRE (On génère l'invitation)
-        await q.answer() # Stop le chargement
+        # Remplacé par la version sécurisée pour éviter le plantage
+        try: await q.answer() 
+        except: pass
+        
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=ID_DU_CANAL,
             member_limit=1, 
@@ -2962,7 +2980,11 @@ async def hist_pros(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import json
 
     q = update.callback_query
-    await q.answer()
+    
+    # --- CORRECTION ICI : Sécurité anti-crash ---
+    try: await q.answer()
+    except: pass
+    
     uid = str(q.from_user.id)
     chat_id = update.effective_chat.id
 
@@ -3178,7 +3200,11 @@ async def hist_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_permis_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche les derniers permis générés avec un style UX (une bulle par item)."""
     q = update.callback_query
-    await q.answer()
+    
+    # Sécurité anti-crash (évite l'erreur si menu_handler a déjà répondu)
+    try: await q.answer()
+    except: pass
+    
     user_id = str(update.effective_user.id)
     chat_id = update.effective_chat.id
 
@@ -6235,9 +6261,11 @@ def analyze_response():
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     
-    # Réponse immédiate
-    try: await q.answer()
-    except: pass
+    # Réponse immédiate avec traqueur d'erreur
+    try: 
+        await q.answer()
+    except Exception as e:
+        print(f"[EXTREME DEBUG] Erreur q.answer initial : {e}", flush=True)
 
     data = q.data
     user_id = update.effective_user.id
@@ -6250,10 +6278,26 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- NOUVEAUX BOUTONS STATIQUES (FAQ & CHANNEL) ---
     if data == "faq":
-        return await callback_faq(update, context)
+        print("[EXTREME DEBUG] Avant appel à callback_faq", flush=True)
+        try:
+            await callback_faq(update, context)
+        except Exception as e:
+            print(f"🔴🔴🔴 [EXTREME FATAL ERROR] callback_faq a planté : {e}", flush=True)
+            import traceback
+            print(traceback.format_exc(), flush=True)
+        print("[EXTREME DEBUG] Après appel à callback_faq", flush=True)
+        return
         
     if data == "join_private_channel":
-        return await acces_channel_prive(update, context)
+        print("[EXTREME DEBUG] Avant appel à acces_channel_prive", flush=True)
+        try:
+            await acces_channel_prive(update, context)
+        except Exception as e:
+            print(f"🔴🔴🔴 [EXTREME FATAL ERROR] acces_channel_prive a planté : {e}", flush=True)
+            import traceback
+            print(traceback.format_exc(), flush=True)
+        print("[EXTREME DEBUG] Après appel à acces_channel_prive", flush=True)
+        return
 
     # --- SECTION HISTORIQUE (Navigation & Affichage) ---
     if data == "hist:view":
