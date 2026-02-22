@@ -1240,6 +1240,10 @@ def codif_prenom(prenom: str) -> str:
 
 def generer_permis(nom: str, prenom: str, date_txt: str):
     try:
+        # Nettoyage de sécurité pour ne pas perdre la première lettre
+        nom = nom.strip().upper()
+        prenom = prenom.strip().upper()
+        
         # On force la lecture du format JJ-MM-AAAA
         date_obj = datetime.strptime(date_txt, "%d-%m-%Y")
         
@@ -1250,20 +1254,23 @@ def generer_permis(nom: str, prenom: str, date_txt: str):
         # Assemblage Date SAAQ (JJMMAA)
         date_saaq = f"{day_str}{month_str}{year_str}"
         
-        # Codes d'identité
-        code_nom = soundex(nom)            # P612
-        code_prenom = codif_prenom(prenom) # 1
+        # --- LOGIQUE SOUNDEX SAAQ ---
+        # On s'assure que code_nom contient bien la LETTRE + les 3 chiffres
+        code_nom = soundex(nom)            # Exemple: P612 (La lettre est INCLUSE ici)
+        code_prenom = str(codif_prenom(prenom)) # Exemple: 1
         
+        # Assemblage complet (1 lettre + 11 chiffres)
+        # P612 + 1 + 070597 = P6121070597
+        base = f"{code_nom}{code_prenom}{date_saaq}"
         
-        base = code_nom + code_prenom + date_saaq
-        
-        # Format pour l'affichage Telegram
+        # Format pour l'affichage Telegram (Lettre + 4 chiffres - 6 chiffres - 2 étoiles)
+        # Résultat : P6121-070597-**
         formatted = f"{base[:5]}-{base[5:11]}-**"
         
         return formatted, base
     except Exception as e:
-        print(f"Erreur Gen Permis: {e}")
-        return "ERREUR-DATE", "00000000000"
+        print(f"🔴 Erreur Gen Permis pour {nom}: {e}", flush=True)
+        return "ERREUR-FORMAT", "00000000000"
 
 def convertir_en_code_saaq(code: str) -> str:
     if not code:
@@ -2215,34 +2222,30 @@ def zpub_to_xpub(zpub: str) -> str:
         return zpub
 
 def generate_address(user_id: int, order_id: int) -> str:
-    """Génère une adresse BTC via Bip32Secp256k1 (Force Brute)."""
-    if not ADMIN_XPUB: return "ERREUR_NO_XPUB"
+    """Génère une adresse BTC bc1q (Segwit) de manière ultra-stable."""
+    if not ADMIN_XPUB: 
+        return "ERREUR_NO_XPUB"
+    
     try:
-        # 1. Nettoyage et Conversion ZPUB -> XPUB
-        raw_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
-        if raw_key.startswith("zpub"):
-            try:
-                data = base58.b58decode_check(raw_key)
-                data = b'\x04\x88\xB2\x1E' + data[4:]
-                raw_key = base58.b58encode_check(data).decode()
-            except: pass 
+        # On utilise la fonction get_crypto_address qui est déjà corrigée 
+        # pour éviter les erreurs de "Hardened Path" (m/0/index)
+        address = get_crypto_address(ADMIN_XPUB, order_id, coin_type="BTC")
+        
+        if not address or address.startswith("ERR"):
+            # Backup de secours avec ta logique Bip32 si HDWallet échoue
+            raw_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
+            ctx = Bip32Secp256k1.FromExtendedKey(raw_key)
+            # IMPORTANT : Pas de dérivation durcie ici (pas de .ChildKey(0, hardened=True))
+            addr_ctx = ctx.ChildKey(0).ChildKey(order_id)
+            pub_key_bytes = addr_ctx.PublicKey().RawCompressed().ToBytes()
+            return P2WPKHAddr.EncodeKey(pub_key_bytes, hrp="bc")
             
-        # 2. Dérivation Bas Niveau (Bip32 pur)
-        # On contourne les vérifications de profondeur qui bloquaient avant
-        ctx = Bip32Secp256k1.FromExtendedKey(raw_key)
-        
-        # Chemin : /0 (Chaîne externe) / order_id (Index commande)
-        addr_ctx = ctx.ChildKey(0).ChildKey(order_id)
-        
-        # 3. Encodage Segwit (bc1q)
-        # C'est ici qu'on applique le correctif "hrp='bc'" qui a sauvé la mise
-        pub_key_bytes = addr_ctx.PublicKey().RawCompressed().ToBytes()
-        return P2WPKHAddr.EncodeKey(pub_key_bytes, hrp="bc")
+        return address
         
     except Exception as e:
-        logger.error(f"CRASH FORCE: {e}")
-        return f"ERR: {str(e)}"
-
+        logger.error(f"🔴 CRASH GÉNÉRATION ADRESSE (User: {user_id}): {e}")
+        return f"ERR_SYSTEM"
+    
 def check_payment_status(address: str):
     try:
         r = requests.get(f"https://mempool.space/api/address/{address}", timeout=10)
