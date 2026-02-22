@@ -5,8 +5,15 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes, ConversationHandler
 
+# --- LOGIQUE DE CHEMIN DYNAMIQUE ---
+# On détecte le dossier où se trouve tickets.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# On définit le chemin vers la DB sans écrire le nom d'utilisateur en dur
+DB_PATH = os.path.join(BASE_DIR, "database.db")
+
 # Utilisation du même chemin DB que app.py
-DB_NAME = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
+DB_NAME = os.environ.get("DB_NAME", DB_PATH)
 CHANNEL_LOGS = "-1003589564052" 
 
 # États
@@ -126,21 +133,34 @@ async def admin_view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     uid, uname, cat, msg_content, date = row
 
+    # --- SÉCURITÉ MARKDOWN : Échappement des caractères spéciaux ---
+    # On remplace les caractères qui font planter Telegram (_, *, `) par leur version sécurisée
+    safe_uname = str(uname or 'Inconnu').replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    safe_uid = str(uid).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    safe_cat = str(cat).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
+    # -------------------------------------------------------------
+
     clean_date = str(date).strip()
 
     txt = (
-                f"🎫 **TICKET #{tid}**\n"
-                f"👤 {uname or 'Inconnu'} (`{uid}`)\n"
-                f"📂 {cat}\n"
-                f"📅 {clean_date}"
-            )
+        f"🎫 **TICKET #{tid}**\n"
+        f"👤 {safe_uname} (`{safe_uid}`)\n"
+        f"📂 {safe_cat}\n"
+        f"📅 {clean_date}"
+    )
     
     kb = [
         [InlineKeyboardButton("✍️ Répondre", callback_data=f"adm_ticket_rep_{tid}_{uid}")],
         [InlineKeyboardButton("🗑 Fermer", callback_data=f"adm_ticket_close_{tid}")],
         [InlineKeyboardButton("🔙 Liste", callback_data="admin_tickets_list")]
     ]
-    await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    
+    try:
+        await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    except Exception as e:
+        # Fallback au cas où le Markdown pose encore problème malgré le nettoyage
+        print(f"Erreur Markdown dans admin_view_ticket: {e}")
+        await q.message.edit_text(txt.replace("**", "").replace("`", ""), reply_markup=InlineKeyboardMarkup(kb))
 
 async def admin_ask_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
