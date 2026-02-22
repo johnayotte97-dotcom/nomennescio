@@ -28,13 +28,12 @@ from dotenv import load_dotenv
 from mnemonic import Mnemonic
 from PIL import Image, ImageOps, ImageColor
 from bip_utils import Bip32Secp256k1, P2WPKHAddr
-
-from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin as BTC_Class, Litecoin as LTC_Class
-from hdwallet.derivations import CustomDerivation
-
 from sentry_sdk.integrations.flask import FlaskIntegration
 from telegram.ext import PicklePersistence
+
+from hdwallet import HDWallet
+from hdwallet.cryptocurrencies import Bitcoin as BTC_Class
+BTC = BTC_Class
 
 # --- WEB & TÉLÉPHONIE ---
 from flask import Flask, request, Response
@@ -675,13 +674,15 @@ if os.path.exists(LOCK):
         print(f"[LOCK] bot-nomen déjà lancé (PID {old}).", flush=True)
         sys.exit(0)
     else:
-        try:
-            os.remove(LOCK)
-        except FileNotFoundError:
-            pass
+            try:
+                if os.path.exists(LOCK):
+                    os.remove(LOCK)
+            except Exception as e:
+                print(f"⚠️ Note: Impossible de supprimer le LOCK ({e}), on continue quand même.")
+                pass
 
 open(LOCK, "w").write(str(os.getpid()))
-atexit.register(lambda: os.path.exists(LOCK) and os.remove(LOCK))
+atexit.register(lambda: os.path.exists(LOCK) and exec("try: os.remove(LOCK)\nexcept: pass"))
 
 # ========================== LOGGING ==========================
 class SafeFormatter(logging.Formatter):
@@ -764,7 +765,7 @@ SELECT_TOOL = 900
 WAIT_HLR_NUMBER = 901
 ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
 BTC = BTC_Class
-LTC = LTC_Class
+
 
 
 (ACC_WAIT_NEW_PIN, ACC_WAIT_USERNAME, ACC_WAIT_JABBER, ACC_WAIT_RESET_CONFIRM) = range(3200, 3204)
@@ -2121,67 +2122,70 @@ async def filter_cancel_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========================== FIN DU BLOC CCS ==========================
 
-# ========================== BOUTONS SIMPLES ==========================
-async def callback_show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    await update.callback_query.message.reply_text(
-        f"🆔 Ton ID Telegram est : <code>{user_id}</code>",
-        parse_mode="HTML"
-    )
-
 # ================= PAIEMENT CRYPTO (ELECTRUM / NO KYC) =================
 
 from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin as BTC_Class, Litecoin as LTC_Class
+from hdwallet.cryptocurrencies import Bitcoin as BTC_Class
 from hdwallet.derivations import CustomDerivation
 import base58
 
+# Alias unique pour le Bitcoin
+BTC = BTC_Class
+
 def zpub_to_xpub(zpub: str) -> str:
-    """Convertit une clé zpub (Segwit) en xpub (Standard) pour que HDWallet la comprenne."""
+    """Convertit une clé zpub (Segwit) en xpub (Standard) pour compatibilité HDWallet."""
     try:
         zpub = zpub.strip().replace('"', '').replace("'", "")
         if not zpub.startswith("zpub"):
             return zpub
         data = base58.b58decode_check(zpub)
-        # Remplace le préfixe zpub (04b24746) par le préfixe xpub standard (0488b21e)
+        # Remplace le préfixe zpub par le préfixe xpub standard (0488b21e)
         data = b'\x04\x88\xB2\x1E' + data[4:]
         return base58.b58encode_check(data).decode()
     except Exception as e:
         print(f"⚠️ Erreur conversion zpub: {e}")
         return zpub
 
-def get_crypto_address(xpub, index, coin_type="BTC"):
-    """Génère une adresse Segwit (bc1q) compatible Electrum."""
+def get_crypto_address(xpub, index):
     try:
-        # 1. Convertir si c'est une zpub
+        if not xpub: return None
+        xpub = xpub.strip().replace('"', '').replace("'", "")
+        
+        # On force la conversion zpub -> xpub pour la compatibilité
         clean_xpub = zpub_to_xpub(xpub)
         
-        # 2. Initialisation HDWallet
-        crypto_class = BTC_Class if coin_type == "BTC" else LTC_Class
-        hdwallet: HDWallet = HDWallet(cryptocurrency=crypto_class)
+        hdwallet: HDWallet = HDWallet(cryptocurrency=BTC)
         hdwallet.from_xpublic_key(xpublic_key=clean_xpub)
         
-        # 3. Dérivation non-durcie (Indispensable pour XPUB)
-        hdwallet.from_derivation(CustomDerivation(path=f"m/0/{index}"))
+        # Correction : On dérive SANS le "m/" pour éviter l'erreur Hardened
+        hdwallet.from_index(index=0) # Change
+        hdwallet.from_index(index=index) # Address index
         
-        # 4. Retourne l'adresse Segwit (Bech32) commencant par bc1q
         return hdwallet.p2wpkh_address() 
-        
     except Exception as e:
         print(f"🔴 Erreur HDWallet (index {index}): {e}", flush=True)
         return None
-
+    
 def generate_address(user_id: int, order_id: int) -> str:
-    """Fonction principale utilisée par le bot pour générer l'adresse de paiement."""
+    """Génère une adresse BTC stable sans erreur de dérivation."""
     if not ADMIN_XPUB: 
         return "ERREUR_NO_XPUB"
     
-    # On force l'utilisation de la méthode stable
-    addr = get_crypto_address(ADMIN_XPUB, order_id, coin_type="BTC")
-    return addr if addr else "ERR_GEN_FAILED"
-
+    try:
+        # On utilise uniquement la fonction get_crypto_address qui gère le m/0/index
+        address = get_crypto_address(ADMIN_XPUB, order_id)
+        
+        if not address:
+            return "ERR_GEN"
+            
+        return address
+        
+    except Exception as e:
+        print(f"🔴 Erreur fatale génération : {e}", flush=True)
+        return "ERR_SYSTEM"
+    
 def ensure_payment_table():
-    """Crée ou met à jour la table des paiements sans perte de données."""
+    """Prépare la table SQL pour les paiements."""
     try:
         con = sqlite3.connect(DB_NAME)
         cur = con.cursor()
@@ -2197,7 +2201,7 @@ def ensure_payment_table():
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Patch pour les installations existantes
+        # Patch pour les colonnes si la table existe déjà
         colonnes = [
             ("address", "TEXT"),
             ("amount_cad", "REAL"),
@@ -2208,18 +2212,17 @@ def ensure_payment_table():
             try:
                 cur.execute(f"ALTER TABLE crypto_payments ADD COLUMN {col} {col_type}")
             except:
-                pass # Déjà présente
+                pass 
         
         con.commit()
         con.close()
     except Exception as e:
-        print(f"🔴 Erreur table crypto: {e}")
+        print(f"🔴 Erreur DB Crypto: {e}")
 
-# Appel immédiat pour sécuriser la DB
 ensure_payment_table()
 
 def get_btc_price_usd():
-    """Récupère le prix actuel du BTC via Binance ou Blockchain.info."""
+    """Récupère le prix actuel du BTC."""
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
         return float(r.json()['price'])
@@ -2228,34 +2231,20 @@ def get_btc_price_usd():
             r = requests.get("https://blockchain.info/ticker", timeout=5)
             return float(r.json()['USD']['last'])
         except:
-            return 65000.0 # Fallback sécurisé
-    
-def check_payment_status(address: str):
-    try:
-        r = requests.get(f"https://mempool.space/api/address/{address}", timeout=10)
-        data = r.json()
-        
-        # --- SÉCURITÉ : 1 CONFIRMATION MINIMUM ---
-        # chain_stats = L'argent est gravé dans un bloc (Confirmé)
-        # On ignore mempool_stats (Non confirmé / Risque d'arnaque RBF)
-        satoshis = data['chain_stats']['funded_txo_sum']
-        
-        return satoshis / 100_000_000
-    except:
-        return 0.0
+            return 65000.0
 
 async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+   
     
     if not ADMIN_XPUB:
-        await q.message.reply_text("⚠️ Erreur config: XPUB manquant ")
+        await q.message.reply_text("⚠️ Erreur : ADMIN_XPUB non configuré.")
         return ConversationHandler.END
 
     await replace_view(
         q,
-        "💸 **Recharge votre solde !**\n\n"
-        "Combien voulez-vous ajouter ? \n"
+        "💸 **Recharge de solde (Bitcoin)**\n\n"
+        "Combien de USD voulez-vous ajouter ?\n"
         "_(Exemple: tapez 50)_",
         reply_markup=kb_back_to_menu(),
         parse_mode="Markdown"
@@ -2273,7 +2262,7 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ Montant invalide.")
         return WAIT_AMOUNT_CRYPTO
 
-    msg_wait = await update.message.reply_text("⏳ Génération de l'adresse...")
+    msg_wait = await update.message.reply_text("⏳ Génération de votre adresse BTC...")
     
     try:
         btc_price = get_btc_price_usd() 
@@ -2295,19 +2284,19 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
         except: pass
 
         if "ERR" in address:
-            await update.message.reply_text(f"❌ Erreur Clé API : {address}")
+            await update.message.reply_text("❌ Erreur de génération d'adresse.")
             return ConversationHandler.END
 
         txt = (
-            f"🧾 **Facture #{order_id}**\n"
+            f"🧾 **Facture #{order_id}**\n\n"
             f"💰 Montant : `{amount_usd:.2f} USD`\n" 
             f"💎 BTC : `{amount_btc:.8f} BTC`\n\n"
             f"👉 **Envoyez à :**\n`{address}`\n\n"
-            f"_(Cliquez l'adresse pour copier)_"
+            f"⚠️ _Le solde sera crédité après 2 confirmations._"
         )
         
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ J'ai payé (Vérifier)", callback_data=f"check_pay_{order_id}")],
+            [InlineKeyboardButton("✅ Vérifier le paiement", callback_data=f"check_pay_{order_id}")],
             [InlineKeyboardButton("❌ Annuler", callback_data="menu_accueil")]
         ])
         
@@ -2316,13 +2305,15 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         try: await msg_wait.delete()
         except: pass
-        await update.message.reply_text(f"❌ Erreur base de données : {e}")
+        await update.message.reply_text(f"❌ Erreur : {e}")
 
     return ConversationHandler.END
 
 async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    # Réponse immédiate au bouton
+    try: await query.answer()
+    except: pass
     
     try:
         order_id = int(query.data.split("_")[-1])
@@ -2335,178 +2326,142 @@ async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
         if not row: return await query.message.reply_text("❌ Commande introuvable.")
         user_id, btc_addr, status = row
         if status == 'paid': return await query.message.reply_text("✅ Déjà payé.")
-    except Exception as e:
-        print(f"Erreur DB dans check_payment_callback: {e}") 
-        return await query.message.reply_text("⚠️ Erreur interne. Réessayez plus tard.")
-
-    # --- VÉRIFICATION PRÉCISE AVEC LE NOMBRE DE CONFIRMATIONS ---
-    try:
-        # On demande TOUTES les transactions de l'adresse pour compter les confirmations
+        
+        # Vérification Mempool
         r_txs = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", timeout=5)
         r_tip = requests.get("https://mempool.space/api/blocks/tip/height", timeout=5)
         
+        if r_txs.status_code != 200:
+            return await query.message.reply_text("❌ Impossible de vérifier pour le moment.")
+
         txs = r_txs.json()
         current_height = int(r_tip.text)
         
+        if not txs:
+            msg = await query.message.reply_text("❌ Aucun paiement détecté sur le réseau.")
+            await asyncio.sleep(5)
+            try: await msg.delete()
+            except: pass
+            return
+
+        satoshis_total = 0
+        conf_max = 0
+        for tx in txs:
+            for out in tx['vout']:
+                if out['scriptpubkey_address'] == btc_addr:
+                    satoshis_total += out['value']
+            if tx['status']['confirmed']:
+                conf_max = max(conf_max, current_height - tx['status']['block_height'] + 1)
+
+        if satoshis_total > 0:
+            status_txt = f"🔗 Confirmations : {conf_max}/2"
+            msg = await query.message.reply_text(f"👀 **Transaction trouvée !**\n\n{status_txt}")
+            await asyncio.sleep(8)
+            try: await msg.delete()
+            except: pass
+
     except Exception as e:
-        print(f"Erreur API Blockchain: {e}")
-        return await query.message.reply_text("⚠️ Erreur API Blockchain.")
-
-    if not txs:
-        # Aucune transaction trouvée du tout
-        msg_err = await query.message.reply_text("❌ Rien reçu pour l'instant. Le réseau peut prendre quelques minutes.")
-        await asyncio.sleep(5)
-        try: await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_err.message_id)
-        except: pass
-        return
-
-    # Calcul exact des confirmations
-    confirmations_max = 0
-    satoshis_total = 0
-
-    for tx in txs:
-        for out in tx['vout']:
-            if out['scriptpubkey_address'] == btc_addr:
-                satoshis_total += out['value']
-                
-        if tx['status']['confirmed']:
-            tx_height = tx['status']['block_height']
-            confs = current_height - tx_height + 1
-            confirmations_max = max(confirmations_max, confs)
-
-    # Si on a bien reçu quelque chose
-    if satoshis_total > 0:
-        
-        # 1. 🧹 ON SUPPRIME LES BOUTONS DE LA FACTURE POUR ÉVITER LE SPAM
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except: pass
-
-        # 2. 📊 ON AFFICHE LE COMPTEUR PRÉCIS
-        if confirmations_max == 0:
-            txt = (
-                f"👀 **Transaction Détectée !**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 **Confirmations : 0/2**\n"
-                f"⏳ _En attente du premier bloc (Mempool)._\n\n"
-                f"⚠️ _Ce message va disparaître._"
-            )
-        elif confirmations_max == 1:
-            txt = (
-                f"✅ **Paiement en cours de validation !**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 **Confirmations : 1/2**\n"
-                f"⏳ _Encore 1 bloc requis (environ 10 min)._\n\n"
-                f"⚠️ _Ce message va disparaître._"
-            )
-        else:
-            txt = (
-                f"🎉 **Paiement Validé !**\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 **Confirmations : {confirmations_max}/2**\n"
-                f"✅ _Votre solde arrive d'une minute à l'autre..._\n\n"
-                f"⚠️ _Ce message va disparaître._"
-            )
-
-        msg = await query.message.reply_text(txt, parse_mode="Markdown")
-
-        # 3. 💣 AUTODESTRUCTION DU MESSAGE DANS 10 SECONDES
-        await asyncio.sleep(10)
-        try: 
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg.message_id)
-        except: pass
+        print(f"Erreur callback : {e}")
 
 async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
     """Vérifie les paiements et crédite UNIQUEMENT si >= 2 Confirmations."""
-    
-    # On utilise DB_PATH (défini dans ton app.py ou utils.py) pour être sûr du chemin
     try:
-        conn = sqlite3.connect(DB_PATH) 
+        # Imports locaux pour éviter les erreurs "name not defined" et les boucles d'import
+        import sqlite3
+        import requests
+        from hdwallet import HDWallet
+        from hdwallet.cryptocurrencies import Bitcoin as BTC_Class
+        
+        # 1. Connexion DB sécurisée
+        conn = sqlite3.connect(DB_NAME) 
         c = conn.cursor()
         c.execute("SELECT id, user_id, address FROM crypto_payments WHERE status='pending'")
         pending_orders = c.fetchall()
-    except Exception as e:
-        print(f"🔴 Erreur DB task_check: {e}")
-        return
-
-    # On récupère la hauteur actuelle de la blockchain
-    try:
-        tip_req = requests.get("https://mempool.space/api/blocks/tip/height", timeout=10)
-        if tip_req.status_code != 200:
-            raise ValueError("API Mempool indisponible")
-        current_height = int(tip_req.text)
-    except Exception as e:
-        print(f"⚠️ Impossible de récupérer la hauteur du bloc: {e}")
-        conn.close()
-        return 
-
-    for row in pending_orders:
-        order_id, user_id, btc_addr = row
         
+        if not pending_orders:
+            conn.close()
+            return
+
+        # 2. Récupération de la hauteur actuelle (Mempool)
         try:
-            # On demande la liste des transactions
-            r = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", timeout=10)
-            
-            # Sécurité anti-erreur "line 1 column 1" : on vérifie si c'est bien du JSON
-            if r.status_code != 200:
-                continue
-            
-            try:
-                txs = r.json()
-            except:
-                continue # Réponse vide ou HTML (ban IP temporaire par l'API)
-            
-            total_btc_recu = 0.0
-            confirmations_max = 0
-            
-            for tx in txs:
-                if tx.get('status', {}).get('confirmed'):
-                    tx_height = tx['status']['block_height']
-                    confs = current_height - tx_height + 1
-                    confirmations_max = max(confirmations_max, confs)
-                    
-                    for out in tx.get('vout', []):
-                        if out.get('scriptpubkey_address') == btc_addr:
-                            total_btc_recu += out.get('value', 0) / 100_000_000.0
-
-            # --- LE VERDICT : 2 CONFIRMATIONS ---
-            if confirmations_max >= 2 and total_btc_recu > 0:
-                # 1. Calcul du prix
-                from app import get_btc_price_usd, update_user_balance # On s'assure qu'ils sont là
-                price_btc = get_btc_price_usd()
-                valeur_usd = total_btc_recu * price_btc
-                
-                # 2. Frais de 3%
-                frais = valeur_usd * 0.03
-                montant_final = valeur_usd - frais
-                
-                # 3. Mise à jour DB
-                c.execute("UPDATE crypto_payments SET status='paid', btc_received=? WHERE id=?", (total_btc_recu, order_id))
-                conn.commit()
-                
-                # 4. Crédit client
-                update_user_balance(str(user_id), montant_final)
-                
-                # 5. Notification
-                try:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=(
-                            f"✅ **Paiement Reçu & Validé**\n\n"
-                            f"💰 Montant : `{total_btc_recu:.8f} BTC`\n"
-                            f"💵 Valeur créditée : `+{montant_final:.2f}$` (Frais 3% inclus)\n\n"
-                            f"Merci de votre confiance !"
-                        ),
-                        parse_mode="Markdown"
-                    )
-                except: pass
-                
+            tip_req = requests.get("https://mempool.space/api/blocks/tip/height", timeout=10)
+            if tip_req.status_code != 200:
+                conn.close()
+                return
+            current_height = int(tip_req.text)
         except Exception as e:
-            # On affiche l'erreur sans tout faire planter
-            print(f"Erreur check {btc_addr}: {e}", flush=True)
-            continue
+            print(f"⚠️ API Mempool Height Offline: {e}")
+            conn.close()
+            return 
 
-    conn.close()
+        for row in pending_orders:
+            order_id, user_id, btc_addr = row
+            
+            # Sécurité : Si l'adresse est mal générée (ERR_GEN), on passe
+            if not btc_addr or "ERR" in btc_addr:
+                continue
+
+            try:
+                # 3. Récupération des transactions
+                # Utilisation d'un header User-Agent pour éviter d'être bloqué par Mempool
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                r = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", headers=headers, timeout=10)
+                
+                if r.status_code != 200:
+                    continue
+                
+                try:
+                    txs = r.json()
+                except Exception:
+                    continue # Stop l'erreur "Expecting value" si l'API renvoie du HTML
+                
+                total_btc_recu = 0.0
+                confirmations_max = 0
+                
+                for tx in txs:
+                    # On vérifie si la transaction est confirmée
+                    status = tx.get('status', {})
+                    if status.get('confirmed'):
+                        tx_height = status.get('block_height')
+                        confs = current_height - tx_height + 1
+                        confirmations_max = max(confirmations_max, confs)
+                        
+                        for out in tx.get('vout', []):
+                            if out.get('scriptpubkey_address') == btc_addr:
+                                total_btc_recu += out.get('value', 0) / 100_000_000.0
+
+                # 4. CRÉDIT SI 2 CONFIRMATIONS
+                if confirmations_max >= 2 and total_btc_recu > 0:
+                    # Import local de la fonction de solde
+                    from app import update_user_balance, get_btc_price_usd
+                    
+                    # On marque comme payé AVANT de créditer (Sécurité anti-double débit)
+                    c.execute("UPDATE crypto_payments SET status='paid', btc_received=? WHERE id=?", (total_btc_recu, order_id))
+                    conn.commit()
+                    
+                    # Calcul valeur (Prix actuel du BTC - 3% de frais de change)
+                    price_btc = get_btc_price_usd()
+                    montant_usd = (total_btc_recu * price_btc) * 0.97
+                    
+                    update_user_balance(str(user_id), montant_usd)
+                    
+                    # Notification Telegram
+                    try:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=f"✅ **Dépôt Confirmé !**\n\n💰 `+{montant_usd:.2f}$ USD` ajoutés à votre solde.\nMerci de votre confiance !",
+                            parse_mode="Markdown"
+                        )
+                    except Exception as e:
+                        print(f"⚠️ Erreur notification user {user_id}: {e}")
+                
+            except Exception as e:
+                print(f"🔴 Erreur check adresse {btc_addr}: {e}", flush=True)
+                continue
+
+        conn.close()
+    except Exception as e:
+        print(f"❌ Erreur critique Task Crypto: {e}", flush=True)
         
 async def choose_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3118,7 +3073,6 @@ async def show_permis_history(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Affiche les derniers permis générés avec un style UX (une bulle par item)."""
     q = update.callback_query
     
-    # Sécurité anti-crash (évite l'erreur si menu_handler a déjà répondu)
     try: await q.answer()
     except: pass
     
