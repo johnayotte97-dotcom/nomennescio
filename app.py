@@ -14,7 +14,11 @@ import sqlite3
 import threading
 import subprocess
 from datetime import datetime
+
+# --- MODULES LOCAUX ---
 import tickets
+from statics import callback_faq, acces_channel_prive
+from utils import replace_view, kb_back_to_menu, get_user_lang
 # --- TIERCE PARTIES ---
 import pytz
 import base58
@@ -26,6 +30,7 @@ from PIL import Image, ImageOps, ImageColor
 from bip_utils import Bip32Secp256k1, P2WPKHAddr
 from hdwallet import HDWallet
 from hdwallet.cryptocurrencies import Bitcoin as BTC
+from hdwallet.derivations import CustomDerivation
 from sentry_sdk.integrations.flask import FlaskIntegration
 from telegram.ext import PicklePersistence
 
@@ -34,34 +39,30 @@ from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
 
-from statics import callback_faq, acces_channel_prive
-
-# --- TELEGRAM (CORRIGÉ AVEC ApplicationBuilder) ---
+# --- TELEGRAM ---
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
-    Application, ApplicationBuilder,  # <--- L'AJOUT CRITIQUE EST ICI
+    Application, ApplicationBuilder,
     CommandHandler, MessageHandler, filters,
     ConversationHandler, ContextTypes, CallbackQueryHandler,
     TypeHandler, ApplicationHandlerStop
 )
 from typing import Dict, Any, List, Tuple
-# --- MODULES LOCAUX ---
-
-
 
 # --- CONFIG LOGGING ---
 logger = logging.getLogger("SYSTEM")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "database.db")
+DB_NAME = "database.db" # Assure-toi que c'est le nom utilisé dans tes fonctions
+DB_PATH = os.path.join(BASE_DIR, DB_NAME)
 
 load_dotenv()
 
 app = Flask(__name__)
 
-
+# --- FIX PROXY ---
 os.environ.pop('http_proxy', None)
 os.environ.pop('https_proxy', None)
 os.environ.pop('all_proxy', None)
@@ -69,7 +70,6 @@ os.environ.pop('HTTP_PROXY', None)
 os.environ.pop('HTTPS_PROXY', None)
 os.environ.pop('ALL_PROXY', None)
 
-# Forcer l'exception SignalWire
 os.environ["no_proxy"] = "signalwire.com,john-m-shop.signalwire.com,37.228.129.82"
 os.environ["NO_PROXY"] = "signalwire.com,john-m-shop.signalwire.com,37.228.129.82"
 
@@ -85,13 +85,6 @@ if sentry_dsn:
     print("✅ SENTRY : Monitoring Activé.")
 else:
     print("⚠️ SENTRY : Pas de clé DSN trouvée.")
-
-# ----------------------------
-
-
-# --- Ligne de test temporaire ---
-#division_by_zero = 1 / 0
-
 
 # ================= SECURITY HEARTBEAT =================
 # Ton lien Healthchecks personnel
@@ -1044,16 +1037,6 @@ def user_exists(telegram_id: str) -> bool:
     con.close()
     return exists
 
-def get_user_lang(telegram_id: str) -> str:
-    try:
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        cur.execute("SELECT lang FROM users WHERE telegram_id=?", (telegram_id,))
-        row = cur.fetchone()
-        con.close()
-        return row[0] if row else "fr"
-    except Exception:
-        return "fr"
 
 def set_user_lang(telegram_id: str, lang: str):
     con = sqlite3.connect(DB_NAME)
@@ -2137,6 +2120,43 @@ async def callback_show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ================= PAIEMENT CRYPTO (ELECTRUM / NO KYC) =================
 
+def get_crypto_address(xpub, index, coin_type="BTC"):
+    try:
+        # On choisit la classe de la crypto selon ton besoin
+        crypto_class = Bitcoin if coin_type == "BTC" else Litecoin
+        
+        # 1. Initialisation avec la classe de la crypto
+        hdwallet: HDWallet = HDWallet(cryptocurrency=crypto_class)
+        
+        # 2. Chargement de la clé publique
+        hdwallet.from_xpublic_key(xpublic_key=xpub)
+        
+        # 3. LE CORRECTIF CRITIQUE : Chemin de dérivation non-durci (No apostrophe)
+        # On utilise CustomDerivation pour avoir un contrôle total
+        path = f"m/0/{index}" 
+        hdwallet.from_derivation(CustomDerivation(path=path))
+        
+        # 4. Retourne l'adresse P2PKH (Standard)
+        return hdwallet.p2pkh_address()
+        
+    except Exception as e:
+        print(f"🔴 Erreur HDWallet (index {index}): {e}", flush=True)
+        return None
+    
+def generate_crypto_address(xpub, index, symbol=BTC):
+    try:
+        # Initialisation avec la classe de la crypto
+        hdwallet: HDWallet = HDWallet(cryptocurrency=symbol)
+        hdwallet.from_xpublic_key(xpublic_key=xpub)
+        
+        # CORRECTIF : Chemin non-durci pour XPUB (m/0/index)
+        hdwallet.from_derivation(CustomDerivation(path=f"m/0/{index}"))
+        
+        return hdwallet.p2pkh_address()
+    except Exception as e:
+        print(f"🔴 Erreur HDWallet : {e}", flush=True)
+        return None
+
 def ensure_payment_table():
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
@@ -2415,71 +2435,91 @@ async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
     """Vérifie les paiements et crédite UNIQUEMENT si >= 2 Confirmations."""
     
-    # 👇 CORRECTION ICI : Utilisation de la bonne méthode de connexion SQLite 👇
-    conn = sqlite3.connect(DB_NAME) 
-    c = conn.cursor()
-    c.execute("SELECT id, user_id, address FROM crypto_payments WHERE status='pending'")
-    pending_orders = c.fetchall()
-    
-    # On récupère la hauteur actuelle de la blockchain (le dernier bloc)
+    # On utilise DB_PATH (défini dans ton app.py ou utils.py) pour être sûr du chemin
     try:
-        tip_req = requests.get("https://mempool.space/api/blocks/tip/height", timeout=5)
+        conn = sqlite3.connect(DB_PATH) 
+        c = conn.cursor()
+        c.execute("SELECT id, user_id, address FROM crypto_payments WHERE status='pending'")
+        pending_orders = c.fetchall()
+    except Exception as e:
+        print(f"🔴 Erreur DB task_check: {e}")
+        return
+
+    # On récupère la hauteur actuelle de la blockchain
+    try:
+        tip_req = requests.get("https://mempool.space/api/blocks/tip/height", timeout=10)
+        if tip_req.status_code != 200:
+            raise ValueError("API Mempool indisponible")
         current_height = int(tip_req.text)
-    except:
+    except Exception as e:
+        print(f"⚠️ Impossible de récupérer la hauteur du bloc: {e}")
         conn.close()
-        return # Si on ne peut pas avoir la hauteur, on ne fait rien par sécurité
+        return 
 
     for row in pending_orders:
         order_id, user_id, btc_addr = row
         
         try:
-            # On demande la liste des transactions de cette adresse
-            r = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", timeout=5)
-            txs = r.json()
+            # On demande la liste des transactions
+            r = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", timeout=10)
+            
+            # Sécurité anti-erreur "line 1 column 1" : on vérifie si c'est bien du JSON
+            if r.status_code != 200:
+                continue
+            
+            try:
+                txs = r.json()
+            except:
+                continue # Réponse vide ou HTML (ban IP temporaire par l'API)
             
             total_btc_recu = 0.0
             confirmations_max = 0
             
-            # On analyse les transactions entrantes
             for tx in txs:
-                # Si la TX est confirmée (elle a un block_height)
-                if tx['status']['confirmed']:
+                if tx.get('status', {}).get('confirmed'):
                     tx_height = tx['status']['block_height']
                     confs = current_height - tx_height + 1
                     confirmations_max = max(confirmations_max, confs)
                     
-                    # On additionne les montants reçus sur notre adresse
-                    for out in tx['vout']:
-                        if out['scriptpubkey_address'] == btc_addr:
-                            total_btc_recu += out['value'] / 100_000_000.0
+                    for out in tx.get('vout', []):
+                        if out.get('scriptpubkey_address') == btc_addr:
+                            total_btc_recu += out.get('value', 0) / 100_000_000.0
 
-            # --- LE VERDICT : EST-CE QU'ON A 2 CONFIRMATIONS ? ---
+            # --- LE VERDICT : 2 CONFIRMATIONS ---
             if confirmations_max >= 2 and total_btc_recu > 0:
-                
-                # C'est bon, c'est sécurisé -> ON CRÉDITE
+                # 1. Calcul du prix
+                from app import get_btc_price_usd, update_user_balance # On s'assure qu'ils sont là
                 price_btc = get_btc_price_usd()
                 valeur_usd = total_btc_recu * price_btc
                 
-                # Note: Vous avez gardé les 3% de frais, c'est parfait si c'est voulu !
+                # 2. Frais de 3%
                 frais = valeur_usd * 0.03
                 montant_final = valeur_usd - frais
                 
+                # 3. Mise à jour DB
                 c.execute("UPDATE crypto_payments SET status='paid', btc_received=? WHERE id=?", (total_btc_recu, order_id))
                 conn.commit()
                 
+                # 4. Crédit client
                 update_user_balance(str(user_id), montant_final)
                 
+                # 5. Notification
                 try:
                     await context.bot.send_message(
                         chat_id=user_id,
-                        text=f"✅ **Paiement Validé (2/2 Confirmations)**\n"
-                             f"💰 Crédité : +{montant_final:.2f}$",
+                        text=(
+                            f"✅ **Paiement Reçu & Validé**\n\n"
+                            f"💰 Montant : `{total_btc_recu:.8f} BTC`\n"
+                            f"💵 Valeur créditée : `+{montant_final:.2f}$` (Frais 3% inclus)\n\n"
+                            f"Merci de votre confiance !"
+                        ),
                         parse_mode="Markdown"
                     )
                 except: pass
                 
         except Exception as e:
-            print(f"Erreur check {btc_addr}: {e}")
+            # On affiche l'erreur sans tout faire planter
+            print(f"Erreur check {btc_addr}: {e}", flush=True)
             continue
 
     conn.close()
