@@ -34,7 +34,7 @@ from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
 
-
+from statics import callback_faq, acces_channel_prive
 
 # --- TELEGRAM (CORRIGÉ AVEC ApplicationBuilder) ---
 from telegram import (
@@ -2724,117 +2724,10 @@ async def callback_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await replace_view(q, intro_text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-async def callback_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("🟢 [DEBUG] Entrée dans la fonction callback_faq réussie !", flush=True)
-    q = update.callback_query
-    try: await q.answer()
-    except: pass
-    lang = get_user_lang(str(update.effective_user.id))
-    
-    if lang == "fr":
-        txt = (
-            "📚 FAQ (Tarifs USD)\n\n"
-            "💵 Système de paliers :\n"
-            "• Bronze : 7.00 USD / permis\n"
-            "• Silver : 5.50 USD / permis (après 175$ rechargés)\n"
-            "• Gold : 4.25 USD / permis (après 350$)\n"
-            "• Platinum : 2.80 USD / permis (après 700$)\n"
-            "➡️ Le passage de palier est automatique selon vos recharges.\n\n"
-            "🆘 Support :\n"
-            "Après tout paiement, envoyez un *screenshot* de la preuve. Le crédit est ajouté très rapidement.\n"
-            "Support direct : @nomennesciosupport\n\n"
-            "⚡ Délais :\n"
-            "La validation des permis est quasi instantanée. Les paiements sont confirmés en quelques minutes.\n\n"
-            "🤝 Partenariats :\n"
-            "Nous sommes ouverts à toute collaboration ou intégration.\n\n"
-            "🚀 Nouvelles fonctions :\n"
-            "De nouvelles fonctionnalités arrivent bientôt (automatisations, statistiques, outils avancés)."
-        )
-    else:
-        txt = (
-            "📚 FAQ (USD Pricing)\n\n"
-            "💵 Tier system:\n"
-            "• Bronze: 7.00 USD / license\n"
-            "• Silver: 5.50 USD / license (after $175 recharged)\n"
-            "• Gold: 4.25 USD / license (after $350)\n"
-            "• Platinum: 2.80 USD / license (after $700)\n"
-            "➡️ Tier upgrades are automatic based on your recharges.\n\n"
-            "🆘 Support:\n"
-            "After each payment, please send a *screenshot* as proof. Your balance will be credited very quickly.\n"
-            "Direct support: @nomennesciosupport\n\n"
-            "⚡ Processing time:\n"
-            "License validation is almost instant. Payments are confirmed within minutes.\n\n"
-            "🤝 Partnerships:\n"
-            "We are open to any collaboration or integration.\n\n"
-            "🚀 Upcoming features:\n"
-            "New functionalities coming soon (automation, statistics, advanced tools)."
-        )
-    
-    await replace_view(q, txt, reply_markup=kb_back_to_menu(), parse_mode="Markdown")
 
-# ================= CHANNEL PRIVÉ (FINAL) =================
-async def acces_channel_prive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    
-    # Sécurité anti-crash dès le début de la fonction (évite le bug "Double Answer")
-    try: await q.answer()
-    except: pass
-    
-    # TON ID (Celui qui est correct)
-    ID_DU_CANAL = -1003536878473
 
-    try:
-        # 1. On vérifie si tu es membre
-        is_member = False
-        try:
-            member = await context.bot.get_chat_member(chat_id=ID_DU_CANAL, user_id=q.from_user.id)
-            if member.status in ['member', 'creator', 'administrator', 'restricted']:
-                is_member = True
-        except Exception:
-            pass # Si on arrive pas à vérifier, on assume que non
 
-        # 2. SI TU ES DÉJÀ MEMBRE
-        if is_member:
-            # On construit le lien d'accès direct (t.me/c/...)
-            clean_id = str(ID_DU_CANAL).replace("-100", "")
-            direct_link = f"https://t.me/c/{clean_id}/1"
-            
-            await replace_view(
-                q,
-                "👋 **Tu es déjà membre !**\n\n"
-                "Tu as déjà accès au canal VIP. Clique sur le bouton ci-dessous pour y entrer directement.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🚀 Ouvrir le Canal", url=direct_link)],
-                    [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
-                ]),
-                parse_mode="Markdown"
-            )
-            return
 
-        # 3. SI TU N'ES PAS MEMBRE (On génère l'invitation)
-        # Remplacé par la version sécurisée pour éviter le plantage
-        try: await q.answer() 
-        except: pass
-        
-        invite_link = await context.bot.create_chat_invite_link(
-            chat_id=ID_DU_CANAL,
-            member_limit=1, 
-            name=f"Invite pour {q.from_user.first_name}"
-        )
-
-        await replace_view(
-            q,
-            f"🕵️ **Accès VIP Autorisé**\n\n"
-            f"Voici ton lien d'accès unique.\n"
-            f"⚠️ Attention : Ce lien ne fonctionne qu'une seule fois.\n\n"
-            f"👉 {invite_link.invite_link}",
-            reply_markup=kb_back_to_menu(),
-            parse_mode="Markdown"
-        )
-
-    except Exception as e:
-        logger.error(f"Erreur channel: {e}")
-        await q.message.reply_text("🔴 Une erreur est survenue (vérifie que le bot est Admin du canal).")
     
     # ========================== HISTORIQUE (helpers communs) ==========================
 def _table_exists(con, name: str) -> bool:
