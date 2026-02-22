@@ -28,9 +28,11 @@ from dotenv import load_dotenv
 from mnemonic import Mnemonic
 from PIL import Image, ImageOps, ImageColor
 from bip_utils import Bip32Secp256k1, P2WPKHAddr
+
 from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin as BTC
+from hdwallet.cryptocurrencies import Bitcoin as BTC_Class, Litecoin as LTC_Class
 from hdwallet.derivations import CustomDerivation
+
 from sentry_sdk.integrations.flask import FlaskIntegration
 from telegram.ext import PicklePersistence
 
@@ -761,6 +763,8 @@ ID_AUTH_WAIT_SEED = 1502       # Import d'un wallet existant
 SELECT_TOOL = 900
 WAIT_HLR_NUMBER = 901
 ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
+BTC = BTC_Class
+LTC = LTC_Class
 
 
 (ACC_WAIT_NEW_PIN, ACC_WAIT_USERNAME, ACC_WAIT_JABBER, ACC_WAIT_RESET_CONFIRM) = range(3200, 3204)
@@ -2127,124 +2131,104 @@ async def callback_show_my_id(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # ================= PAIEMENT CRYPTO (ELECTRUM / NO KYC) =================
 
-def get_crypto_address(xpub, index, coin_type="BTC"):
+from hdwallet import HDWallet
+from hdwallet.cryptocurrencies import Bitcoin as BTC_Class, Litecoin as LTC_Class
+from hdwallet.derivations import CustomDerivation
+import base58
+
+def zpub_to_xpub(zpub: str) -> str:
+    """Convertit une clé zpub (Segwit) en xpub (Standard) pour que HDWallet la comprenne."""
     try:
-        # On choisit la classe de la crypto selon ton besoin
-        crypto_class = Bitcoin if coin_type == "BTC" else Litecoin
+        zpub = zpub.strip().replace('"', '').replace("'", "")
+        if not zpub.startswith("zpub"):
+            return zpub
+        data = base58.b58decode_check(zpub)
+        # Remplace le préfixe zpub (04b24746) par le préfixe xpub standard (0488b21e)
+        data = b'\x04\x88\xB2\x1E' + data[4:]
+        return base58.b58encode_check(data).decode()
+    except Exception as e:
+        print(f"⚠️ Erreur conversion zpub: {e}")
+        return zpub
+
+def get_crypto_address(xpub, index, coin_type="BTC"):
+    """Génère une adresse Segwit (bc1q) compatible Electrum."""
+    try:
+        # 1. Convertir si c'est une zpub
+        clean_xpub = zpub_to_xpub(xpub)
         
-        # 1. Initialisation avec la classe de la crypto
+        # 2. Initialisation HDWallet
+        crypto_class = BTC_Class if coin_type == "BTC" else LTC_Class
         hdwallet: HDWallet = HDWallet(cryptocurrency=crypto_class)
+        hdwallet.from_xpublic_key(xpublic_key=clean_xpub)
         
-        # 2. Chargement de la clé publique
-        hdwallet.from_xpublic_key(xpublic_key=xpub)
+        # 3. Dérivation non-durcie (Indispensable pour XPUB)
+        hdwallet.from_derivation(CustomDerivation(path=f"m/0/{index}"))
         
-        # 3. LE CORRECTIF CRITIQUE : Chemin de dérivation non-durci (No apostrophe)
-        # On utilise CustomDerivation pour avoir un contrôle total
-        path = f"m/0/{index}" 
-        hdwallet.from_derivation(CustomDerivation(path=path))
-        
-        # 4. Retourne l'adresse P2PKH (Standard)
-        return hdwallet.p2pkh_address()
+        # 4. Retourne l'adresse Segwit (Bech32) commencant par bc1q
+        return hdwallet.p2wpkh_address() 
         
     except Exception as e:
         print(f"🔴 Erreur HDWallet (index {index}): {e}", flush=True)
         return None
-    
-def generate_crypto_address(xpub, index, symbol=BTC):
-    try:
-        hdwallet: HDWallet = HDWallet(cryptocurrency=symbol)
-        hdwallet.from_xpublic_key(xpublic_key=xpub)
-        # FORCE le chemin non-durci (No apostrophe)
-        hdwallet.from_derivation(CustomDerivation(path=f"m/0/{index}"))
-        return hdwallet.p2pkh_address()
-    except Exception as e:
-        print(f"🔴 Erreur Crypto bloquante : {e}")
-        return None
-
-def ensure_payment_table():
-    con = sqlite3.connect(DB_NAME)
-    cur = con.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS crypto_payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT,
-            address TEXT,
-            amount_cad REAL,
-            amount_btc_expected REAL,
-            btc_received REAL DEFAULT 0,
-            status TEXT DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # --- PATCH MAGIQUE : Ajoute les colonnes manquantes sans écraser ---
-    colonnes_a_ajouter = [
-        ("address", "TEXT"),
-        ("amount_cad", "REAL"),
-        ("amount_btc_expected", "REAL"),
-        ("btc_received", "REAL DEFAULT 0")
-    ]
-    for col, col_type in colonnes_a_ajouter:
-        try: cur.execute(f"ALTER TABLE crypto_payments ADD COLUMN {col} {col_type}")
-        except: pass
-    
-    con.commit()
-    con.close()
-
-ensure_payment_table()
-
-def get_btc_price_usd():
-    try:
-        # Tentative 1 : API Binance (Très rapide et robuste pour les serveurs)
-        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
-        return float(r.json()['price'])
-    except Exception as e:
-        print(f"Erreur API Binance: {e}")
-        try:
-            # Tentative 2 : API Blockchain.info (Alternative de secours)
-            r = requests.get("https://blockchain.info/ticker", timeout=5)
-            return float(r.json()['USD']['last'])
-        except:
-            # Fallback ultime : Mets un prix plus réaliste au cas où tout plante
-            return 64000.0
-
-def zpub_to_xpub(zpub: str) -> str:
-    """Convertit une clé zpub (Electrum) en xpub (Standard) pour compatibilité."""
-    try:
-        if not zpub.startswith("zpub"):
-            return zpub
-        data = base58.b58decode_check(zpub)
-        # Remplace le préfixe zpub (04b24746) par xpub (0488b21e)
-        prefix_xpub = b'\x04\x88\xB2\x1E'
-        data = prefix_xpub + data[4:]
-        return base58.b58encode_check(data).decode()
-    except Exception as e:
-        logger.error(f"Erreur conversion zpub: {e}")
-        return zpub
 
 def generate_address(user_id: int, order_id: int) -> str:
-    """Génère une adresse BTC bc1q (Segwit) de manière ultra-stable."""
+    """Fonction principale utilisée par le bot pour générer l'adresse de paiement."""
     if not ADMIN_XPUB: 
         return "ERREUR_NO_XPUB"
     
+    # On force l'utilisation de la méthode stable
+    addr = get_crypto_address(ADMIN_XPUB, order_id, coin_type="BTC")
+    return addr if addr else "ERR_GEN_FAILED"
+
+def ensure_payment_table():
+    """Crée ou met à jour la table des paiements sans perte de données."""
     try:
-        # On utilise la fonction get_crypto_address qui est déjà corrigée 
-        # pour éviter les erreurs de "Hardened Path" (m/0/index)
-        address = get_crypto_address(ADMIN_XPUB, order_id, coin_type="BTC")
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS crypto_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                address TEXT,
+                amount_cad REAL,
+                amount_btc_expected REAL,
+                btc_received REAL DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Patch pour les installations existantes
+        colonnes = [
+            ("address", "TEXT"),
+            ("amount_cad", "REAL"),
+            ("amount_btc_expected", "REAL"),
+            ("btc_received", "REAL DEFAULT 0")
+        ]
+        for col, col_type in colonnes:
+            try:
+                cur.execute(f"ALTER TABLE crypto_payments ADD COLUMN {col} {col_type}")
+            except:
+                pass # Déjà présente
         
-        if not address or address.startswith("ERR"):
-            # Backup de secours avec ta logique Bip32 si HDWallet échoue
-            raw_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
-            ctx = Bip32Secp256k1.FromExtendedKey(raw_key)
-            # IMPORTANT : Pas de dérivation durcie ici (pas de .ChildKey(0, hardened=True))
-            addr_ctx = ctx.ChildKey(0).ChildKey(order_id)
-            pub_key_bytes = addr_ctx.PublicKey().RawCompressed().ToBytes()
-            return P2WPKHAddr.EncodeKey(pub_key_bytes, hrp="bc")
-            
-        return address
-        
+        con.commit()
+        con.close()
     except Exception as e:
-        logger.error(f"🔴 CRASH GÉNÉRATION ADRESSE (User: {user_id}): {e}")
-        return f"ERR_SYSTEM"
+        print(f"🔴 Erreur table crypto: {e}")
+
+# Appel immédiat pour sécuriser la DB
+ensure_payment_table()
+
+def get_btc_price_usd():
+    """Récupère le prix actuel du BTC via Binance ou Blockchain.info."""
+    try:
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
+        return float(r.json()['price'])
+    except:
+        try:
+            r = requests.get("https://blockchain.info/ticker", timeout=5)
+            return float(r.json()['USD']['last'])
+        except:
+            return 65000.0 # Fallback sécurisé
     
 def check_payment_status(address: str):
     try:
