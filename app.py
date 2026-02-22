@@ -2115,10 +2115,22 @@ def ensure_payment_table():
             address TEXT,
             amount_cad REAL,
             amount_btc_expected REAL,
+            btc_received REAL DEFAULT 0,
             status TEXT DEFAULT 'pending',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # --- PATCH MAGIQUE : Ajoute les colonnes manquantes sans écraser ---
+    colonnes_a_ajouter = [
+        ("address", "TEXT"),
+        ("amount_cad", "REAL"),
+        ("amount_btc_expected", "REAL"),
+        ("btc_received", "REAL DEFAULT 0")
+    ]
+    for col, col_type in colonnes_a_ajouter:
+        try: cur.execute(f"ALTER TABLE crypto_payments ADD COLUMN {col} {col_type}")
+        except: pass
+    
     con.commit()
     con.close()
 
@@ -2211,7 +2223,6 @@ async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     try:
-        # On lit le montant comme étant du USD
         amount_usd = float(update.message.text.replace(',', '.').strip())
         if amount_usd < 5: 
             await update.message.reply_text("❌ Minimum 5$ USD.")
@@ -2222,40 +2233,49 @@ async def receive_amount_crypto(update: Update, context: ContextTypes.DEFAULT_TY
 
     msg_wait = await update.message.reply_text("⏳ Génération de l'adresse...")
     
-    # Calcul en USD
-    btc_price = get_btc_price_usd() # <-- Appel de la nouvelle fonction
-    amount_btc = amount_usd / btc_price
-    
-    con = sqlite3.connect(DB_NAME)
-    cur = con.cursor()
-    # On sauvegarde amount_usd dans la colonne amount_cad (ou tu peux renommer ta colonne plus tard)
-    cur.execute("INSERT INTO crypto_payments (user_id, amount_cad, amount_btc_expected) VALUES (?,?,?)", 
-                (str(user_id), amount_usd, amount_btc))
-    order_id = cur.lastrowid
-    
-    address = generate_address(user_id, order_id)
-    
-    cur.execute("UPDATE crypto_payments SET address=? WHERE id=?", (address, order_id))
-    con.commit()
-    con.close()
-    
-    try: await msg_wait.delete()
-    except: pass
+    try:
+        btc_price = get_btc_price_usd() 
+        amount_btc = amount_usd / btc_price
+        
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        cur.execute("INSERT INTO crypto_payments (user_id, amount_cad, amount_btc_expected) VALUES (?,?,?)", 
+                    (str(user_id), amount_usd, amount_btc))
+        order_id = cur.lastrowid
+        
+        address = generate_address(user_id, order_id)
+        
+        cur.execute("UPDATE crypto_payments SET address=? WHERE id=?", (address, order_id))
+        con.commit()
+        con.close()
+        
+        try: await msg_wait.delete()
+        except: pass
 
-    txt = (
-        f"🧾 **Facture #{order_id}**\n"
-        f"💰 Montant : `{amount_usd:.2f} USD`\n" # <-- Affichage USD
-        f"💎 BTC : `{amount_btc:.8f} BTC`\n\n"
-        f"👉 **Envoyez à :**\n`{address}`\n\n"
-        f"_(Cliquez l'adresse pour copier)_"
-    )
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ J'ai payé (Vérifier)", callback_data=f"check_pay_{order_id}")],
-        [InlineKeyboardButton("❌ Annuler", callback_data="menu_accueil")]
-    ])
-    
-    await update.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
+        if "ERR" in address:
+            await update.message.reply_text(f"❌ Erreur Clé API : {address}")
+            return ConversationHandler.END
+
+        txt = (
+            f"🧾 **Facture #{order_id}**\n"
+            f"💰 Montant : `{amount_usd:.2f} USD`\n" 
+            f"💎 BTC : `{amount_btc:.8f} BTC`\n\n"
+            f"👉 **Envoyez à :**\n`{address}`\n\n"
+            f"_(Cliquez l'adresse pour copier)_"
+        )
+        
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ J'ai payé (Vérifier)", callback_data=f"check_pay_{order_id}")],
+            [InlineKeyboardButton("❌ Annuler", callback_data="menu_accueil")]
+        ])
+        
+        await update.message.reply_text(txt, reply_markup=kb, parse_mode="Markdown")
+        
+    except Exception as e:
+        try: await msg_wait.delete()
+        except: pass
+        await update.message.reply_text(f"❌ Erreur base de données : {e}")
+
     return ConversationHandler.END
 
 async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2268,7 +2288,7 @@ async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
         order_id = int(query.data.split("_")[-1])
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT user_id, btc_address, status FROM crypto_payments WHERE id=?", (order_id,))
+        c.execute("SELECT user_id, address, status FROM crypto_payments WHERE id=?", (order_id,))
         row = c.fetchone()
         conn.close()
         
@@ -2326,7 +2346,7 @@ async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
     """Vérifie les paiements et crédite UNIQUEMENT si >= 2 Confirmations."""
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT id, user_id, btc_address FROM crypto_payments WHERE status='pending'")
+    c.execute("SELECT id, user_id, address FROM crypto_payments WHERE status='pending'")
     pending_orders = c.fetchall()
     
     # On récupère la hauteur actuelle de la blockchain (le dernier bloc)
@@ -9077,6 +9097,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(cart_clear_callback, pattern=r"^cart:clear$"))
     application.add_handler(CallbackQueryHandler(cart_checkout_callback, pattern=r"^cart:checkout$"))
     application.add_handler(CallbackQueryHandler(cart_remove_single, pattern=r"^cart:del:\d+$"))
+    application.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_"))
 
     # 6. AUTRES FLUX (ID Docs, Paiement, Menu Principal)
     application.add_handler(payment_conv)
@@ -9084,6 +9105,7 @@ def setup_all_handlers(application):
     application.add_handler(conv_handler) # Ceci gère le /start et menu_accueil
 
     # 7. ADMIN (Callbacks simples)
+    
     application.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     application.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     application.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
