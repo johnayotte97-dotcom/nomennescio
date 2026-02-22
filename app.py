@@ -6248,6 +6248,13 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['cart_return_to'] = "menu_accueil"
         return await goto_menu(update, context)
 
+    # --- NOUVEAUX BOUTONS STATIQUES (FAQ & CHANNEL) ---
+    if data == "faq":
+        return await callback_faq(update, context)
+        
+    if data == "join_private_channel":
+        return await acces_channel_prive(update, context)
+
     # --- SECTION HISTORIQUE (Navigation & Affichage) ---
     if data == "hist:view":
         return await hist_view_callback(update, context)
@@ -9119,9 +9126,7 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(admin_menu, pattern="^admin_menu$"),
         CallbackQueryHandler(auth_logout, pattern="^auth_logout$"),
         CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"),
-        CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"),
-        CallbackQueryHandler(callback_faq, pattern="^faq$"),
-        CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$")
+        CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$")
     ],
     states={
         # --- AUTHENTIFICATION ---
@@ -9186,9 +9191,7 @@ conv_handler = ConversationHandler(
     fallbacks=[
         CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
         CommandHandler("start", goto_menu),
-        CallbackQueryHandler(ticket_resume, pattern="^ticket_resume:"),
-        CallbackQueryHandler(callback_faq, pattern="^faq$"),
-        CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$")
+        CallbackQueryHandler(ticket_resume, pattern="^ticket_resume:")
     ],
     name="main_conversation"
 )
