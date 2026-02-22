@@ -6178,49 +6178,43 @@ def analyze_response():
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     
-    # Réponse immédiate avec traqueur d'erreur
+    # 1. Réponse unique au clic (Indispensable pour débloquer le bouton gris)
     try: 
         await q.answer()
-    except Exception as e:
-        print(f"[EXTREME DEBUG] Erreur q.answer initial : {e}", flush=True)
+    except:
+        pass
 
     data = q.data
     user_id = update.effective_user.id
-    print(f"[DBG] menu_handler triggered with data={data}", flush=True)
+    
+    # DEBUG Simple (Utile pour voir si le clic arrive)
+    print(f"DEBUG: Clic détecté -> {data}", flush=True)
 
     # --- LOGIQUE DE RETOUR / ACCUEIL ---
     if data == "menu_accueil":
         context.user_data['cart_return_to'] = "menu_accueil"
         return await goto_menu(update, context)
 
-    # --- NOUVEAUX BOUTONS STATIQUES (FAQ & CHANNEL) ---
+    # --- BOUTONS STATIQUES (FAQ & VIP) ---
+    # Ces fonctions sont importées de statics.py
     if data == "faq":
-        print("[EXTREME DEBUG] Avant appel à callback_faq", flush=True)
         try:
-            await callback_faq(update, context)
+            return await callback_faq(update, context)
         except Exception as e:
-            print(f"🔴🔴🔴 [EXTREME FATAL ERROR] callback_faq a planté : {e}", flush=True)
-            import traceback
-            print(traceback.format_exc(), flush=True)
-        print("[EXTREME DEBUG] Après appel à callback_faq", flush=True)
-        return
+            print(f"🔴 Erreur FAQ: {e}", flush=True)
+            return
         
     if data == "join_private_channel":
-        print("[EXTREME DEBUG] Avant appel à acces_channel_prive", flush=True)
         try:
-            await acces_channel_prive(update, context)
+            return await acces_channel_prive(update, context)
         except Exception as e:
-            print(f"🔴🔴🔴 [EXTREME FATAL ERROR] acces_channel_prive a planté : {e}", flush=True)
-            import traceback
-            print(traceback.format_exc(), flush=True)
-        print("[EXTREME DEBUG] Après appel à acces_channel_prive", flush=True)
-        return
+            print(f"🔴 Erreur Channel: {e}", flush=True)
+            return
 
-    # --- SECTION HISTORIQUE (Navigation & Affichage) ---
+    # --- SECTION HISTORIQUE ---
     if data == "hist:view":
         return await hist_view_callback(update, context)
 
-    # AJOUT ICI : Gestion des flèches de l'historique Pro's
     if data.startswith("hist:pros"):
         return await hist_pros(update, context)
 
@@ -6230,8 +6224,8 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "hist:ids":
         return await show_ids_history(update, context)
 
-    # --- SECTION BOUTIQUE (PROPRO) ---
-    if data == "propro" or data == "cat:propro":
+    # --- SECTION BOUTIQUE ---
+    if data in ["propro", "cat:propro"]:
         context.user_data["prod_tier"] = None
         context.user_data['cart_return_to'] = "cat:propro"
         return await show_products(update, context, page=0, tier=None)
@@ -6241,7 +6235,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tier = context.user_data.get("prod_tier")
         return await show_products(update, context, page=page, tier=tier)
 
-    # --- SECTION BOUTIQUE (CCS) ---
     if data.startswith("ccs:page:"):
         page = int(data.split(":")[2])
         tier = context.user_data.get("prod_tier")
