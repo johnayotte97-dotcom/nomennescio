@@ -2138,12 +2138,18 @@ ensure_payment_table()
 
 def get_btc_price_usd():
     try:
-        # On demande le prix en USD à CoinGecko
-        r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=5)
-        return float(r.json()['bitcoin']['usd'])
-    except:
-        # Fallback : Prix approximatif du BTC en USD (Mets une valeur sûre)
-        return 96000.0
+        # Tentative 1 : API Binance (Très rapide et robuste pour les serveurs)
+        r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
+        return float(r.json()['price'])
+    except Exception as e:
+        print(f"Erreur API Binance: {e}")
+        try:
+            # Tentative 2 : API Blockchain.info (Alternative de secours)
+            r = requests.get("https://blockchain.info/ticker", timeout=5)
+            return float(r.json()['USD']['last'])
+        except:
+            # Fallback ultime : Mets un prix plus réaliste au cas où tout plante
+            return 64000.0
 
 def zpub_to_xpub(zpub: str) -> str:
     """Convertit une clé zpub (Electrum) en xpub (Standard) pour compatibilité."""
@@ -2282,11 +2288,9 @@ async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     
-    # ... (Récupération order_id, SQL, etc... gardez votre code existant pour ça) ...
-    # Je vous remets le bloc de récupération pour être sûr :
     try:
         order_id = int(query.data.split("_")[-1])
-        conn = get_db_connection()
+        conn = sqlite3.connect(DB_NAME)
         c = conn.cursor()
         c.execute("SELECT user_id, address, status FROM crypto_payments WHERE id=?", (order_id,))
         row = c.fetchone()
@@ -2295,56 +2299,92 @@ async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
         if not row: return await query.message.reply_text("❌ Commande introuvable.")
         user_id, btc_addr, status = row
         if status == 'paid': return await query.message.reply_text("✅ Déjà payé.")
-    except: return
+    except Exception as e:
+        print(f"Erreur DB dans check_payment_callback: {e}") 
+        return await query.message.reply_text("⚠️ Erreur interne. Réessayez plus tard.")
 
-    # --- VÉRIFICATION SÉCURISÉE ---
+    # --- VÉRIFICATION PRÉCISE AVEC LE NOMBRE DE CONFIRMATIONS ---
     try:
-        # On récupère les infos de l'adresse ET la hauteur de bloc actuelle (Tip)
-        r_addr = requests.get(f"https://mempool.space/api/address/{btc_addr}")
-        r_tip  = requests.get("https://mempool.space/api/blocks/tip/height")
+        # On demande TOUTES les transactions de l'adresse pour compter les confirmations
+        r_txs = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", timeout=5)
+        r_tip = requests.get("https://mempool.space/api/blocks/tip/height", timeout=5)
         
-        data = r_addr.json()
-        current_block_height = r_tip.json()
+        txs = r_txs.json()
+        current_height = int(r_tip.text)
         
-        satoshis_confirmed = data['chain_stats']['funded_txo_sum']
-        satoshis_pending   = data['mempool_stats']['funded_txo_sum']
-        
-    except:
+    except Exception as e:
+        print(f"Erreur API Blockchain: {e}")
         return await query.message.reply_text("⚠️ Erreur API Blockchain.")
 
-    # CALCUL DES CONFIRMATIONS (Approximation via chain_stats)
-    # Si chain_stats > 0, on a au moins 1 confirmation.
-    # Pour avoir le nombre exact, il faudrait parser les TXs, mais pour simplifier :
-    # Si c'est dans Mempool, c'est 0 conf.
-    
-    # CAS A : C'est dans le Mempool (0 Conf) -> ON RASSURE MAIS ON ATTEND
-    if satoshis_pending > 0 and satoshis_confirmed == 0:
-        msg = await query.message.reply_text(
-            f"👀 **Transaction Détectée !**\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"Le réseau voit bien votre paiement en attente.\n"
-            f"🔒 **Sécurité :** En attente de 2 confirmations.\n"
-            f"⏳ _Votre solde sera ajouté automatiquement dans ~20 min._\n\n"
-            f"⚠️ _Ce message va disparaître._",
-            parse_mode="Markdown"
-        )
-        # Autodestruction du message dans 10 secondes
-        await asyncio.sleep(10)
-        try: await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg.message_id)
+    if not txs:
+        # Aucune transaction trouvée du tout
+        msg_err = await query.message.reply_text("❌ Rien reçu pour l'instant. Le réseau peut prendre quelques minutes.")
+        await asyncio.sleep(5)
+        try: await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg_err.message_id)
         except: pass
         return
 
-    # CAS B : C'est confirmé (Au moins 1 fois) -> On laisse la tâche de fond gérer les 2 confs
-    elif satoshis_confirmed > 0:
-        await query.message.reply_text("✅ Paiement confirmé sur la Blockchain ! Le solde arrive...")
-        # (La tâche automatique ci-dessous fera le crédit final)
+    # Calcul exact des confirmations
+    confirmations_max = 0
+    satoshis_total = 0
+
+    for tx in txs:
+        for out in tx['vout']:
+            if out['scriptpubkey_address'] == btc_addr:
+                satoshis_total += out['value']
+                
+        if tx['status']['confirmed']:
+            tx_height = tx['status']['block_height']
+            confs = current_height - tx_height + 1
+            confirmations_max = max(confirmations_max, confs)
+
+    # Si on a bien reçu quelque chose
+    if satoshis_total > 0:
         
-    else:
-        await query.message.reply_text("❌ Rien reçu pour l'instant. Envoyez les BTC.")
+        # 1. 🧹 ON SUPPRIME LES BOUTONS DE LA FACTURE POUR ÉVITER LE SPAM
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except: pass
+
+        # 2. 📊 ON AFFICHE LE COMPTEUR PRÉCIS
+        if confirmations_max == 0:
+            txt = (
+                f"👀 **Transaction Détectée !**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🔗 **Confirmations : 0/2**\n"
+                f"⏳ _En attente du premier bloc (Mempool)._\n\n"
+                f"⚠️ _Ce message va disparaître._"
+            )
+        elif confirmations_max == 1:
+            txt = (
+                f"✅ **Paiement en cours de validation !**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🔗 **Confirmations : 1/2**\n"
+                f"⏳ _Encore 1 bloc requis (environ 10 min)._\n\n"
+                f"⚠️ _Ce message va disparaître._"
+            )
+        else:
+            txt = (
+                f"🎉 **Paiement Validé !**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🔗 **Confirmations : {confirmations_max}/2**\n"
+                f"✅ _Votre solde arrive d'une minute à l'autre..._\n\n"
+                f"⚠️ _Ce message va disparaître._"
+            )
+
+        msg = await query.message.reply_text(txt, parse_mode="Markdown")
+
+        # 3. 💣 AUTODESTRUCTION DU MESSAGE DANS 10 SECONDES
+        await asyncio.sleep(10)
+        try: 
+            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=msg.message_id)
+        except: pass
 
 async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
     """Vérifie les paiements et crédite UNIQUEMENT si >= 2 Confirmations."""
-    conn = get_db_connection()
+    
+    # 👇 CORRECTION ICI : Utilisation de la bonne méthode de connexion SQLite 👇
+    conn = sqlite3.connect(DB_NAME) 
     c = conn.cursor()
     c.execute("SELECT id, user_id, address FROM crypto_payments WHERE status='pending'")
     pending_orders = c.fetchall()
@@ -2385,8 +2425,10 @@ async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
             if confirmations_max >= 2 and total_btc_recu > 0:
                 
                 # C'est bon, c'est sécurisé -> ON CRÉDITE
-                price_btc = get_btc_price()
+                price_btc = get_btc_price_usd()
                 valeur_usd = total_btc_recu * price_btc
+                
+                # Note: Vous avez gardé les 3% de frais, c'est parfait si c'est voulu !
                 frais = valeur_usd * 0.03
                 montant_final = valeur_usd - frais
                 
@@ -9213,9 +9255,11 @@ def run_bot_polling():
         # Configuration des Handlers
         setup_all_handlers(app_telegram)
 
-        # JobQueue
+       # JobQueue
         if app_telegram.job_queue:
             app_telegram.job_queue.run_repeating(check_inactivity_job, interval=60, first=60)
+            # 👇 AJOUT : Lancement de la vérification des paiements toutes les 2 minutes
+            app_telegram.job_queue.run_repeating(task_check_crypto_deposits, interval=120, first=10)
         
         print("✅ BOT EN LIGNE (Mémoire persistante activée) !")
         app_telegram.run_polling(close_loop=False, stop_signals=False)
