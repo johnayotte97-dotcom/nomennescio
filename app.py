@@ -9120,6 +9120,8 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(auth_logout, pattern="^auth_logout$"),
         CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"),
         CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$"),
+        CallbackQueryHandler(callback_faq, pattern="^faq$"),
+        CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$")
     ],
     states={
         # --- AUTHENTIFICATION ---
@@ -9184,7 +9186,9 @@ conv_handler = ConversationHandler(
     fallbacks=[
         CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
         CommandHandler("start", goto_menu),
-        CallbackQueryHandler(ticket_resume, pattern="^ticket_resume:")
+        CallbackQueryHandler(ticket_resume, pattern="^ticket_resume:"),
+        CallbackQueryHandler(callback_faq, pattern="^faq$"),
+        CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$")
     ],
     name="main_conversation"
 )
@@ -9244,8 +9248,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
     application.add_handler(CallbackQueryHandler(admin_deluser_ask, pattern="^admin_deluser_ask_"))
     application.add_handler(CallbackQueryHandler(admin_deluser_confirm, pattern="^admin_deluser_confirm_"))
-    application.add_handler(CallbackQueryHandler(callback_faq, pattern="^faq$"))
-    application.add_handler(CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$"))
+
     
     
 
