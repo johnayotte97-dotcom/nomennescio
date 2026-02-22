@@ -2145,16 +2145,13 @@ def get_crypto_address(xpub, index, coin_type="BTC"):
     
 def generate_crypto_address(xpub, index, symbol=BTC):
     try:
-        # Initialisation avec la classe de la crypto
         hdwallet: HDWallet = HDWallet(cryptocurrency=symbol)
         hdwallet.from_xpublic_key(xpublic_key=xpub)
-        
-        # CORRECTIF : Chemin non-durci pour XPUB (m/0/index)
+        # FORCE le chemin non-durci (No apostrophe)
         hdwallet.from_derivation(CustomDerivation(path=f"m/0/{index}"))
-        
         return hdwallet.p2pkh_address()
     except Exception as e:
-        print(f"🔴 Erreur HDWallet : {e}", flush=True)
+        print(f"🔴 Erreur Crypto bloquante : {e}")
         return None
 
 def ensure_payment_table():
