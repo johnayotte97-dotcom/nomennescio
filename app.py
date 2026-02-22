@@ -34,6 +34,8 @@ from flask import Flask, request, Response
 from signalwire.rest import Client as SignalWireClient
 from twilio.twiml.voice_response import VoiceResponse
 
+
+
 # --- TELEGRAM (CORRIGÉ AVEC ApplicationBuilder) ---
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -51,6 +53,9 @@ from typing import Dict, Any, List, Tuple
 
 # --- CONFIG LOGGING ---
 logger = logging.getLogger("SYSTEM")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "database.db")
 
 load_dotenv()
 
@@ -176,8 +181,17 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         pid = int(q.data.split(":")[-1])
         user_id = str(update.effective_user.id)
         chat_id = update.effective_chat.id
+        
+        # --- RÉCUPÉRATION SÉCURISÉE DE LA CONNEXION ---
         db = context.bot_data.get("db_conn")
+        if db is None:
+            # Reconnexion manuelle si la session est perdue
+            import sqlite3
+            db = sqlite3.connect(DB_NAME, check_same_thread=False)
+            context.bot_data["db_conn"] = db
+        
         c = db.cursor()
+        # ----------------------------------------------
 
         c.execute("SELECT * FROM products WHERE id=?", (pid,))
         row = c.fetchone()
@@ -195,13 +209,11 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return await q.message.reply_text(f"⚠️ Solde insuffisant ({balance:.2f} USD).")
 
         # --- 1. NETTOYAGE VISUEL IMMÉDIAT ---
-        # On récupère tous les IDs de messages du catalogue et du panier pour les effacer
         msgs_to_kill = []
         msgs_to_kill += context.user_data.pop("catalog_msg_ids", [])
         msgs_to_kill += context.user_data.pop("cart_msg_ids", [])
         msgs_to_kill += CATALOG_MSGS.pop(chat_id, [])
         
-        # On ajoute le message actuel (celui du bouton Payer)
         try: await q.message.delete()
         except: pass
 
@@ -211,15 +223,24 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # --- 2. TRAITEMENT DE LA TRANSACTION ---
         update_user_balance(user_id, -price)
-        c.execute("INSERT INTO purchases (user_id, product_id, price, full_data, status, title, amount) VALUES (?,?,?,?,'paid',?,?)",
-                  (user_id, pid, price, json.dumps(prod), prod.get("title"), price))
-        c.execute("UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0", (pid,))
         
-        # Nettoyage de l'article du panier s'il y était
-        c.execute("DELETE FROM cart_items WHERE user_id=? AND product_id=?", (user_id, pid))
-        db.commit()
+        try:
+            # Insertion explicite pour respecter la structure avec created_at (index 6)
+            c.execute("""
+                INSERT INTO purchases (user_id, product_id, price, full_data, status, title, amount) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, pid, price, json.dumps(prod), 'paid', prod.get("title", "Sans titre"), price)
+            )
+            
+            c.execute("UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0", (pid,))
+            c.execute("DELETE FROM cart_items WHERE user_id=? AND product_id=?", (user_id, pid))
+            db.commit()
+        except Exception as sql_e:
+            db.rollback()
+            logger.error(f"SQL Transaction Error: {sql_e}")
+            return await context.bot.send_message(chat_id=chat_id, text=f"❌ Erreur base de données : {sql_e}")
 
-        # --- 3. AFFICHAGE DU RÉSULTAT ET RETOUR ACCUEIL ---
+        # --- 3. AFFICHAGE DU RÉSULTAT ---
         details = full_product_text(prod)
         sent = await context.bot.send_message(
             chat_id=chat_id, 
@@ -227,27 +248,23 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown"
         )
         
-        # Petit message flash de redirection
         redir = await context.bot.send_message(chat_id=chat_id, text="🔄 Retour au menu principal...")
         
-        # Tâche de suppression de la fiche après 60s
         async def _del(m):
             await asyncio.sleep(60)
             try: await m.delete()
             except: pass
         asyncio.create_task(_del(sent))
 
-        # Redirection réelle après un court instant
         await asyncio.sleep(1.5)
         try: await redir.delete()
         except: pass
         
-        # Appel du menu principal propre
         return await show_main_menu(int(user_id), clear=True)
 
     except Exception as e:
-        logger.error(f"Buy Error: {e}")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text="❌ Erreur lors de la transaction.")
+        logger.error(f"Global Buy Error: {e}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Erreur critique : {e}")
 
 async def cart_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -583,15 +600,15 @@ def kb_back_cancel():
 
 # === [CART: real implementation] ===
 async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import sqlite3, os
+    import sqlite3
     try:
         user_id = str(update.effective_user.id)
     except Exception:
         return
 
-    db_path = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
+    # Utilisation de la variable globale définie à la ligne 58
     try:
-        con = sqlite3.connect(db_path)
+        con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
         cur.execute("""
             SELECT p.title, p.price, COALESCE(c.qty,1) as qty
@@ -600,31 +617,37 @@ async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
             WHERE c.user_id = ?
         """, (user_id,))
         rows = cur.fetchall()
+    except Exception as e:
+        logger.error(f"Erreur SQL Panier : {e}")
+        rows = []
     finally:
-        try: con.close()
-        except: pass
+        if 'con' in locals(): 
+            try: con.close()
+            except: pass
 
     if not rows:
         text = "🛒 Votre panier est vide."
     else:
         total = 0.0
-        lines = ["🛒 Contenu de votre panier:"]
+        lines = ["🛒 **Contenu de votre panier:**"]
         for title, price, qty in rows:
             price = float(price or 0.0)
             qty   = int(qty or 1)
             sub   = price * qty
             total += sub
             lines.append(f"• {title} ×{qty} — {sub:.2f} $")
-        lines.append(f"\n💰 Total: {total:.2f} $")
+        lines.append(f"\n💰 **Total: {total:.2f} $**")
         text = "\n".join(lines)
 
+    # Gestion de l'affichage (Message ou Callback)
     if getattr(update, "message", None):
-        await update.message.reply_text(text)
+        await update.message.reply_text(text, parse_mode="Markdown")
     elif getattr(update, "callback_query", None):
-        try: await update.callback_query.answer()
-        except: pass
-        await update.callback_query.message.reply_text(text)
-# === [/CART] ===
+        try: 
+            await update.callback_query.answer()
+        except: 
+            pass
+        await update.callback_query.message.reply_text(text, parse_mode="Markdown")
 
 # ========================== ENV & LOCK ==========================
 
@@ -694,7 +717,7 @@ SERVER_URL = os.environ.get("SERVER_URL")
 ADMIN_IDS = ["7573645008", "8409831904"]
 CHANNEL_LOGS = "-1003589564052"
 NUMVERIFY_API_KEY = os.environ.get("NUMVERIFY_API_KEY")
-DB_NAME = os.environ.get("DB_NAME", "/home/johnmsaaq/bot-nomen/database.db")
+DB_NAME = os.environ.get("DB_NAME", DB_PATH)
 
 client = SignalWireClient(SW_PROJECT_ID, SW_TOKEN)
 
@@ -2547,12 +2570,13 @@ async def goto_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, batch_id: str, lang: str):
+async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, batch_id: str, lang: str, extra_msg_id: int = None):
     """
-    Anime un message "Décryptage en cours..." avec un timeout de 5 minutes et votre message personnalisé.
+    Anime un message "Décryptage en cours..." et supprime 
+    le message de solde (extra_msg_id) à la fin.
     """
     i = 0
-    # Timeout réglé à 5 minutes (150 tours * 2 secondes = 300s) pour éviter l'apparition prématurée
+    # Timeout réglé à 5 minutes (150 tours * 2 secondes = 300s)
     timeout_limit = 150
     
     # Laisse le temps au batch d'être créé
@@ -2577,11 +2601,9 @@ async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             br = batch_runs.get(batch_id)
             if not br: break
 
-        # === GESTION DU TIMEOUT (Si ça dépasse 5 min) ===
+        # === GESTION DU TIMEOUT ===
         if i >= timeout_limit and not br.get("notified", False):
             br["notified"] = True
-            
-            # Votre message personnalisé
             await context.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
@@ -2599,10 +2621,16 @@ async def animate_wait_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     except Exception as e:
         logger.error(f"Erreur animate_wait_message: {e}")
     finally:
-        # Si tout s'est bien passé (batch fini avant le timeout), on supprime le message d'attente
+        # Si le batch est fini normalement avant le timeout
         if br and br.get("notified", True) and i < timeout_limit:
+            # 1. On supprime le message de décryptage (le sablier)
             try: await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             except: pass
+            
+            # 2. ON SUPPRIME LE MESSAGE DU SOLDE (La cerise sur le gâteau 🍒)
+            if extra_msg_id:
+                try: await context.bot.delete_message(chat_id=chat_id, message_id=extra_msg_id)
+                except: pass
 
 def get_ivr_timings():
     """Charge les temps de pause depuis le fichier JSON, ou utilise les défauts."""
@@ -4258,6 +4286,7 @@ async def csv_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     reply = update.message.text.strip().lower()
+    
     if reply not in ["oui", "yes", "non", "no"]:
         await update.message.reply_text("❓ Oui ou Non / Yes or No?")
         return BULK_CONFIRM
@@ -4287,32 +4316,34 @@ async def bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     new_balance = update_user_balance(str(user_id), -total_cost)
-    await update.message.reply_text(
+    
+    # --- MODIFICATION ICI : Capture du message de solde ---
+    msg_balance = await update.message.reply_text(
         f"🏦 {msg(user_id, 'balance', balance=new_balance)}\n"
         f"{FORFAITS[statut]['label']} ({unit_price:.2f}$ x {len(entries)} permis = {total_cost:.2f}$)"
     )
     
-    # --- MODIFICATION ICI ---
     total_entries = len(entries)
-    # Envoie le premier message de l'animation
     msgx = await update.message.reply_text(f"🔄 {msg(user_id, 'decrytage_en_cours').replace('…','.')} (0/{total_entries})")
-    # --- FIN MODIFICATION ---
 
     batch_id = f"{user_id}:{int(datetime.now().timestamp())}"
     
-    # --- MODIFICATION ICI ---
     batch_runs[batch_id] = {
         "total": total_entries, 
         "resolved": 0, 
         "notified": False,
         "lock": asyncio.Lock(),
-        # On ne stocke plus l'ID du message ici
     }
-    # --- FIN MODIFICATION ---
 
-    # --- LANCE L'ANIMATION ---
-    asyncio.create_task(animate_wait_message(context, update.effective_chat.id, msgx.message_id, batch_id, lang))
-    # --- FIN ---
+    # --- LANCE L'ANIMATION AVEC extra_msg_id ---
+    asyncio.create_task(animate_wait_message(
+        context, 
+        update.effective_chat.id, 
+        msgx.message_id, 
+        batch_id, 
+        lang, 
+        extra_msg_id=msg_balance.message_id
+    ))
 
     tasks = []
 
@@ -4326,12 +4357,7 @@ async def bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         ))
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for (item, res) in zip(entries, results):
-        if isinstance(res, Exception):
-            log(f"Bulk launch error for {item['prenom']} {item['nom']}: {res}", user_id, "error")
-
+    # On laisse la tâche de fond gérer les résultats et l'animation gère la suppression
     return ConversationHandler.END
 
 async def receive_prenom(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4379,29 +4405,21 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prix = get_permit_price(str(user_id))
     statut = get_user_statut(str(user_id))
 
-    # --- CORRECTION AJOUTÉE ---
-    # On récupère la liste de TOUS les messages de la conversation
+    # --- RÉCUPÉRATION ET NETTOYAGE DES IDS ---
     verif_msgs = context.user_data.pop("verif_flow_msg_ids", [])
     
-    # On essaie de supprimer le message de l'utilisateur (ex: "Non" ou "Oui")
     try:
         verif_msgs.append(update.message.message_id)
     except Exception:
         pass
-    # --- FIN CORRECTION ---
 
     if reponse in ["non", "no"]:
-        # --- CORRECTION PRINCIPALE ---
-        # On n'envoie plus les messages "D0005..." ou "Retour...".
-        
-        for mid in verif_msgs: # Supprime "Combien de permis...", "Prénom...", "Nom...", "Date...", "Permis proposé..."
+        for mid in verif_msgs:
             try:
                 await context.bot.delete_message(chat_id=user_id, message_id=mid)
             except:
                 pass
-                
-        await show_main_menu(user_id, clear=True) # clear=True nettoie les messages de 'bot_messages' (sécurité)
-        # --- FIN CORRECTION ---
+        await show_main_menu(user_id, clear=True)
         return ConversationHandler.END
 
     if reponse in ["oui", "yes"]:
@@ -4409,7 +4427,6 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if balance < prix:
             keyboard = [[InlineKeyboardButton("💳 Recharger" if lang == "fr" else "💳 Top up", callback_data="add_balance")]]
             
-            # On nettoie la conversation avant d'afficher le message de solde
             for mid in verif_msgs:
                 try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
                 except: pass
@@ -4418,15 +4435,17 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg(user_id, "solde_insuffisant", balance=balance, prix=prix, statut=FORFAITS[statut]['label']),
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-            return ConversationHandler.END # On quitte la convo
+            return ConversationHandler.END
         else:
-            # On nettoie la conversation avant de payer
+            # Nettoyage de la conversation avant le processus de paiement
             for mid in verif_msgs:
                 try: await context.bot.delete_message(chat_id=user_id, message_id=mid)
                 except: pass
         
             new_balance = update_user_balance(str(user_id), -prix)
-            await update.message.reply_text(
+            
+            # --- MODIFICATION ICI : On capture l'ID du message de solde ---
+            msg_balance = await update.message.reply_text(
                 f"🏦 {msg(user_id, 'balance', balance=new_balance)}\n{FORFAITS[statut]['label']} ({prix:.2f}$/permis)"
             )
             
@@ -4439,10 +4458,17 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "resolved": 0, 
                 "notified": False,
                 "lock": asyncio.Lock(),
-                # On ne stocke plus l'ID du message ici
             }
 
-            asyncio.create_task(animate_wait_message(context, update.effective_chat.id, msgx.message_id, batch_id, lang))
+            # --- MODIFICATION ICI : On passe extra_msg_id à la tâche d'animation ---
+            asyncio.create_task(animate_wait_message(
+                context, 
+                update.effective_chat.id, 
+                msgx.message_id, 
+                batch_id, 
+                lang, 
+                extra_msg_id=msg_balance.message_id
+            ))
 
             await launch_parallel_calls(
                 base, user_id, num_calls=10,
@@ -4451,9 +4477,8 @@ async def confirm_permis(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return ConversationHandler.END
 
-    # Si la réponse n'est ni "oui" ni "non", on repose la question
+    # Si la réponse n'est ni "oui" ni "non"
     msgx = await update.message.reply_text("❓ Oui ou Non / Yes or No?")
-    # On ajoute la nouvelle question à la liste des messages à supprimer
     context.user_data.setdefault('verif_flow_msg_ids', []).append(msgx.message_id)
     return CONFIRM_VERIF
 
@@ -4730,19 +4755,30 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
     if user_id_str not in ADMIN_IDS:
         return
 
-    # 2. Vérification du fichier sur le serveur
-    file_path = '/home/johnmsaaq/bot-nomen/import.csv'  # Chemin confirmé
+    # 2. Vérification dynamique du fichier sur le serveur
+    # On utilise BASE_DIR défini à la ligne 57 pour trouver import.csv
+    file_path = os.path.join(BASE_DIR, 'import.csv') 
+    
     if not os.path.exists(file_path):
-        # Fallback au cas où
+        # Fallback au cas où le fichier est à la racine du projet sans chemin absolu
         file_path = 'import.csv' 
         if not os.path.exists(file_path):
-            await update.message.reply_text(f"❌ Fichier introuvable. Assurez-vous d'avoir envoyé 'import.csv' via SCP.")
+            await update.message.reply_text(
+                "❌ Fichier introuvable.\n"
+                f"Le bot cherche ici : `{os.path.join(BASE_DIR, 'import.csv')}`\n"
+                "Assurez-vous d'avoir envoyé 'import.csv' via SCP dans le dossier du bot."
+            )
             return
 
     await update.message.reply_text(f"📂 Fichier trouvé ! Analyse en cours...")
 
-    # 3. Connexion DB
+    # 3. Connexion DB sécurisée
     db = _get_db_from_context(context)
+    if not db:
+        # Reconnexion de secours si le context a perdu la DB
+        import sqlite3
+        db = sqlite3.connect(DB_PATH) 
+        
     c = db.cursor()
     
     # 4. Lecture du fichier
@@ -4777,7 +4813,7 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
         cols = _guess_columns(c)
         category = context.user_data.get('admin_product_category', 'propro')
 
-        # Colonnes qu'on ne veut pas voir en doublon dans la description
+        # Colonnes connues (pour éviter les doublons)
         known_keys = {
             'sin', 'sin_nas', 'dob', 'datenais', 'phone', 'telephone', 
             'address', 'adr', 'unit', 'city', 'muni', 'prov', 'prn_nom', 
@@ -4791,20 +4827,20 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
         for row in rdr:
             line_num += 1
             try:
-                # Nettoyage des données de la ligne
+                # Nettoyage des données
                 r = {k.lower().strip(): v.strip() for k, v in row.items() if k}
 
-                # --- LOGIQUE SPÉCIFIQUE À TON FICHIER ---
+                # --- LOGIQUE D'EXTRACTION ---
                 
-                # A. Nom/Prénom inversé (PRN_NOM: "LAROCHE LAURENCE")
+                # A. Nom/Prénom inversé
                 full_raw = r.get('prn_nom', '')
                 last, first = "", ""
                 if full_raw:
                     parts = full_raw.split(maxsplit=1)
-                    if len(parts) >= 1: last = parts[0]   # 1er mot = NOM
-                    if len(parts) == 2: first = parts[1]  # Reste = PRÉNOM
+                    if len(parts) >= 1: last = parts[0]
+                    if len(parts) == 2: first = parts[1]
                 
-                # B. Adresse avec unité
+                # B. Adresse
                 raw_adr = r.get('adr') or r.get('address') or ""
                 unit = r.get('unit', '')
                 address = f"{unit}-{raw_adr}" if unit else raw_adr
@@ -4814,19 +4850,15 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
                 prov = r.get('prov') or ""
                 if prov and city: city = f"{city} ({prov})"
 
-                # D. Prix et Base (depuis ton fichier)
+                # D. Prix et Base
                 price = _parse_price(r.get('price') or '0')
                 base = (r.get('base') or 'Import Local').strip()
 
-                # E. Autres champs
+                # E. Autres champs et Année
                 sin = r.get('sin_nas') or r.get('sin') or ""
                 phone = r.get('telephone') or r.get('phone') or ""
-                dob = r.get('datenais') or r.get('dob') or ""
+                dob = (r.get('datenais') or r.get('dob') or "").replace("'", "").replace('"', "")
                 
-                # Nettoyage date (enlève les guillemets '1982-10-05')
-                dob = dob.replace("'", "").replace('"', "")
-                
-                # Extraction année
                 year = ''
                 m = re.search(r'(\d{4})', dob)
                 if m: year = m.group(1)
@@ -4844,11 +4876,9 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
                     f"PRICE: {price:.2f} USD"
                 ]
                 
-                # Ajoute l'ID original à la fin
                 orig_id = r.get('id', '')
                 if orig_id: content_lines.append(f"ID: {orig_id}")
 
-                # Ramasse-miettes (ajoute les colonnes inconnues)
                 for k, v in r.items():
                     if k not in known_keys and v:
                         content_lines.append(f"{k.upper()}: {v}")
@@ -4858,7 +4888,7 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
                 # G. Titre
                 title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
 
-                # H. Insertion SQL
+                # H. Insertion SQL Dynamique
                 fields, values = [], []
                 if 'title'    in cols: fields.append('title');    values.append(title)
                 if 'content'  in cols: fields.append('content');  values.append(content)
@@ -4876,14 +4906,15 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
                 inserted += 1
 
             except Exception as e:
-                print(f"Erreur ligne {line_num}: {e}")
+                logger.error(f"Erreur ligne {line_num}: {e}")
                 continue
 
         db.commit()
-        await update.message.reply_text(f"✅ Import terminé ! {inserted} produits ajoutés.")
+        await update.message.reply_text(f"✅ Import terminé ! {inserted} produits ajoutés à la base.")
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Erreur critique : {e}")
+        logger.error(f"Erreur critique Import: {e}")
+        await update.message.reply_text(f"❌ Erreur critique lors de l'import : {e}")
 
 async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_str = str(update.effective_user.id)
@@ -5151,7 +5182,6 @@ def get_users_paginated(page=0, per_page=10):
     return rows, total
 
 
-
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Guard admin
     if str(update.effective_user.id) not in ADMIN_IDS:
@@ -5178,14 +5208,24 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await replace_view(q, "Aucun utilisateur trouvé.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Retour", callback_data="admin_menu")]]))
         return
 
-    # Construction de la liste
+    # Construction de la liste épurée
     keyboard = []
     for u in users:
         tid = str(u[0])
-        bal = float(u[1] or 0.0)
-        tier = (u[2] or 'bronze')
-        # --- ICI : ON AFFICHE L'ID COMPLET ---
-        label = f"🆔 {tid} | {tier.upper()} | {bal:.2f}$"
+        
+        # --- RÉCUPÉRATION DU NOM ---
+        con = sqlite3.connect(DB_NAME)
+        # On cherche le username telegram ou le nom custom en base de données
+        row_name = con.execute("SELECT username, custom_username FROM users WHERE telegram_id=?", (tid,)).fetchone()
+        con.close()
+        
+        display_name = "Ghost"
+        if row_name:
+            # Priorité au nom custom s'il existe, sinon le username telegram
+            display_name = row_name[1] or row_name[0] or "Ghost"
+        
+        # LABEL ÉPURÉ : [ 👤 Nom | 🆔 ID ]
+        label = f"👤 {display_name} | 🆔 {tid}"
         keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_adjust_{tid}")])
 
     # Barre de Navigation
@@ -5211,7 +5251,6 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# --- AJOUTE AUSSI CES DEUX FONCTIONS POUR LA RECHERCHE (JUSTE APRÈS) ---
 
 async def admin_search_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -5249,87 +5288,122 @@ async def admin_search_user_receive(update: Update, context: ContextTypes.DEFAUL
 
 async def admin_adjust_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    1. Affiche le profil de l'utilisateur.
-    Gère la sécurité de session et réinitialise les modes d'édition.
+    Affiche le profil détaillé de l'utilisateur incluant ID, Nom, Solde et Statut.
     """
     # 1. Guard Admin
     if str(update.effective_user.id) not in ADMIN_IDS: return
 
-    # 2. SÉCURITÉ : On désactive le mode "Édition de Solde" si on revient ici
+    # 2. SÉCURITÉ : Réinitialisation du mode édition
     context.user_data["SOLDE_EDIT_MODE"] = False 
 
     target_id = None
-    q = None
+    q = update.callback_query
     
     # 3. Récupération de l'ID cible
-    # Cas A : Clic sur un bouton (Update standard)
-    if hasattr(update, 'callback_query') and update.callback_query:
-        q = update.callback_query
+    if q:
         try: await q.answer()
         except: pass
         if "admin_adjust_" in q.data:
             target_id = q.data.replace("admin_adjust_", "")
     
-    # Cas B : Appel interne
     if not target_id:
-        target_id = context.user_data.get('target_user')
-
-    # Cas C : Fallback
-    if not target_id:
-        target_id = context.user_data.get('SOLDE_TARGET_ID')
+        target_id = context.user_data.get('target_user') or context.user_data.get('SOLDE_TARGET_ID')
 
     if not target_id:
         try: await update.effective_message.reply_text("❌ Erreur : ID utilisateur perdu.")
         except: pass
         return
 
-    # 4. Sauvegarde BLINDÉE pour la suite
+    # 4. Sauvegarde pour la session
     context.user_data["target_user"] = target_id
     context.user_data["SOLDE_TARGET_ID"] = target_id 
 
-    # 5. Récupération DB
+    # 5. Récupération complète des infos en DB (Ajout du forfait)
     con = sqlite3.connect(DB_NAME)
-    row = con.execute("SELECT username, balance FROM users WHERE telegram_id=?", (target_id,)).fetchone()
+    row = con.execute("SELECT username, balance, forfait FROM users WHERE telegram_id=?", (target_id,)).fetchone()
     con.close()
     
-    username = row[0] if row else "Inconnu"
-    balance = row[1] if row else 0.0
+    if not row:
+        try: await q.edit_message_text("❌ Utilisateur introuvable.")
+        except: pass
+        return
 
-    # --- 👇 CORRECTIF ANTI-CRASH : Échappement des caractères Markdown 👇 ---
-    # On ajoute des backslashs devant _ et * pour que Telegram ne les interprète pas comme du formatage
+    username, balance, tier = row
+    
+    # --- CORRECTIF ANTI-CRASH & STATUT ---
     safe_username = str(username).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`") if username else "Inconnu"
-    # -----------------------------------------------------------------------
+    status_label = FORFAITS.get(tier, {}).get('label', tier.upper()) # Récupère le label (ex: 🟫 Bronze)
+    # -------------------------------------
 
-    # 6. Construction Interface
+    # 6. Construction Interface épurée
     txt = (
         f"👤 **GESTION UTILISATEUR**\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🆔 ID : `{target_id}`\n"
-        f"📛 Nom : @{safe_username}\n"  # <--- On utilise safe_username ici
+        f"📛 Nom : @{safe_username}\n"
         f"💰 Solde actuel : **{balance:.2f} $**\n"
+        f"🏆 Statut : **{status_label}**\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
     kb = [
         [InlineKeyboardButton("✍️ Modifier le Solde (+/-)", callback_data=f"admin_customamount_{target_id}")],
+        [InlineKeyboardButton("🏷️ Changer le Statut", callback_data=f"admin_userstatut_{target_id}")],
         [InlineKeyboardButton("🗑 Supprimer l'utilisateur", callback_data=f"admin_deluser_ask_{target_id}")],
         [InlineKeyboardButton("🔙 Retour Liste", callback_data="admin_users")]
     ]
     
-    # 7. Affichage intelligent (Edit ou Send)
+    # 7. Affichage intelligent
     try:
         if q:
             await q.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         else:
             await context.bot.send_message(chat_id=update.effective_chat.id, text=txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    except:
-        # Fallback ultime : si le Markdown plante encore (ex: caractères bizarres), on envoie en texte brut
-        try:
-            clean_txt = txt.replace("*", "").replace("`", "").replace("_", "")
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=clean_txt, reply_markup=InlineKeyboardMarkup(kb))
-        except: 
-            pass
+    except Exception:
+        # Fallback texte brut en cas d'erreur de formatave Markdown
+        clean_txt = txt.replace("*", "").replace("`", "").replace("_", "")
+        if q: await q.edit_message_text(clean_txt, reply_markup=InlineKeyboardMarkup(kb))
+        else: await context.bot.send_message(chat_id=update.effective_chat.id, text=clean_txt, reply_markup=InlineKeyboardMarkup(kb))
 
+async def admin_deluser_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Demande confirmation avant la suppression réelle."""
+    q = update.callback_query
+    await q.answer()
+    target_id = q.data.split("_")[-1]
+    
+    kb = [
+        [InlineKeyboardButton("🔥 OUI, SUPPRIMER DÉFINITIVEMENT", callback_data=f"admin_deluser_confirm_{target_id}")],
+        [InlineKeyboardButton("❌ Annuler", callback_data=f"admin_adjust_{target_id}")]
+    ]
+    
+    await q.edit_message_text(
+        f"⚠️ **AVERTISSEMENT CRITIQUE**\n\n"
+        f"Vous allez supprimer l'utilisateur `{target_id}` de la base de données.\n"
+        f"• Il n'aura plus accès au bot.\n"
+        f"• Son solde sera perdu.\n"
+        f"• Il ne recevra plus de messages de diffusion.\n\n"
+        f"Confirmer ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+
+async def admin_deluser_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Exécute la suppression en base de données."""
+    q = update.callback_query
+    target_id = q.data.split("_")[-1]
+    
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    # On le supprime de la table users pour couper tout accès et broadcast
+    cur.execute("DELETE FROM users WHERE telegram_id=?", (target_id,))
+    # Optionnel : Supprimer aussi son historique pour nettoyer la DB
+    cur.execute("DELETE FROM verifications WHERE user_id=?", (target_id,))
+    cur.execute("DELETE FROM purchases WHERE user_id=?", (target_id,))
+    con.commit()
+    con.close()
+    
+    await q.answer("✅ Utilisateur supprimé et banni.", show_alert=True)
+    return await admin_users(update, context) # Retour à la liste globale
 
 async def admin_customamount_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -5625,7 +5699,6 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton(label_tickets, callback_data="admin_tickets_list")],
         [InlineKeyboardButton("👥 Utilisateurs", callback_data="admin_users")],
-        [InlineKeyboardButton("🏷 Forfait utilisateur", callback_data="admin_setstatut")],
         [InlineKeyboardButton("🔁 Redémarrer le bot", callback_data="admin_hard_reboot")],
         [InlineKeyboardButton("🪪 ID's Orders", callback_data="admin_all_orders")],
         [InlineKeyboardButton("💳 Produits Cc's", callback_data="admin_cat_menu:ccs")],
@@ -9140,11 +9213,12 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(cart_checkout_callback, pattern=r"^cart:checkout$"))
     application.add_handler(CallbackQueryHandler(cart_remove_single, pattern=r"^cart:del:\d+$"))
     application.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_"))
+    
 
-    # 6. AUTRES FLUX (ID Docs, Paiement, Menu Principal)
+   
     application.add_handler(payment_conv)
     application.add_handler(id_docs_conv)
-    application.add_handler(conv_handler) # Ceci gère le /start et menu_accueil
+    application.add_handler(conv_handler) 
 
     # 7. ADMIN (Callbacks simples)
     
@@ -9168,6 +9242,11 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_hard_reboot, pattern="^admin_hard_reboot$"))
     application.add_handler(CallbackQueryHandler(admin_ivr_settings, pattern="^admin_ivr_settings$"))
     application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
+    application.add_handler(CallbackQueryHandler(admin_deluser_ask, pattern="^admin_deluser_ask_"))
+    application.add_handler(CallbackQueryHandler(admin_deluser_confirm, pattern="^admin_deluser_confirm_"))
+    application.add_handler(CallbackQueryHandler(callback_faq, pattern="^faq$"))
+    application.add_handler(CallbackQueryHandler(acces_channel_prive, pattern="^join_private_channel$"))
+    
     
 
     # 8. VUE & NAVIGATION
