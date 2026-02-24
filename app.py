@@ -17,8 +17,6 @@ from datetime import datetime
 
 # --- MODULES LOCAUX ---
 import tickets
-from statics import callback_faq, acces_channel_prive
-from utils import replace_view, kb_back_to_menu, get_user_lang
 # --- TIERCE PARTIES ---
 import pytz
 import base58
@@ -655,8 +653,8 @@ async def view_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ========================== ENV & LOCK ==========================
 
 
+LOCK = "/home/johnm/bot-nomen/bot-nomen.pid"
 
-LOCK = "/tmp/bot-nomen.pid"
 
 def _pid_alive(pid: int) -> bool:
     try:
@@ -1042,6 +1040,18 @@ def user_exists(telegram_id: str) -> bool:
     con.close()
     return exists
 
+def get_user_lang(user_id: str) -> str:
+    """Récupère la langue de l'utilisateur (par défaut 'fr')"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT lang FROM users WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row and row[0] else 'fr'
+    except Exception:
+        return 'fr'
+
 
 def set_user_lang(telegram_id: str, lang: str):
     con = sqlite3.connect(DB_NAME)
@@ -1310,9 +1320,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📜 Historique", callback_data="hist:view")],
         [InlineKeyboardButton("💳 Recharger" if lang == "fr" else "💳 Top up", callback_data="add_balance")],
         [InlineKeyboardButton("🌐 Langue/Language", callback_data="choose_lang")],
-        [InlineKeyboardButton("📣 Channel", callback_data="join_private_channel")],
         [InlineKeyboardButton(label_support, callback_data="support")], 
-        [InlineKeyboardButton("📚 FAQ", callback_data="faq")],
         [InlineKeyboardButton("👤 Mon Compte", callback_data="account_menu")],
         [InlineKeyboardButton("🔒 Log Out", callback_data="auth_logout")],
     ]
@@ -2120,131 +2128,123 @@ async def filter_cancel_ccs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await goto_menu(update, context)
     # --- FIN MODIFICATION ---
 
-# ========================== FIN DU BLOC CCS ==========================
-
 # ================= PAIEMENT CRYPTO (ELECTRUM / NO KYC) =================
 
-from hdwallet import HDWallet
-from hdwallet.cryptocurrencies import Bitcoin as BTC_Class
-from hdwallet.derivations import CustomDerivation
-import base58
-
-# Alias unique pour le Bitcoin
-BTC = BTC_Class
-
-def zpub_to_xpub(zpub: str) -> str:
-    """Convertit une clé zpub (Segwit) en xpub (Standard) pour compatibilité HDWallet."""
-    try:
-        zpub = zpub.strip().replace('"', '').replace("'", "")
-        if not zpub.startswith("zpub"):
-            return zpub
-        data = base58.b58decode_check(zpub)
-        # Remplace le préfixe zpub par le préfixe xpub standard (0488b21e)
-        data = b'\x04\x88\xB2\x1E' + data[4:]
-        return base58.b58encode_check(data).decode()
-    except Exception as e:
-        print(f"⚠️ Erreur conversion zpub: {e}")
-        return zpub
-
-def get_crypto_address(xpub, index):
-    try:
-        if not xpub: return None
-        xpub = xpub.strip().replace('"', '').replace("'", "")
-        
-        # On force la conversion zpub -> xpub pour la compatibilité
-        clean_xpub = zpub_to_xpub(xpub)
-        
-        hdwallet: HDWallet = HDWallet(cryptocurrency=BTC)
-        hdwallet.from_xpublic_key(xpublic_key=clean_xpub)
-        
-        # Correction : On dérive SANS le "m/" pour éviter l'erreur Hardened
-        hdwallet.from_index(index=0) # Change
-        hdwallet.from_index(index=index) # Address index
-        
-        return hdwallet.p2wpkh_address() 
-    except Exception as e:
-        print(f"🔴 Erreur HDWallet (index {index}): {e}", flush=True)
-        return None
-    
-def generate_address(user_id: int, order_id: int) -> str:
-    """Génère une adresse BTC stable sans erreur de dérivation."""
-    if not ADMIN_XPUB: 
-        return "ERREUR_NO_XPUB"
-    
-    try:
-        # On utilise uniquement la fonction get_crypto_address qui gère le m/0/index
-        address = get_crypto_address(ADMIN_XPUB, order_id)
-        
-        if not address:
-            return "ERR_GEN"
-            
-        return address
-        
-    except Exception as e:
-        print(f"🔴 Erreur fatale génération : {e}", flush=True)
-        return "ERR_SYSTEM"
-    
 def ensure_payment_table():
-    """Prépare la table SQL pour les paiements."""
-    try:
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS crypto_payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                address TEXT,
-                amount_cad REAL,
-                amount_btc_expected REAL,
-                btc_received REAL DEFAULT 0,
-                status TEXT DEFAULT 'pending',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Patch pour les colonnes si la table existe déjà
-        colonnes = [
-            ("address", "TEXT"),
-            ("amount_cad", "REAL"),
-            ("amount_btc_expected", "REAL"),
-            ("btc_received", "REAL DEFAULT 0")
-        ]
-        for col, col_type in colonnes:
-            try:
-                cur.execute(f"ALTER TABLE crypto_payments ADD COLUMN {col} {col_type}")
-            except:
-                pass 
-        
-        con.commit()
-        con.close()
-    except Exception as e:
-        print(f"🔴 Erreur DB Crypto: {e}")
+    con = sqlite3.connect(DB_NAME)
+    cur = con.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS crypto_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            address TEXT,
+            amount_cad REAL,
+            amount_btc_expected REAL,
+            btc_received REAL DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # --- PATCH MAGIQUE : Ajoute les colonnes manquantes sans écraser ---
+    colonnes_a_ajouter = [
+        ("address", "TEXT"),
+        ("amount_cad", "REAL"),
+        ("amount_btc_expected", "REAL"),
+        ("btc_received", "REAL DEFAULT 0")
+    ]
+    for col, col_type in colonnes_a_ajouter:
+        try: cur.execute(f"ALTER TABLE crypto_payments ADD COLUMN {col} {col_type}")
+        except: pass
+    
+    con.commit()
+    con.close()
 
 ensure_payment_table()
 
 def get_btc_price_usd():
-    """Récupère le prix actuel du BTC."""
     try:
+        # Tentative 1 : API Binance (Très rapide et robuste pour les serveurs)
         r = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=5)
         return float(r.json()['price'])
-    except:
+    except Exception as e:
+        print(f"Erreur API Binance: {e}")
         try:
+            # Tentative 2 : API Blockchain.info (Alternative de secours)
             r = requests.get("https://blockchain.info/ticker", timeout=5)
             return float(r.json()['USD']['last'])
         except:
-            return 65000.0
+            # Fallback ultime : Mets un prix plus réaliste au cas où tout plante
+            return 64000.0
+
+def zpub_to_xpub(zpub: str) -> str:
+    """Convertit une clé zpub (Electrum) en xpub (Standard) pour compatibilité."""
+    try:
+        if not zpub.startswith("zpub"):
+            return zpub
+        data = base58.b58decode_check(zpub)
+        # Remplace le préfixe zpub (04b24746) par xpub (0488b21e)
+        prefix_xpub = b'\x04\x88\xB2\x1E'
+        data = prefix_xpub + data[4:]
+        return base58.b58encode_check(data).decode()
+    except Exception as e:
+        logger.error(f"Erreur conversion zpub: {e}")
+        return zpub
+
+def generate_address(user_id: int, order_id: int) -> str:
+    """Génère une adresse BTC via Bip32Secp256k1 (Force Brute)."""
+    if not ADMIN_XPUB: return "ERREUR_NO_XPUB"
+    try:
+        # 1. Nettoyage et Conversion ZPUB -> XPUB
+        raw_key = ADMIN_XPUB.strip().replace('"', '').replace("'", "")
+        if raw_key.startswith("zpub"):
+            try:
+                data = base58.b58decode_check(raw_key)
+                data = b'\x04\x88\xB2\x1E' + data[4:]
+                raw_key = base58.b58encode_check(data).decode()
+            except: pass 
+            
+        # 2. Dérivation Bas Niveau (Bip32 pur)
+        # On contourne les vérifications de profondeur qui bloquaient avant
+        ctx = Bip32Secp256k1.FromExtendedKey(raw_key)
+        
+        # Chemin : /0 (Chaîne externe) / order_id (Index commande)
+        addr_ctx = ctx.ChildKey(0).ChildKey(order_id)
+        
+        # 3. Encodage Segwit (bc1q)
+        # C'est ici qu'on applique le correctif "hrp='bc'" qui a sauvé la mise
+        pub_key_bytes = addr_ctx.PublicKey().RawCompressed().ToBytes()
+        return P2WPKHAddr.EncodeKey(pub_key_bytes, hrp="bc")
+        
+    except Exception as e:
+        logger.error(f"CRASH FORCE: {e}")
+        return f"ERR: {str(e)}"
+
+def check_payment_status(address: str):
+    try:
+        r = requests.get(f"https://mempool.space/api/address/{address}", timeout=10)
+        data = r.json()
+        
+        # --- SÉCURITÉ : 1 CONFIRMATION MINIMUM ---
+        # chain_stats = L'argent est gravé dans un bloc (Confirmé)
+        # On ignore mempool_stats (Non confirmé / Risque d'arnaque RBF)
+        satoshis = data['chain_stats']['funded_txo_sum']
+        
+        return satoshis / 100_000_000
+    except:
+        return 0.0
 
 async def add_balance_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-   
+    await q.answer()
     
     if not ADMIN_XPUB:
-        await q.message.reply_text("⚠️ Erreur : ADMIN_XPUB non configuré.")
+        await q.message.reply_text("⚠️ Erreur config: XPUB manquant ")
         return ConversationHandler.END
 
     await replace_view(
         q,
-        "💸 **Recharge de solde (Bitcoin)**\n\n"
-        "Combien de USD voulez-vous ajouter ?\n"
+        "💸 **Recharge votre solde !**\n\n"
+        "Combien voulez-vous ajouter ? \n"
         "_(Exemple: tapez 50)_",
         reply_markup=kb_back_to_menu(),
         parse_mode="Markdown"
@@ -6149,21 +6149,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['cart_return_to'] = "menu_accueil"
         return await goto_menu(update, context)
 
-    # --- BOUTONS STATIQUES (FAQ & VIP) ---
-    # Ces fonctions sont importées de statics.py
-    if data == "faq":
-        try:
-            return await callback_faq(update, context)
-        except Exception as e:
-            print(f"🔴 Erreur FAQ: {e}", flush=True)
-            return
-        
-    if data == "join_private_channel":
-        try:
-            return await acces_channel_prive(update, context)
-        except Exception as e:
-            print(f"🔴 Erreur Channel: {e}", flush=True)
-            return
 
     # --- SECTION HISTORIQUE ---
     if data == "hist:view":
