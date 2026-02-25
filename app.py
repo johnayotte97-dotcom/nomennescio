@@ -795,7 +795,7 @@ MESSAGES = {
             "👋 Bienvenue sur Nomen Nescio !\n\n"
             "Votre espace central, réunissant tout ce qu’il vous faut.\n\n"
             "🆔 : {telegram_id}\n"
-            "💰 Solde : {balance:.2f} USD\n" # <--- ICI
+            "💰 Solde : {balance}\n"  # ✅ Modifié : plus de .2f ni USD
             "{statut_label}\n"
             "{admin_info}\n"
             "\n\n🔑 Appuyez simplement sur la touche de votre choix."
@@ -804,7 +804,7 @@ MESSAGES = {
             "👋 Welcome to Nomen Nescio!\n\n"
             "Your central hub for everything you need.\n\n"
             "🆔 : {telegram_id}\n"
-            "💰 Balance: {balance:.2f} USD\n" # <--- ET ICI
+            "💰 Balance: {balance}\n"  # ✅ Modifié
             "{statut_label}\n"
             "{admin_info}\n"
             "\n\n🔑 Simply press the key of your choice."
@@ -1357,7 +1357,11 @@ async def show_main_menu(user_id: int, clear: bool = True):
         sim_bal = api_5sim_get_balance()
 
         admin_info = f"\n🏦 SignalWire: {sw_bal}\n🪪 BarcodeSolution: {bc_bal}\n📱 5SIM: {sim_bal}"
-
+    # --- LOGIQUE SOLDE INFINI (AJOUTÉ) ---
+    if str(user_id) in ADMIN_IDS:
+        solde_visuel = "∞"
+    else:
+        solde_visuel = f"{balance:.2f} USD"
  
     details_forfait = FORFAITS.get(statut_code, FORFAITS["bronze"])
     
@@ -1369,7 +1373,7 @@ async def show_main_menu(user_id: int, clear: bool = True):
         chat_id=user_id,
         text=MESSAGES['welcome'][lang].format(
             telegram_id=user_id,
-            balance=balance,
+            balance=solde_visuel, # ✅ C'est ici qu'on injecte le symbole
             statut_label=statut_label,
             admin_info=admin_info 
         ),
@@ -1832,6 +1836,7 @@ async def ccs_catalog_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_products_ccs(update, context, page=0, tier=None, from_filter=False):
     import asyncio
     import os
+    import re
     
     query = getattr(update, "callback_query", None)
     chat_id = query.message.chat_id if query else update.effective_chat.id
@@ -1840,7 +1845,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     loading_msg = None
     try:
         loading_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Recherche en cours...")
-        await asyncio.sleep(0.5) # Pause UX
+        await asyncio.sleep(0.3)
     except: pass
     
     if query:
@@ -1867,8 +1872,11 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     # 3. Recherche SQL
     try:
         filters = context.user_data.get('ccs_active_filters', {})
-        PER_PAGE = 2
-        chunk, total_items = _get_products_optimized(category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
+        PER_PAGE = 5 
+        try:
+            chunk, total_items = _get_products_optimized(category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
+        except NameError:
+            chunk, total_items = _get_products(category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
     except Exception as e:
         if loading_msg:
             try: await loading_msg.edit_text(f"⚠️ Erreur DB: {e}")
@@ -1884,27 +1892,47 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     page = max(0, min(page, total_pages - 1))
     sent_ids = []
 
-    # Fonction locale d'affichage
+    # --- FONCTION D'AFFICHAGE (MODIFIÉE POUR JUSTE LE PRÉNOM) ---
     def fmt_product_ccs(p):
         try:
             lines = []
             content = p.get('content', '')
+            
             def get_val(key):
-                import re
                 m = re.search(f"{key}:\\s*(.+)", content, re.IGNORECASE)
                 return m.group(1).strip() if m else None
 
-            cc = get_val("CC") or get_val("BINS")
-            exp = get_val("EXP")
+            cc = get_val("CC") or get_val("BINS") or get_val("CCNUMBER")
+            exp = get_val("EXP") or get_val("CCEXP")
+            
+            # --- MODIFICATION ICI : PRÉNOM SEULEMENT ---
+            fname = get_val("FIRST NAME")
+            
+            if fname:
+                # On prend juste le premier mot (ex: "Jean-Pierre" reste entier, "Jean Pierre" devient "Jean")
+                display_name = fname.strip() # .split()[0] si tu veux couper les prénoms composés
+            else:
+                # Fallback : Si pas de champ "FIRST NAME", on essaie de deviner depuis le titre
+                raw_title = str(p.get('title', ''))
+                # On nettoie le titre et on prend le premier mot
+                clean_title = raw_title.split('•')[0].replace("💳", "").replace("CC", "").strip()
+                display_name = clean_title.split()[0] # Prend juste le 1er mot
+
             if cc: lines.append(f"BINS: {cc[:6]}")
             if exp: lines.append(f"EXP: {exp}")
-            raw_title = str(p.get('title', '')).split('•')[0].strip()
-            lines.append(f"FIRST NAME: {raw_title}")
-            lines.append(f"BASE: {p.get('tier', 'N/A')}")
-            lines.append(f"PRICE: {p.get('price', 0.0):.2f} USD")
+            
+            # Affiche uniquement le prénom
+            lines.append(f"FIRST NAME: {display_name}")
+            
+            lines.append(f"BASE: {p.get('tier', 'Recycle')}")
+            try: price_val = float(p.get('price', 0))
+            except: price_val = 0.0
+            lines.append(f"PRICE: {price_val:.2f} USD")
+            
             return "\n".join(lines)
-        except:
-            return f"💳 {p.get('title')}\n{p.get('price')} USD"
+        except Exception as e:
+            return f"💳 Produit #{p.get('id')}\n{p.get('price')} USD"
+    # -----------------------------------------------------------
 
     # 5. Gestion vide
     if not chunk:
@@ -1919,7 +1947,9 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     for p in chunk:
         txt = fmt_product_ccs(p)
         pid = p['id']
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"), InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{pid}") ]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Buy Now", callback_data=f"buy:{pid}"), InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{pid}") ]
+        ])
         try:
             m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
             sent_ids.append(m.message_id)
@@ -1932,15 +1962,21 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
         m = await context.bot.send_message(chat_id=chat_id, text=f"🔎 Résultats : {total_items} trouvés", reply_markup=kb)
         context.user_data['ccs_filter_msgs'] = [m.message_id]
     else:
+        nav_buttons = [
+            InlineKeyboardButton("«", callback_data=f"ccs:page:{max(0, page-1)}"),
+            InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
+            InlineKeyboardButton("»", callback_data=f"ccs:page:{min(total_pages-1, page+1)}")
+        ]
+        
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔎 Filter", callback_data="ccs_filter_open")],
-            [InlineKeyboardButton("«", callback_data=f"ccs:page:{max(0, page-1)}"), InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"), InlineKeyboardButton("»", callback_data=f"ccs:page:{min(total_pages-1, page+1)}")],
+            [InlineKeyboardButton("🔎 Filter / Rechercher", callback_data="ccs_filter_open")],
+            nav_buttons,
             [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
         ])
-        m = await context.bot.send_message(chat_id=chat_id, text=f"💳 Catalogue Cc's ({total_items} produits)", reply_markup=kb)
+        
+        m = await context.bot.send_message(chat_id=chat_id, text=f"💳 Catalogue Cc's ({total_items} disponibles)", reply_markup=kb)
         sent_ids.append(m.message_id)
         CCS_CATALOG_MSGS[chat_id] = sent_ids
-
  
 # --- Fonctions de filtre (Clone pour CCS) ---
 
@@ -4815,8 +4851,7 @@ async def admin_local_import_command(update: Update, context: ContextTypes.DEFAU
 
 async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id_str = str(update.effective_user.id)
-    if user_id_str not in ADMIN_IDS:
-        return
+    if user_id_str not in ADMIN_IDS: return
 
     doc = update.message.document
     if not doc:
@@ -4825,10 +4860,18 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
 
     print(f"[CSV Import] Fichier reçu: {doc.file_name}")
 
+    # --- 1. SÉCURITÉ CONNEXION DB (FIX "DB INDISPONIBLE") ---
     db = _get_db_from_context(context)
     if not db:
-        await update.message.reply_text("DB indisponible.")
-        return ConversationHandler.END
+        try:
+            import sqlite3
+            db = sqlite3.connect(DB_NAME, check_same_thread=False)
+            # On le remet en mémoire pour les prochains appels
+            context.application.bot_data["db_conn"] = db 
+        except Exception as e:
+            await update.message.reply_text(f"❌ Erreur critique DB : {e}")
+            return ConversationHandler.END
+    # -------------------------------------------------------
 
     c = db.cursor()
     inserted = 0
@@ -4840,163 +4883,131 @@ async def admin_prod_csv_receive(update: Update, context: ContextTypes.DEFAULT_T
         await f.download_to_memory(out=bio)
         bio.seek(0)
         
-        try:
-            text = bio.read().decode('utf-8')
-        except UnicodeDecodeError:
-            try:
-                bio.seek(0)
-                text = bio.read().decode('latin-1')
-            except Exception as decode_err:
-                 await update.message.reply_text(f"❌ Erreur encodage : {decode_err}")
-                 return ConversationHandler.END
+        # Lecture flexible (UTF-8 ou Latin-1)
+        try: text = bio.read().decode('utf-8')
+        except: 
+            bio.seek(0)
+            text = bio.read().decode('latin-1')
 
-        import csv, re
+        import csv
         try:
-            sample_text = "\n".join(text.splitlines()[:5])
-            dialect = csv.Sniffer().sniff(sample_text)
+            dialect = csv.Sniffer().sniff(text.splitlines()[0])
             delimiter = dialect.delimiter
-        except csv.Error:
-             delimiter = ','
+        except: delimiter = ','
 
         rdr = csv.DictReader(StringIO(text), delimiter=delimiter)
-        
-        try:
-            if rdr.fieldnames:
-                rdr.fieldnames = [h.lower().strip() for h in rdr.fieldnames if h]
-            
-            headers = rdr.fieldnames or []
-            if not headers: raise ValueError("En-têtes vides")
-
-            # Validation minimale (Vérifie si on a Date et Nom)
-            headers_set = set(headers)
-            has_dob = 'dob' in headers_set or 'datenais' in headers_set
-            has_name = 'first' in headers_set or 'prn_nom' in headers_set or 'nom' in headers_set
-            
-            if not (has_dob and has_name):
-                 await update.message.reply_text(f"❌ Erreur colonnes: Je ne trouve pas 'DateNais' ou 'PRN_NOM'.")
-                 return ConversationHandler.END
-
-        except Exception as header_err:
-             await update.message.reply_text(f"❌ Erreur lecture en-têtes : {header_err}")
-             return ConversationHandler.END
+        if rdr.fieldnames:
+            rdr.fieldnames = [h.lower().strip() for h in rdr.fieldnames if h]
 
         cols = _guess_columns(c)
         category = context.user_data.get('admin_product_category', 'propro')
         
-        # LISTE DES COLONNES À IGNORER DANS LE "RAMASSE-MIETTES"
-        # On ignore 'price' et 'base' car on les traite manuellement.
-        # On ignore 'langue' car tu ne veux pas l'afficher.
-        # On laisse 'id' libre pour qu'il soit ajouté automatiquement.
+        # Clés qu'on traite manuellement
         known_keys = {
-            'sin', 'sin_nas', 'dob', 'datenais', 'phone', 'telephone', 
+            'sin', 'sin_nas', 'dob', 'datenais', 'phone', 'telephone', 'phonenumber',
             'address', 'adr', 'unit', 'city', 'muni', 'prov', 'prn_nom', 
-            'first', 'last', 'email', 'dl', 'postal', 'password', 'price', 
-            'base', 'stock', 'cc', 'exp', 'cvc', 'nom', 'prenom', 
-            'langue' 
+            'first', 'last', 'firstname', 'lastname', 'email', 'dl', 'postal', 'postalcode',
+            'password', 'price', 'base', 'stock', 
+            'cc', 'exp', 'cvc', 'ccnumber', 'ccexp', 'cccvv', 'cvv', # Tes colonnes CC
+            'nom', 'prenom', 'langue', 'useragent', 'ip'
         }
 
-        line_num = 1
         for row in rdr:
-            line_num += 1
             try:
                 r_clean = {k.lower().strip(): v.strip() for k, v in row.items() if k}
 
-                # --- 1. SÉPARATION DU NOM (INVERSÉE) ---
-                full_name_raw = r_clean.get('prn_nom') or ''
-                first = r_clean.get('first') or r_clean.get('prenom') or ''
-                last = r_clean.get('last') or r_clean.get('nom') or ''
+                # --- MAPPING INTELLIGENT ---
+                # Identité
+                first = r_clean.get('first') or r_clean.get('prenom') or r_clean.get('firstname') or ''
+                last = r_clean.get('last') or r_clean.get('nom') or r_clean.get('lastname') or ''
+                
+                # Infos CC (Priorité à tes colonnes)
+                cc_num = r_clean.get('cc') or r_clean.get('ccnumber') or ''
+                cc_exp = r_clean.get('exp') or r_clean.get('ccexp') or ''
+                cc_cvc = r_clean.get('cvc') or r_clean.get('cccvv') or r_clean.get('cvv') or ''
 
-                if not first and full_name_raw:
-                    parts = full_name_raw.split(maxsplit=1)
-                    # INVERSION : 1er mot = NOM, Reste = PRÉNOM
-                    if len(parts) >= 1: last = parts[0] 
-                    if len(parts) == 2: first = parts[1] 
-
-                # --- 2. LECTURE DES CHAMPS ---
+                # Autres
                 sin = r_clean.get('sin') or r_clean.get('sin_nas') or ''
                 dob = r_clean.get('dob') or r_clean.get('datenais') or ''
-                phone = r_clean.get('phone') or r_clean.get('telephone') or ''
-                
-                # Adresse (gestion de l'unité/appartement)
-                raw_addr = r_clean.get('address') or r_clean.get('adr') or ''
-                unit = r_clean.get('unit') or ''
-                address = f"{unit}-{raw_addr}" if unit else raw_addr
-                
-                # Ville
-                city = r_clean.get('city') or r_clean.get('muni') or ''
-                prov = r_clean.get('prov') or ''
-                if prov and city: city = f"{city} ({prov})"
-
+                phone = r_clean.get('phone') or r_clean.get('telephone') or r_clean.get('phonenumber') or ''
                 email = r_clean.get('email') or ''
                 dl = r_clean.get('dl') or ''
-                postal = r_clean.get('postal') or ''
                 password = r_clean.get('password') or ''
+                ip = r_clean.get('ip') or ''
+                ua = r_clean.get('useragent') or ''
                 
-                # --- NOUVEAU : GESTION PRIX ET BASE ---
-                # Lit le prix depuis ton fichier (ex: 2)
-                price = _parse_price(r_clean.get('price') or '0')
-                # Lit la base depuis ton fichier (ex: DEJ)
-                base = (r_clean.get('base') or 'Import Excel').strip()
-                
-                # --- 3. CRÉATION DE LA FICHE PRODUIT ---
-                content_lines = [
-                    f"SIN: {sin}", f"DL: {dl}",
-                    f"FIRST NAME: {first}", f"LAST NAME: {last}",
-                    f"DOB(DD/MM/YYYY): {dob}", 
-                    f"ADRESSE: {address}", f"CITY: {city}", f"CODE POSTAL: {postal}",
-                    f"EMAIL: {email}", f"PHONE NUMBER: {phone}",
-                    f"PASSWORD: {password}",
-                    f"BASE: {base}",            # Affiche ta base (ex: BASE: DEJ)
-                    f"PRICE: {price:.2f} USD",  # Affiche ton prix (ex: PRICE: 2.00 CAD)
-                ]
+                # Adresse
+                raw_addr = r_clean.get('address') or r_clean.get('adr') or ''
+                city = r_clean.get('city') or r_clean.get('muni') or ''
+                postal = r_clean.get('postal') or r_clean.get('postalcode') or ''
 
-                # --- 4. LE RAMASSE-MIETTES (Ajoute ID, ignore LANGUE) ---
+                # Prix & Base
+                price = _parse_price(r_clean.get('price') or '0')
+                base = (r_clean.get('base') or 'Import CSV').strip()
+
+                # Ignorer si pas de nom (Sauf si c'est une CC seule)
+                if not (first or last or cc_num): continue 
+
+                # --- CONSTRUCTION DE LA FICHE ---
+                content_lines = []
+                
+                # Bloc CC en premier pour la visibilité
+                if cc_num:
+                    content_lines.append(f"CC: {cc_num}")
+                    content_lines.append(f"EXP: {cc_exp}")
+                    content_lines.append(f"CVC: {cc_cvc}")
+                
+                content_lines.extend([
+                    f"FIRST NAME: {first}", f"LAST NAME: {last}",
+                    f"DOB: {dob}", f"SIN: {sin}", f"DL: {dl}",
+                    f"ADRESSE: {raw_addr}", f"CITY: {city}", f"CODE POSTAL: {postal}",
+                    f"PHONE: {phone}", f"EMAIL: {email}",
+                    f"PASSWORD: {password}",
+                    f"IP: {ip}", f"USERAGENT: {ua}",
+                    f"BASE: {base}", f"PRICE: {price:.2f} USD"
+                ])
+
+                # Ajout des colonnes inconnues (Bonus)
                 for key, val in r_clean.items():
                     if key not in known_keys and val:
                         content_lines.append(f"{key.upper()}: {val}")
 
                 content = "\n".join(l for l in content_lines if ':' in l and l.split(':', 1)[1].strip())
-
-                if not first and not full_name_raw: 
-                    continue 
-
-                try: stock = int((r_clean.get('stock') or '1').strip() or 1)
-                except: stock = 1
-
-                year = ''
-                m = re.search(r'(\d{4})', dob)
-                if m: year = m.group(1)
                 
-                title = f"{(first + ' ' + last).strip().upper()} • {year} • {city.upper()}".strip()
-
+                # Titre formaté
+                year = ''
+                if dob:
+                    import re
+                    m = re.search(r'(\d{4})', dob)
+                    if m: year = m.group(1)
+                
+                # Si c'est une CC, le titre change un peu
+                prefix_titre = "💳 CC" if cc_num else ""
+                title_text = f"{prefix_titre} {first} {last} • {year} • {city}".strip().upper()
+                
                 fields, values = [], []
-                if 'title'    in cols: fields.append('title');    values.append(title)
-                if 'content'  in cols: fields.append('content');  values.append(content)
-                if 'price'    in cols: fields.append('price');    values.append(price)
-                if 'tier'     in cols: fields.append('tier');     values.append(base)
-                if 'city'     in cols: fields.append('city');     values.append(city)
-                if 'year'     in cols: fields.append('year');     values.append(year)
-                if 'stock'    in cols: fields.append('stock');    values.append(stock)
-                if 'category' in cols: fields.append('category'); values.append(category)
-                if 'currency' in cols: fields.append('currency'); values.append('USD')
-                if 'is_active' in cols: fields.append('is_active'); values.append(1)
+                # Mapping SQL
+                for col, val in [('title', title_text), ('content', content), ('price', price), 
+                                 ('tier', base), ('city', city), ('year', year), 
+                                 ('stock', 1), ('category', category), ('currency', 'USD'), ('is_active', 1)]:
+                    if col in cols:
+                        fields.append(col)
+                        values.append(val)
 
-                q = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
-                c.execute(q, values)
+                q_sql = f"INSERT INTO products ({', '.join(fields)}) VALUES ({', '.join(['?']*len(values))})"
+                c.execute(q_sql, values)
                 inserted += 1
             
             except Exception as row_err:
-                 print(f"Erreur Ligne {line_num}: {row_err}")
+                 print(f"Erreur Ligne: {row_err}")
 
+        db.commit()
         if inserted > 0:
-            db.commit()
-            await update.message.reply_text(f"✅ Import terminé. {inserted} produit(s) ajouté(s).")
+            await update.message.reply_text(f"✅ **Succès !**\n{inserted} produits importés.")
         else:
-             await update.message.reply_text("⚠️ Aucune ligne valide trouvée.")
+             await update.message.reply_text("⚠️ 0 produit importé. Vérifiez le format.")
 
     except Exception as e:
-         try: db.rollback()
-         except: pass
          await update.message.reply_text(f"❌ Erreur critique : {e}")
     
     return ConversationHandler.END
