@@ -2945,7 +2945,7 @@ async def hist_menu(update, context):
     await q.answer()
     kb = [
         [InlineKeyboardButton("🆔 IDs & Physical", callback_data="hist:ids")],
-        [InlineKeyboardButton("👥 Pro's",  callback_data="hist:pros"),
+        [InlineKeyboardButton("👥 Pro's & Cc's",  callback_data="hist:pros"),
          InlineKeyboardButton("🚗 Permis", callback_data="hist:permis")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     ]
@@ -6631,7 +6631,7 @@ async def id_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🪪 Physical ID", callback_data="id_cat:physical")],
         [InlineKeyboardButton("🔢 Numerical ID", callback_data="id_cat:numerical")],
         [InlineKeyboardButton("📄 Documents", callback_data="id_cat:document")],
-        [InlineKeyboardButton("🛠️ Tools", callback_data="id_cat:tool")],
+        [InlineKeyboardButton("📊 Barcodes", callback_data="id_cat:tool")],
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     ]
     
@@ -6648,22 +6648,27 @@ async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
-    # Récupération et sauvegarde de la catégorie dans user_data (Essentiel pour le bouton Retour)
+    # Récupération et sauvegarde de la catégorie
     cat = q.data.split(":")[1]
     context.user_data['id_category'] = cat
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
-    # On récupère les produits actifs de la catégorie
     rows = cur.execute("SELECT id, title, price, tier FROM products WHERE category=? AND is_active=1", (cat,)).fetchall()
     con.close()
     
-    if not rows:
-        # Si vide, on propose de retourner au menu principal des IDs
-        await q.edit_message_text("❌ Aucun produit disponible dans cette catégorie.", reply_markup=kb_back_to_menu())
-        return ConversationHandler.END
+    # Bouton de retour commun
+    back_button = [InlineKeyboardButton("⬅️ Retour", callback_data="id_menu_entry")]
 
-    # Mapping des noms longs vers les noms de boutons courts
+    if not rows:
+        # IMPORTANT: On retourne ID_PROD_VIEW au lieu de END pour que le bouton Retour fonctionne
+        await q.edit_message_text(
+            "❌ Aucun produit disponible dans cette catégorie.", 
+            reply_markup=InlineKeyboardMarkup([back_button])
+        )
+        return ID_PROD_VIEW
+
+    # Mapping des noms courts
     short_names = {
         "Quebec Driver License (Full)": "QC DRIVER LICENSE",
         "Ontario Driver License": "ON DRIVER LICENSE",
@@ -6675,23 +6680,18 @@ async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb = []
     for pid, title, price, code in rows:
-        # On utilise le nom court défini au-dessus, sinon le titre de la DB
         display_name = short_names.get(title, title)
-        
-        # Ajout du bouton vers la vue détaillée du produit (id_view)
         kb.append([InlineKeyboardButton(f"➡️ {display_name}", callback_data=f"id_view:{pid}")])
     
-    # Bouton de retour vers la sélection du type d'ID (Physical, Tools, etc.)
-    kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="id_menu_entry")])
+    kb.append(back_button)
     
     titles = {
         "physical": "🪪 **PHYSICAL ID**",
         "numerical": "🔢 **NUMERICAL ID**",
         "document": "📄 **DOCUMENTS**",
-        "tool": "🛠️ **TOOLS & BARCODES**"
+        "tool": "📊 **BARCODES PACK**"
     }
     
-    # Affichage du catalogue
     text_header = titles.get(cat, "📂 **CATALOGUE**")
     await q.edit_message_text(
         f"{text_header}\n\nSélectionnez un modèle ci-dessous :", 
@@ -9317,12 +9317,88 @@ admin_ticket_conv = ConversationHandler(
     fallbacks=[CallbackQueryHandler(admin_menu, pattern="^admin_menu$"), CommandHandler("start", start)]
 )
 
-# 2. ROUTEUR PRINCIPAL (Start, Vérif, Outils, Compte)
+
+id_docs_conv = ConversationHandler(
+    entry_points=[
+        CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
+        # 👇 AJOUT CRITIQUE : Permet d'entrer directement dans les Barcodes depuis le menu
+        CallbackQueryHandler(id_show_category, pattern="^id_cat:") 
+    ],
+    states={
+        ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
+        ID_PROD_VIEW: [
+            CallbackQueryHandler(id_view_product, pattern="^id_view:"),
+            CallbackQueryHandler(id_start_buy, pattern="^id_buy:"),
+            CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
+            CallbackQueryHandler(id_show_category, pattern="^id_cat:") # Navigation interne
+        ],
+        ID_ASK_QTY: [
+            CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_"),
+            CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
+        ],
+        ID_ASK_NAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_firstname)],
+        ID_ASK_LASTNAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_lastname)],
+        ID_ASK_DOB: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_dob)],
+        ID_ASK_STREET: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_street)],
+        ID_ASK_CITY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_city)],
+        ID_ASK_ZIP: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_zip)],
+        ID_CONFIRM_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
+        ID_ASK_ISSUE: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_issue)],
+        ID_ASK_EXPIRY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_expiry)],
+        
+        ID_ASK_DL_NUM: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(id_handle_dl_method, pattern="^dl_mode:"), 
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_manual_digits)
+        ],
+        
+        ID_ASK_REF_NUM: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)
+        ],
+        ID_ASK_SEX: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_save_sex, pattern="^sex:")],
+        ID_ASK_HEIGHT: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_height)],
+        
+        ID_ASK_EYES: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"), 
+            CallbackQueryHandler(id_save_eyes, pattern="^eyes:")
+        ],
+        
+        ID_ASK_PHOTO: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.PHOTO, id_save_photo)],
+        
+        ID_CONFIRM_SUMMARY: [
+            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), 
+            CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$"),
+            CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")
+        ],
+        
+        ID_EDIT_MENU: [
+            CallbackQueryHandler(id_handle_edit_choice, pattern="^do_edit:"), 
+            CallbackQueryHandler(id_show_summary, pattern="^back_to_summary$")
+        ],
+        ID_EDIT_INPUT: [
+            MessageHandler(filters.TEXT, id_receive_new_value), 
+            CallbackQueryHandler(id_open_edit_menu, pattern="^cancel_edit_input$")
+        ],
+    },
+    fallbacks=[CommandHandler("start", start), CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
+    name="id_docs_conversation",
+    per_chat=True,
+    per_user=True
+)
+
+# ====================================================
+#      CONVERSATION PRINCIPALE (Auth & Menu)
+# ====================================================
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
         CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
-        CallbackQueryHandler(show_tools_menu, pattern="^section_tools$"),
+        # On garde section_tools au cas où, mais id_cat:tool passe maintenant par id_docs_conv
+        CallbackQueryHandler(show_tools_menu, pattern="^section_tools$"), 
         CallbackQueryHandler(auth_import_start, pattern="^auth_import_start$"),
         CallbackQueryHandler(auth_create_start, pattern="^auth_create$"),
         CallbackQueryHandler(ticket_create_start, pattern="^ticket_create_start$"),
@@ -9332,16 +9408,14 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(auth_logout, pattern="^auth_logout$"),
         CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"),
         CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$")
-        
     ],
     states={
         # --- AUTHENTIFICATION ---
-        # Utilisation de ~filters.COMMAND pour éviter de bloquer le /start
         ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_create_pin_save)],
         ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
         ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
         
-        # --- BOÎTE À OUTILS ---
+        # --- BOÎTE À OUTILS (Ancienne section, conservée pour HLR/SMS) ---
         SELECT_TOOL: [
             CallbackQueryHandler(show_tools_menu, pattern="^section_tools$"),
             CallbackQueryHandler(start_verifier_main, pattern="^start_verifier_main$"),
@@ -9358,7 +9432,6 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(acc_set_timeout, pattern="^set_timeout_"),
             CallbackQueryHandler(account_menu, pattern="^account_menu$"),
             CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")
-            
         ],
         WAIT_HLR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, tool_process_hlr)],
         
@@ -9368,7 +9441,7 @@ conv_handler = ConversationHandler(
         ACC_WAIT_JABBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_jabber)],
         ACC_WAIT_RESET_CONFIRM: [CallbackQueryHandler(acc_reset_confirm, pattern="^confirm_reset_seed$")],
 
-        # --- VÉRIFICATION PERMIS (MULTI & UNIQUE) ---
+        # --- VÉRIFICATION PERMIS ---
         ASK_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_qty)],
         ASK_MODE: [
             CallbackQueryHandler(choose_mode_manual, pattern="^mode_manual$"),
@@ -9396,7 +9469,7 @@ conv_handler = ConversationHandler(
     },
     fallbacks=[
         CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", start), # Retour au start au cas où
+        CommandHandler("start", start),
         CallbackQueryHandler(ticket_resume, pattern="^ticket_resume:")
     ],
     name="main_conversation",
@@ -9407,22 +9480,18 @@ conv_handler = ConversationHandler(
 
 def setup_all_handlers(application):
     # ====================================================
-    # GROUPE -1 : SYSTÈME & DÉBUG (Priorité maximale)
+    # GROUPE -1 : SYSTÈME & DÉBUG
     # ====================================================
-
-    
-    
-    # 1. L'ESPION (Affiche les messages dans la console sans les arrêter)
     async def espion(update, context):
         if update.message and update.message.text:
             print(f"🕵️ ESPION: Message reçu -> '{update.message.text}'", flush=True)
             
     application.add_handler(CallbackQueryHandler(show_referral_menu, pattern="^show_referral$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, espion), group=-1)
-    application.add_handler(catalog_filter_conv)      # Filtre Pro's
-    application.add_handler(ccs_catalog_filter_conv)  # Filtre Cc's
+    application.add_handler(catalog_filter_conv)
+    application.add_handler(ccs_catalog_filter_conv)
     
-    # 5. BOUTIQUE (Actions sur produits)
+    # ACTIONS BOUTIQUE
     application.add_handler(CallbackQueryHandler(handle_buy_callback, pattern=r"^buy:\d+$"))
     application.add_handler(CallbackQueryHandler(cart_add_callback, pattern=r"^cart:add:\d+$"))
     application.add_handler(CallbackQueryHandler(handle_view_callback, pattern=r"^prod:view:\d+$"))
@@ -9432,16 +9501,12 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(cart_remove_single, pattern=r"^cart:del:\d+$"))
     application.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_"))
   
-    
-    
-
-   
+    # CONVERSATIONS PRINCIPALES (Ordre crucial)
     application.add_handler(payment_conv)
-    application.add_handler(id_docs_conv)
+    application.add_handler(id_docs_conv) # Doit être AVANT conv_handler pour capter id_cat:
     application.add_handler(conv_handler) 
 
-    # 7. ADMIN (Callbacks simples)
-    
+    # HANDLERS ADMIN
     application.add_handler(CallbackQueryHandler(tickets.admin_list_tickets, pattern="^admin_tickets_list$"))
     application.add_handler(CallbackQueryHandler(tickets.admin_view_ticket, pattern="^adm_ticket_view_"))
     application.add_handler(CallbackQueryHandler(tickets.admin_close_no_reply, pattern="^adm_ticket_close_"))
@@ -9467,28 +9532,19 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_maintenance_toggle, pattern="^maint_"))
     application.add_handler(CallbackQueryHandler(admin_broadcast_maintenance_done, pattern="^admin_broadcast_done$"))
 
-    
-    
-
-    # 8. VUE & NAVIGATION
+    # VUE & NAVIGATION
     application.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
     application.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
 
-    # ====================================================
-    # GROUPES SECONDAIRES (Conversations Admin & Hist)
-    # ====================================================
+    # GROUPES SECONDAIRES
     application.add_handler(history_filter_conv, group=5)
     application.add_handler(admin_csv_conv, group=6)
     application.add_handler(admin_ivr_conv, group=7)
     application.add_handler(admin_search_conv, group=8)
     application.add_handler(admin_ticket_conv, group=9)
 
-    # 9. HANDLER GÉNÉRIQUE (Tout clic non géré revient ici)
     application.add_handler(CallbackQueryHandler(menu_handler))
-# ====================================================
-#      2. FONCTIONS DE PAGINATION
-# ====================================================
 
 async def set_pg_callback(update, context):
     q = update.callback_query
