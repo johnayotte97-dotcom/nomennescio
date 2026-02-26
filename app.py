@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import subprocess
 from datetime import datetime
+from PIL import Image, ImageDraw, ImageFont
 
 
 # --- MODULES LOCAUX ---
@@ -93,6 +94,88 @@ else:
 # ================= SECURITY HEARTBEAT =================
 # Ton lien Healthchecks personnel
 HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
+
+# ==========================================
+# ⚙️ MOTEUR DE CALCUL ET GÉNÉRATION T4
+# ==========================================
+
+def calculer_tout_depuis_case14(montant_base):
+    # Ajout d'un petit montant aléatoire pour le réalisme (-150$ à +150$)
+    ajustement = random.uniform(-150, 150)
+    montant_final = round(montant_base + ajustement, 2)
+    
+    # Taux officiels 2025 (Québec)
+    taux_ae = 0.0132
+    taux_rrq = 0.0640
+    exemption_rrq = 3500
+    
+    # Calculs automatiques
+    ae = round(montant_final * taux_ae, 2)
+    rrq = round(max(0, (montant_final - exemption_rrq) * taux_rrq), 2)
+    
+    # Impôt progressif réaliste
+    if montant_final <= 52000:
+        impot = montant_final * 0.142
+    elif montant_final <= 95000:
+        impot = montant_final * 0.195
+    else:
+        impot = montant_final * 0.248
+
+    # Formatage (ex: 50,142.67)
+    def format_money(n):
+        return "{:,.2f}".format(n)
+
+    return {
+        "salaire": format_money(montant_final),
+        "impot": format_money(impot),
+        "cpp_rrq": format_money(rrq),
+        "ae": format_money(ae)
+    }
+
+def generer_t4_double_arial(data, output_name):
+    source_path = "Sample.jpg"
+    if not os.path.exists(source_path):
+        print(f"❌ Erreur : {source_path} introuvable.")
+        return
+
+    img = Image.open(source_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+
+    # Recherche de la police sur le serveur Ubuntu
+    font_paths = [
+        "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+    ]
+    font_path = next((p for p in font_paths if os.path.exists(p)), None)
+    
+    # Coordonnées (Haut et Bas)
+    MAP_COORDS = {
+        "employeur":      (136, 90,   1165, 28),
+        "employeur_adr1": (137, 120,  1196, 26),
+        "employeur_adr2": (136, 156,  1233, 26),
+        "annee":          (864, 115,  1191, 32),
+        "nas":            (254, 419,  1494, 32),
+        "nom":            (174, 584,  1660, 32),
+        "prenom":         (551, 584,  1660, 32),
+        "adresse1":       (139, 690,  1765, 28),
+        "adresse2":       (140, 721,  1797, 28),
+        "salaire":        (1081, 213, 1293, 32),
+        "impot":          (1456, 217, 1293, 32),
+        "cpp_rrq":        (1467, 308, 1387, 30),
+        "ae":             (1121, 864, 1941, 30),
+        "province":       (820, 345,  1420, 30)
+    }
+
+    for champ, (x, y_haut, y_bas, size) in MAP_COORDS.items():
+        if champ in data and data[champ]:
+            font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
+            valeur = str(data[champ]).upper()
+            draw.text((x, y_haut), valeur, fill=(0, 0, 0), font=font)
+            draw.text((x, y_bas), valeur, fill=(0, 0, 0), font=font)
+
+    img.save(output_name, quality=100, subsampling=0)
+    print(f"✅ T4 généré : {output_name}")
+# ==========================================
 
 def get_final_price(user_id, base_price):
     """Renvoie 0.0 si l'utilisateur est admin, sinon le prix normal."""
@@ -795,6 +878,7 @@ SELECT_TOOL = 900
 WAIT_HLR_NUMBER = 901
 ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
 BTC = BTC_Class
+ID_ASK_T4_EMPLOYER, ID_ASK_T4_SALAIRE = range(3500, 3502)
 
 
 
@@ -7726,7 +7810,40 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await q.edit_message_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
         return ID_CONFIRM_ADDR
+
+    # ==========================================
+    # 📄 ROUTAGE DES RETOURS POUR DOCUMENTS (T4)
+    # ==========================================
+    elif target_state == ID_ASK_DOC_EMPLOYER:
+        await show("🏢 **Nom de l'Employeur ?**", kb_back_state=ID_CONFIRM_ADDR)
+        return ID_ASK_DOC_EMPLOYER
         
+    elif target_state == ID_ASK_DOC_ADDR:
+        await show("📍 **Adresse de l'Employeur ?**\n(Ex: 123 Rue Principale, Montréal QC)", kb_back_state=ID_ASK_DOC_EMPLOYER)
+        return ID_ASK_DOC_ADDR
+        
+    elif target_state == ID_ASK_DOC_SIN:
+        await show("🔢 **Numéro d'Assurance Sociale (NAS) ?**\n(Ex: 123 456 789)", kb_back_state=ID_ASK_DOC_ADDR)
+        return ID_ASK_DOC_SIN
+
+    elif target_state == ID_CHOOSE_INxCOME_MODE:
+        kb = [
+            [InlineKeyboardButton("45,000$", callback_data="t4_sal:45000"), InlineKeyboardButton("65,000$", callback_data="t4_sal:65000")],
+            [InlineKeyboardButton("85,000$", callback_data="t4_sal:85000"), InlineKeyboardButton("110,000$", callback_data="t4_sal:110000")],
+            [InlineKeyboardButton("✏️ Montant Personnalisé", callback_data="t4_sal:custom")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_SIN}")]
+        ]
+        await q.edit_message_text("💰 **Quel est le Salaire Brut (Case 14) ?**\n_Le bot calculera automatiquement les impôts (RRQ, AE)._", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return ID_CHOOSE_INxCOME_MODE
+
+    elif target_state == ID_ASK_DOC_RATE:
+        await show("✍️ **Saisie du salaire :**\nEntrez le montant exact (ex: `72500`) :", kb_back_state=ID_CHOOSE_INxCOME_MODE)
+        return ID_ASK_DOC_RATE
+    # ==========================================
+
+    # ==========================================
+    # 🪪 ROUTAGE DES RETOURS POUR CARTES D'ID
+    # ==========================================
     elif target_state == ID_ASK_ISSUE:
         await show("📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)", kb_back_state=ID_CONFIRM_ADDR)
         return ID_ASK_ISSUE
