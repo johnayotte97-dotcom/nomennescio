@@ -9334,75 +9334,6 @@ async def ask_eye_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_EYES
 
-id_docs_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")],
-    states={
-        ID_CAT_VIEW: [CallbackQueryHandler(id_show_category, pattern="^id_cat:")],
-        ID_PROD_VIEW: [
-            CallbackQueryHandler(id_view_product, pattern="^id_view:"),
-            CallbackQueryHandler(id_start_buy, pattern="^id_buy:"),
-            CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")
-        ],
-        ID_ASK_QTY: [
-            CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_"),
-            CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
-        ],
-        ID_ASK_NAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_firstname)],
-        ID_ASK_LASTNAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_lastname)],
-        ID_ASK_DOB: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_dob)],
-        ID_ASK_STREET: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_street)],
-        ID_ASK_CITY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_city)],
-        ID_ASK_ZIP: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_zip)],
-        ID_CONFIRM_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
-        ID_ASK_ISSUE: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_issue)],
-        ID_ASK_EXPIRY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_expiry)],
-        
-        # --- ETAT DL NUM CORRIGÉ POUR LE MANUEL ---
-        ID_ASK_DL_NUM: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            CallbackQueryHandler(id_handle_dl_method, pattern="^dl_mode:"), 
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_manual_digits)
-        ],
-        
-        ID_ASK_REF_NUM: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
-            CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_ref_num)
-        ],
-        ID_ASK_SEX: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_save_sex, pattern="^sex:")],
-        ID_ASK_HEIGHT: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_height)],
-        
-        # --- ETAT EYES CORRIGÉ ---
-        ID_ASK_EYES: [
-            CallbackQueryHandler(id_form_back, pattern="^form_back:"), 
-            CallbackQueryHandler(id_save_eyes, pattern="^eyes:") # Pattern matching avec ask_eye_color
-        ],
-        
-        ID_ASK_PHOTO: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.PHOTO, id_save_photo)],
-        
-        # --- ETAT RÉSUMÉ AVEC ÉDITION ---
-        ID_CONFIRM_SUMMARY: [
-            CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), 
-            CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$"), # <-- Le bouton Modifier
-            CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")       # <-- Le bouton Annuler
-        ],
-        
-        # --- NOUVEAUX ÉTATS D'ÉDITION ---
-        ID_EDIT_MENU: [
-            CallbackQueryHandler(id_handle_edit_choice, pattern="^do_edit:"), 
-            CallbackQueryHandler(id_show_summary, pattern="^back_to_summary$")
-        ],
-        ID_EDIT_INPUT: [
-            MessageHandler(filters.TEXT, id_receive_new_value), 
-            CallbackQueryHandler(id_open_edit_menu, pattern="^cancel_edit_input$")
-        ],
-    },
-    fallbacks=[CommandHandler("start", goto_menu), CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")],
-    name="id_docs_conversation"
-)
-
-
 # ==============================================================================
 # 🧩 SYSTÈME DE VERROUILLAGE AUTO (INACTIVITÉ)
 # ==============================================================================
@@ -9565,7 +9496,7 @@ admin_ticket_conv = ConversationHandler(
 id_docs_conv = ConversationHandler(
     entry_points=[
         CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
-        # 👇 AJOUT CRITIQUE : Permet d'entrer directement dans les Barcodes depuis le menu
+        # Permet d'entrer directement dans les catégories (y compris Barcodes)
         CallbackQueryHandler(id_show_category, pattern="^id_cat:") 
     ],
     states={
@@ -9581,6 +9512,8 @@ id_docs_conv = ConversationHandler(
             CallbackQueryHandler(id_save_qty, pattern="^qty_confirm$"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_qty)
         ],
+        
+        # --- INFOS COMMUNES ---
         ID_ASK_NAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_firstname)],
         ID_ASK_LASTNAME: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_lastname)],
         ID_ASK_DOB: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_dob)],
@@ -9588,15 +9521,29 @@ id_docs_conv = ConversationHandler(
         ID_ASK_CITY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_city)],
         ID_ASK_ZIP: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_zip)],
         ID_CONFIRM_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
+        
+        # ==========================================
+        # 📄 CHEMIN SPÉCIFIQUE : DOCUMENTS (T4)
+        # ==========================================
+        ID_ASK_DOC_EMPLOYER: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_employer)],
+        ID_ASK_DOC_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_emp_addr)],
+        ID_ASK_DOC_SIN: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_sin_for_t4)],
+        ID_CHOOSE_INxCOME_MODE: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"), 
+            CallbackQueryHandler(id_handle_t4_salary_btn, pattern="^t4_sal:")
+        ],
+        ID_ASK_DOC_RATE: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_t4_salary_custom)],
+
+        # ==========================================
+        # 🪪 CHEMIN SPÉCIFIQUE : CARTES D'ID
+        # ==========================================
         ID_ASK_ISSUE: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_issue)],
         ID_ASK_EXPIRY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_expiry)],
-        
         ID_ASK_DL_NUM: [
             CallbackQueryHandler(id_form_back, pattern="^form_back:"),
             CallbackQueryHandler(id_handle_dl_method, pattern="^dl_mode:"), 
             MessageHandler(filters.TEXT & ~filters.COMMAND, id_save_dl_manual_digits)
         ],
-        
         ID_ASK_REF_NUM: [
             CallbackQueryHandler(id_form_back, pattern="^form_back:"),
             CallbackQueryHandler(handle_ref_callback, pattern="^ref_action:"),
@@ -9604,20 +9551,21 @@ id_docs_conv = ConversationHandler(
         ],
         ID_ASK_SEX: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_save_sex, pattern="^sex:")],
         ID_ASK_HEIGHT: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_height)],
-        
         ID_ASK_EYES: [
             CallbackQueryHandler(id_form_back, pattern="^form_back:"), 
             CallbackQueryHandler(id_save_eyes, pattern="^eyes:")
         ],
-        
         ID_ASK_PHOTO: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.PHOTO, id_save_photo)],
         
+        # --- RÉSUMÉ ET PAIEMENT ---
         ID_CONFIRM_SUMMARY: [
             CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), 
+            CallbackQueryHandler(id_finalize_t4, pattern="^confirm_gen_t4$"), # <--- Le paiement du T4
             CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$"),
             CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")
         ],
         
+        # --- ÉDITION ---
         ID_EDIT_MENU: [
             CallbackQueryHandler(id_handle_edit_choice, pattern="^do_edit:"), 
             CallbackQueryHandler(id_show_summary, pattern="^back_to_summary$")
@@ -9632,7 +9580,6 @@ id_docs_conv = ConversationHandler(
     per_chat=True,
     per_user=True
 )
-
 # ====================================================
 #      CONVERSATION PRINCIPALE (Auth & Menu)
 # ====================================================
