@@ -111,7 +111,8 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
     out = {
         "first": "", "last": "", "dob": "N/A", "address": "N/A", "city": "N/A",
         "postal": "", "email": "", "phone": "", "sin": "", "dl": "", 
-        "password": "", "base": "N/A", "price": 0.0, "all_data": {}
+        "password": "", "base": "N/A", "price": 0.0, "all_data": {},
+        "cc": "", "exp": "", "cvc": "", "ip": "", "ua": ""
     }
     
     content = (p.get("content") or "").strip()
@@ -119,9 +120,8 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
     parsed_content = {}
     for line in content.splitlines():
         if ":" in line:
-            # On sépare la clé et la valeur
             parts = line.split(":", 1)
-            # 🧹 NETTOYAGE : On enlève les émojis et on met en MAJUSCULES
+            # Nettoyage de la clé (Enlève émojis, espaces et met en MAJ)
             raw_key = parts[0].strip()
             clean_key = re.sub(r'[^\w\s]', '', raw_key).strip().upper() 
             val = parts[1].strip()
@@ -129,17 +129,29 @@ def _parse_product_fields(p: Dict[str, Any]) -> Dict[str, Any]:
 
     out["all_data"] = parsed_content 
 
-    # --- MAPPING BASÉ SUR TES RÉSULTATS DB ---
-    out["first"] = parsed_content.get("NOM") or p.get("firstname") or ""
+    # --- MAPPING INTELLIGENT (Supporte tes imports CSV) ---
+    out["first"] = parsed_content.get("FIRST NAME") or parsed_content.get("PRENOM") or parsed_content.get("NOM") or ""
+    out["last"] = parsed_content.get("LAST NAME") or ""
     out["sin"] = parsed_content.get("SIN") or parsed_content.get("NAS") or ""
-    out["phone"] = parsed_content.get("TEL") or parsed_content.get("PHONE") or ""
+    out["phone"] = parsed_content.get("PHONE") or parsed_content.get("PHONENUMBER") or parsed_content.get("TEL") or ""
     out["dob"] = parsed_content.get("DOB") or parsed_content.get("DATE") or "N/A"
-    out["address"] = parsed_content.get("ADR") or parsed_content.get("ADDRESS") or "N/A"
-    out["city"] = parsed_content.get("VILLE") or p.get("city") or "N/A"
+    out["address"] = parsed_content.get("ADRESSE") or parsed_content.get("ADDRESS") or parsed_content.get("ADR") or "N/A"
+    out["city"] = parsed_content.get("CITY") or parsed_content.get("VILLE") or p.get("city") or "N/A"
+    out["postal"] = parsed_content.get("CODE POSTAL") or parsed_content.get("POSTALCODE") or ""
+    out["email"] = parsed_content.get("EMAIL") or ""
+    
+    # Mapping spécifique pour les CC's
+    out["cc"] = parsed_content.get("CC") or parsed_content.get("CCNUMBER") or ""
+    out["exp"] = parsed_content.get("EXP") or parsed_content.get("CCEXP") or ""
+    out["cvc"] = parsed_content.get("CVC") or parsed_content.get("CCCVV") or parsed_content.get("CVV") or ""
+    
+    # Infos Système
+    out["ip"] = parsed_content.get("IP") or ""
+    out["ua"] = parsed_content.get("USERAGENT") or ""
     
     # Technique
-    out["base"] = p.get("tier") or parsed_content.get("BASE") or "propro"
-    out["price"] = _coerce_price(p.get("price")) or 0.72
+    out["base"] = p.get("tier") or parsed_content.get("BASE") or "Recycle"
+    out["price"] = _coerce_price(p.get("price")) or 0.0
     
     return out
 
@@ -147,22 +159,37 @@ def full_product_text(p: Dict[str, Any]) -> str:
     f = _parse_product_fields(p)
     
     lines = [
-        "✅ **ACHAT RÉUSSI (LIVRAISON)**",
-        "━━━━━━━━━━━━━━━━━━",
-        f"👤 **NOM COMPLET**: `{f['first']}`",
-        f"🎂 **DATE DE NAISSANCE**: `{f['dob']}`",
-        f"🧾 **SIN (NAS)**: `{f['sin'] or 'Non disponible'}`",
-        f"📞 **TÉLÉPHONE**: `{f['phone'] or 'Non disponible'}`",
+        "✅ **LIVRAISON RÉUSSIE**",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
+
+    # --- SECTION CC (S'affiche seulement si c'est une carte) ---
+    if f["cc"]:
+        lines.append(f"💳 **CARTE**: `{f['cc']}`")
+        lines.append(f"📅 **EXP**: `{f['exp']}`  🔐 **CVC**: `{f['cvc']}`")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+    
+    # --- SECTION IDENTITÉ ---
+    lines.extend([
+        f"👤 **NOM**: `{f['first']} {f['last']}`".strip(),
+        f"🎂 **DOB**: `{f['dob']}`",
+        f"🧾 **SIN (NAS)**: `{f['sin'] or 'N/A'}`",
+        f"📞 **TÉL**: `{f['phone'] or 'N/A'}`",
         f"🏠 **ADRESSE**: `{f['address']}`",
-        f"🏙️ **VILLE**: `{f['city']}`",
+        f"🏙️ **VILLE**: `{f['city']} {f['postal']}`".strip(),
+        f"📧 **EMAIL**: `{f['email'] or 'N/A'}`",
+        "━━━━━━━━━━━━━━━━━━",
+    ])
+
+    # --- INFOS SYSTÈME ---
+    if f["ip"]: lines.append(f"🌐 **IP**: `{f['ip']}`")
+    if f["ua"]: lines.append(f"🖥️ **UA**: `{f['ua'][:50]}...`")
+    
+    lines.extend([
         "━━━━━━━━━━━━━━━━━━",
         f"💰 **PRIX**: `{f['price']:.2f} USD`",
-        f"📂 **CATÉGORIE**: `PROPRO`"
-    ]
-    
-    # On ajoute les champs bonus s'ils existent (ex: LANGUE)
-    if "LANGUE" in f["all_data"]:
-        lines.insert(8, f"🗣️ **LANGUE**: `{f['all_data']['LANGUE']}`")
+        f"📂 **BASE**: `{f['base']}`"
+    ])
 
     return "\n".join(lines)
 
@@ -1342,44 +1369,59 @@ async def clear_conversation(user_id: int):
         bot_messages[user_id] = []
 
 async def show_main_menu(user_id: int, clear: bool = True):
-    if clear: await clear_conversation(user_id)
+    # Sécurité : s'assurer que user_id est un entier pour Telegram
+    try:
+        u_id = int(user_id)
+    except:
+        return
+
+    if clear: 
+        try:
+            await clear_conversation(u_id)
+        except Exception as e:
+            print(f"Erreur clear_conversation: {e}")
     
-    balance = get_user_balance(str(user_id))
-    statut_code = get_user_statut(str(user_id)) 
-    lang = get_user_lang(str(user_id))
-    
+    # Récupération des données utilisateur
+    balance = get_user_balance(str(u_id))
+    statut_code = get_user_statut(str(u_id)) 
+    lang = get_user_lang(str(u_id))
     
     # --- LOGIQUE ADMIN INFO ---
     admin_info = ""
-    if str(user_id) in ADMIN_IDS:
-        sw_bal = get_signalwire_balance()
-        bc_bal = get_barcode_balance()
-        sim_bal = api_5sim_get_balance()
+    if str(u_id) in ADMIN_IDS:
+        try:
+            sw_bal = get_signalwire_balance()
+            bc_bal = get_barcode_balance()
+            sim_bal = api_5sim_get_balance()
+            admin_info = f"\n\n🏦 **Admin Stats**:\nSignalWire: {sw_bal}\n🪪 Barcode: {bc_bal}\n📱 5SIM: {sim_bal}"
+        except:
+            admin_info = "\n\n⚠️ Erreur API Admin"
 
-        admin_info = f"\n🏦 SignalWire: {sw_bal}\n🪪 BarcodeSolution: {bc_bal}\n📱 5SIM: {sim_bal}"
-    # --- LOGIQUE SOLDE INFINI (AJOUTÉ) ---
-    if str(user_id) in ADMIN_IDS:
+    # --- LOGIQUE SOLDE ---
+    if str(u_id) in ADMIN_IDS:
         solde_visuel = "∞"
     else:
         solde_visuel = f"{balance:.2f} USD"
  
     details_forfait = FORFAITS.get(statut_code, FORFAITS["bronze"])
-    
-
     statut_label = f"🏆 Statut : {details_forfait['label']}"
-    # ----------------------------------------
-
-    await app_telegram.bot.send_message(
-        chat_id=user_id,
-        text=MESSAGES['welcome'][lang].format(
-            telegram_id=user_id,
-            balance=solde_visuel, # ✅ C'est ici qu'on injecte le symbole
-            statut_label=statut_label,
-            admin_info=admin_info 
-        ),
-        reply_markup=build_main_menu(user_id),
-        parse_mode="Markdown"
-    )
+    
+    # --- ENVOI DU MESSAGE ---
+    # On utilise directement app_telegram.bot pour être sûr d'atteindre le chat
+    try:
+        await app_telegram.bot.send_message(
+            chat_id=u_id,
+            text=MESSAGES['welcome'][lang].format(
+                telegram_id=u_id,
+                balance=solde_visuel,
+                statut_label=statut_label,
+                admin_info=admin_info 
+            ),
+            reply_markup=build_main_menu(u_id),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Erreur fatale send_message menu: {e}")
 
 # ========================== CATALOGUE PRODUITS ==========================
 
@@ -1892,7 +1934,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     page = max(0, min(page, total_pages - 1))
     sent_ids = []
 
-    # --- FONCTION D'AFFICHAGE (MODIFIÉE POUR JUSTE LE PRÉNOM) ---
+    # --- FONCTION D'AFFICHAGE (PRÉNOM + VILLE) ---
     def fmt_product_ccs(p):
         try:
             lines = []
@@ -1902,32 +1944,35 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
                 m = re.search(f"{key}:\\s*(.+)", content, re.IGNORECASE)
                 return m.group(1).strip() if m else None
 
+            # A. Infos Bancaires
             cc = get_val("CC") or get_val("BINS") or get_val("CCNUMBER")
             exp = get_val("EXP") or get_val("CCEXP")
             
-            # --- MODIFICATION ICI : PRÉNOM SEULEMENT ---
+            # B. Identité (Prénom seulement)
             fname = get_val("FIRST NAME")
-            
             if fname:
-                # On prend juste le premier mot (ex: "Jean-Pierre" reste entier, "Jean Pierre" devient "Jean")
-                display_name = fname.strip() # .split()[0] si tu veux couper les prénoms composés
+                display_name = fname.strip()
             else:
-                # Fallback : Si pas de champ "FIRST NAME", on essaie de deviner depuis le titre
                 raw_title = str(p.get('title', ''))
-                # On nettoie le titre et on prend le premier mot
-                clean_title = raw_title.split('•')[0].replace("💳", "").replace("CC", "").strip()
-                display_name = clean_title.split()[0] # Prend juste le 1er mot
+                # Nettoyage "💳 CC" du titre
+                clean_title = raw_title.split('•')[0].replace("💳 CC", "").replace("💳", "").replace("CC", "").strip()
+                display_name = clean_title.split()[0] if clean_title else "N/A"
 
-            if cc: lines.append(f"BINS: {cc[:6]}")
-            if exp: lines.append(f"EXP: {exp}")
+            # C. Ville (Extraction de CITY ou VILLE)
+            city = get_val("CITY") or get_val("VILLE") or p.get('city') or "N/A"
+
+            # Construction du message
+            if cc: lines.append(f"💳 **BINS:** {cc[:6]}")
+            if exp: lines.append(f"📅 **EXP:** {exp}")
             
-            # Affiche uniquement le prénom
-            lines.append(f"FIRST NAME: {display_name}")
+            lines.append(f"👤 **FIRST NAME:** {display_name}")
+            lines.append(f"📍 **CITY:** {city.upper()}") # Ville en majuscule
             
-            lines.append(f"BASE: {p.get('tier', 'Recycle')}")
+            lines.append(f"🏷️ **BASE:** {p.get('tier', 'Recycle')}")
+            
             try: price_val = float(p.get('price', 0))
             except: price_val = 0.0
-            lines.append(f"PRICE: {price_val:.2f} USD")
+            lines.append(f"💰 **PRICE:** {price_val:.2f} USD")
             
             return "\n".join(lines)
         except Exception as e:
@@ -1977,7 +2022,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
         m = await context.bot.send_message(chat_id=chat_id, text=f"💳 Catalogue Cc's ({total_items} disponibles)", reply_markup=kb)
         sent_ids.append(m.message_id)
         CCS_CATALOG_MSGS[chat_id] = sent_ids
- 
+        
 # --- Fonctions de filtre (Clone pour CCS) ---
 
 def _build_filter_menu_ccs(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
@@ -3452,116 +3497,106 @@ async def auth_create_pin_save(update: Update, context: ContextTypes.DEFAULT_TYP
     await goto_menu(update, context)
     return ConversationHandler.END
 
-# --- ÉTAPE C : LOGIN (VÉRIFICATION PIN) ---
 async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Gestion du clavier PIN avec affichage fluide.
-    """
     q = update.callback_query
-    # On répond immédiatement pour la fluidité tactile
+    # On répond tout de suite pour enlever le sablier
     try: await q.answer() 
     except: pass
     
     data = q.data
-    user_id = str(update.effective_user.id)
+    user_id_int = update.effective_user.id
+    user_id_str = str(user_id_int)
     
-    # Récupère le PIN actuel (ou vide si rien)
     current_input = context.user_data.get('temp_pin_input', "")
 
-    # === CAS 1 : L'utilisateur tape un CHIFFRE ===
+    # --- 1. CHIFFRES ---
     if data.startswith("pin_") and data[4:].isdigit():
         digit = data.split("_")[1]
-        
-        # Limite de sécurité à 20 chiffres pour éviter les abus
-        if len(current_input) < 20: 
+        if len(current_input) < 4: 
             current_input += digit
             context.user_data['temp_pin_input'] = current_input
             
-            # --- Construction du masque visuel ---
-            nb = len(current_input)
-            # Si moins de 4, on complète avec des ronds vides pour garder l'alignement
-            if nb < 4:
-                mask = "⚫" * nb + "◯" * (4 - nb)
-            else:
-                mask = "⚫" * nb
-            
+            mask = "⚫" * len(current_input) + "◯" * (4 - len(current_input))
             try:
                 await q.edit_message_text(
-                    f"🔒 **TERMINAL VERROUILLÉ**\nPIN : {mask}",
+                    f"🔒 **TERMINAL VERROUILLÉ**\nPIN : `{mask}`",
                     reply_markup=get_pin_keyboard(),
                     parse_mode="Markdown"
                 )
-            except Exception:
-                # Si Telegram bloque car ça va trop vite, on ignore (le prochain clic mettra à jour)
-                pass
+            except: pass
 
-    # === CAS 2 : BOUTON EFFACER (DEL) ===
-    elif data == "pin_del":
-        if len(current_input) > 0:
-            current_input = current_input[:-1]
-            context.user_data['temp_pin_input'] = current_input
-            
-            nb = len(current_input)
-            if nb < 4:
-                mask = "⚫" * nb + "◯" * (4 - nb)
-            else:
-                mask = "⚫" * nb
+            # --- VALIDATION AUTO ---
+            if len(current_input) == 4:
+                import asyncio
+                await asyncio.sleep(0.1) 
                 
-            try:
-                await q.edit_message_text(
-                    f"🔒 **TERMINAL VERROUILLÉ**\nPIN : {mask}",
-                    reply_markup=get_pin_keyboard(),
-                    parse_mode="Markdown"
-                )
-            except: pass
+                con = sqlite3.connect(DB_NAME)
+                row = con.execute("SELECT pin_code FROM users WHERE telegram_id=?", (user_id_str,)).fetchone()
+                con.close()
+                
+                if row and str(row[0]) == current_input:
+                    # ✅ PIN CORRECT
+                    context.user_data['is_locked'] = False
+                    context.user_data['temp_pin_input'] = ""
+                    context.user_data['last_login_time'] = time.time()
+                    
+                    # On supprime le clavier PIN proprement
+                    try: await q.message.delete()
+                    except: pass
+                    
+                    # FIX CRITIQUE : Appel correct de show_main_menu(user_id, clear)
+                    # On ne passe plus update/context pour éviter l'erreur "multiple values"
+                    try:
+                        await show_main_menu(user_id_int, clear=True)
+                        return ConversationHandler.END
+                    except Exception as e:
+                        print(f"Erreur menu: {e}")
+                        # Fallback direct en cas de souci
+                        await context.bot.send_message(chat_id=user_id_int, text="🔓 Accès autorisé.")
+                        return ConversationHandler.END
+                else:
+                    # ❌ PIN FAUX
+                    context.user_data['temp_pin_input'] = ""
+                    await q.answer("⛔ PIN INCORRECT", show_alert=True)
+                    try:
+                        await q.edit_message_text(
+                            "🔒 **TERMINAL VERROUILLÉ**\nCode incorrect. Réessayez :\n\n`◯◯◯◯`",
+                            reply_markup=get_pin_keyboard(),
+                            parse_mode="Markdown"
+                        )
+                    except: pass
 
-    # === CAS 3 : BOUTON VALIDER (OK) ===
-    elif data == "pin_enter":
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        cur.execute("SELECT pin_code FROM users WHERE telegram_id=?", (user_id,))
-        row = cur.fetchone()
-        con.close()
-        
-        # Vérification du code
-        if row and row[0] == current_input:
-            # ✅ CODE BON
-            context.user_data['is_locked'] = False # Déverrouillage
-            context.user_data['temp_pin_input'] = "" # Reset
-            
-            # Supprime le clavier PIN
-            try: await q.message.delete()
-            except: 
-                try: await q.edit_message_text("✅")
-                except: pass
-            
-            # Affiche le menu principal
-            await show_main_menu(update.effective_user.id, clear=True)
-            return ConversationHandler.END
-        else:
-            # ❌ CODE FAUX
-            context.user_data['temp_pin_input'] = "" # On vide le champ
-            try:
-                await q.edit_message_text(
-                    "⛔ **CODE FAUX !** Réessayez.\nPIN : `◯◯◯◯`",
-                    reply_markup=get_pin_keyboard(),
-                    parse_mode="Markdown"
-                )
-            except: pass
-            return ID_AUTH_WAIT_PIN_LOGIN
+    # --- 2. EFFACER ---
+    elif data == "pin_del":
+        current_input = current_input[:-1]
+        context.user_data['temp_pin_input'] = current_input
+        mask = "⚫" * len(current_input) + "◯" * (4 - len(current_input))
+        try:
+            await q.edit_message_text(
+                f"🔒 **TERMINAL VERROUILLÉ**\nPIN : `{mask}`",
+                reply_markup=get_pin_keyboard(),
+                parse_mode="Markdown"
+            )
+        except: pass
             
     return ID_AUTH_WAIT_PIN_LOGIN
+
 
 # --- BOUTON LOG OUT ---
 async def auth_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer("🔒 Options de session...")
+    try: await q.answer("🔒 Options de session...")
+    except: pass
     
-    # On vide la mémoire vive
-    context.user_data.clear()
-    reset_session(update.effective_user.id)
+    user_id = update.effective_user.id
     
-    # Menu à deux choix
+    # On force le verrouillage sans tout effacer pour garder la fluidité
+    context.user_data['is_locked'] = True
+    context.user_data['temp_pin_input'] = ""
+    
+    # Réinitialisation de la session en DB si ton script le gère
+    reset_session(user_id)
+    
     kb = [
         [InlineKeyboardButton("🔒 Verrouiller (PIN requis)", callback_data="auth_lock_only")],
         [InlineKeyboardButton("🚪 Changer de compte (Importer)", callback_data="auth_switch_account")]
@@ -3576,20 +3611,66 @@ async def auth_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+
+# --- ACTION : VERROUILLER ---
 async def auth_lock_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Verrouille simplement le terminal."""
     q = update.callback_query
-    await q.answer()
-    await replace_view(q, "🔒 **Terminal Verrouillé.**\nTapez /start pour revenir.")
+    try: 
+        await q.answer("Verrouillage...")
+    except: 
+        pass
+    
+    # On marque la session comme verrouillée
+    context.user_data['is_locked'] = True
+    context.user_data['temp_pin_input'] = ""
+    
+    # On supprime le menu de déconnexion pour laisser place au PIN
+    try: 
+        await q.message.delete()
+    except: 
+        pass
+    
+    # FIX : On utilise le nom EXACT présent dans ton code (acc_ask_pin)
+    # On retourne aussi l'état pour que le ConversationHandler suive
+    await acc_ask_pin(update, context)
+    return ID_AUTH_WAIT_PIN_LOGIN
+
+# --- BOUTON LOG OUT (MENU) ---
+async def auth_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try: 
+        await q.answer("🔒 Options de session...")
+    except: 
+        pass
+    
+    user_id = update.effective_user.id
+    
+    # Verrouillage en mémoire vive
+    context.user_data['is_locked'] = True
+    context.user_data['temp_pin_input'] = ""
+    
+    # Nettoyage en base de données
+    reset_session(user_id)
+    
+    kb = [
+        [InlineKeyboardButton("🔒 Verrouiller (PIN requis)", callback_data="auth_lock_only")],
+        [InlineKeyboardButton("🚪 Changer de compte (Importer)", callback_data="auth_switch_account")]
+    ]
+    
+    await replace_view(
+        q,
+        "🛑 **MENU DÉCONNEXION**\n\n"
+        "Voulez-vous simplement verrouiller l'écran ou changer d'utilisateur ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
     return ConversationHandler.END
 
+# --- ACTION : CHANGER DE COMPTE ---
 async def auth_switch_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Prépare le terrain pour un changement de compte."""
     q = update.callback_query
-    await q.answer()
-    
-    # Note : On ne supprime pas l'user de la DB, on le laisse juste "dormant"
-    # Le prochain login par seed réattribuera l'ID Telegram.
+    try: await q.answer()
+    except: pass
     
     await replace_view(
         q,
@@ -3600,52 +3681,60 @@ async def auth_switch_account(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
     return ConversationHandler.END
 
+# --- ACTION : DÉMARRER IMPORTATION ---
 async def auth_import_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
+    try: await q.answer()
+    except: pass
     
-    await replace_view(
-        q,
-        "📝 **IMPORTATION DE COMPTE**\n\n"
-        "Veuillez entrer votre **Seed Phrase** (les 12 ou 24 mots) séparés par des espaces.\n\n"
-        "⚠️ _Ceci liera ce compte Telegram à ce Wallet._",
+    try: await q.message.delete()
+    except: pass
+    
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📝 **IMPORTATION DE COMPTE**\n\n"
+             "Veuillez entrer votre **Seed Phrase** (les 12 ou 24 mots) séparés par des espaces.\n\n"
+             "⚠️ _Ceci liera ce compte Telegram à ce Wallet._",
         parse_mode="Markdown"
     )
     return ID_AUTH_WAIT_SEED
 
+# --- ACTION : VÉRIFICATION ET SWAP ---
 async def auth_import_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    seed_input = update.message.text.strip()
+    seed_input = update.message.text.strip().lower()
     telegram_id = str(update.effective_user.id)
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     
-    # On cherche si cette seed existe
     cur.execute("SELECT user_id, pin_code, username FROM users WHERE seed_phrase=?", (seed_input,))
     row = cur.fetchone()
     
     if row:
         target_user_id, pin, username = row
         
-        # SÉCURITÉ CRITIQUE : 
-        # 1. On détache l'ID Telegram de l'ancien compte (où qu'il soit)
+        # 1. Détache l'ID Telegram de l'ancien profil
         cur.execute("UPDATE users SET telegram_id = NULL WHERE telegram_id = ?", (telegram_id,))
-        # 2. On attache l'ID Telegram au nouveau compte cible
+        # 2. Attache au nouveau profil
         cur.execute("UPDATE users SET telegram_id = ? WHERE user_id = ?", (telegram_id, target_user_id))
         con.commit()
         con.close()
         
+        # Nettoyage complet de la session mémoire pour le nouveau profil
+        context.user_data.clear()
+        context.user_data['is_locked'] = True 
+        
         await update.message.reply_text(
-            f"✅ **Compte récupéré !**\n"
-            f"👤 Bienvenue sur le profil de : {username or 'Utilisateur'}\n"
+            f"✅ **Compte récupéré !**\n\n"
+            f"👤 Profil : `{username or 'Utilisateur'}`\n"
             f"🔑 PIN requis : `{pin}`\n\n"
-            f"Tapez /start pour vous connecter.",
+            f"Faites /start pour accéder au terminal.",
             parse_mode="Markdown"
         )
         return ConversationHandler.END
     else:
         con.close()
-        await update.message.reply_text("❌ **Erreur :** Seed phrase inconnue ou invalide. Réessayez :")
+        await update.message.reply_text("❌ **Erreur :** Seed phrase inconnue. Réessayez :")
         return ID_AUTH_WAIT_SEED
 
 # ========================== TOOLS / HLR LOGIC ==========================
@@ -7628,14 +7717,20 @@ async def account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- 1. CHANGER PIN (CLEAN) ---
 async def acc_ask_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    msg = await q.message.edit_text(
-        "🔐 **Nouveau PIN**\n\nVeuillez entrer votre nouveau code PIN (4 à 8 chiffres) :",
-        reply_markup=kb_back_cancel()
-    )
-    context.user_data['acc_prompt_id'] = msg.message_id # On retient l'ID de la question
-    return ACC_WAIT_NEW_PIN
+    query = update.callback_query
+    chat_id = update.effective_chat.id
+    
+    # On réinitialise la saisie
+    context.user_data['temp_pin_input'] = ""
+    
+    text = "🔒 **TERMINAL VERROUILLÉ**\nSaisissez votre code PIN :\n\n`◯◯◯◯`"
+    
+    if query:
+        await query.message.reply_text(text, reply_markup=get_pin_keyboard(), parse_mode="Markdown")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=get_pin_keyboard(), parse_mode="Markdown")
+    
+    return ID_AUTH_WAIT_PIN_LOGIN
 
 async def acc_save_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import asyncio
@@ -9034,9 +9129,10 @@ conv_handler = ConversationHandler(
     ],
     states={
         # --- AUTHENTIFICATION ---
-        ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT, auth_create_pin_save)],
+        # Utilisation de ~filters.COMMAND pour éviter de bloquer le /start
+        ID_AUTH_WAIT_PIN_CREATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_create_pin_save)],
         ID_AUTH_WAIT_PIN_LOGIN: [CallbackQueryHandler(auth_pin_handler, pattern="^pin_")],
-        ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT, auth_import_verify)],
+        ID_AUTH_WAIT_SEED: [MessageHandler(filters.TEXT & ~filters.COMMAND, auth_import_verify)],
         
         # --- BOÎTE À OUTILS ---
         SELECT_TOOL: [
@@ -9056,48 +9152,48 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(account_menu, pattern="^account_menu$"),
             CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")
         ],
-        WAIT_HLR_NUMBER: [MessageHandler(filters.TEXT, tool_process_hlr)],
+        WAIT_HLR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, tool_process_hlr)],
         
         # --- GESTION COMPTE ---
-        ACC_WAIT_NEW_PIN: [MessageHandler(filters.TEXT, acc_save_pin)],
-        ACC_WAIT_USERNAME: [MessageHandler(filters.TEXT, acc_save_user)],
-        ACC_WAIT_JABBER: [MessageHandler(filters.TEXT, acc_save_jabber)],
+        ACC_WAIT_NEW_PIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_pin)],
+        ACC_WAIT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_user)],
+        ACC_WAIT_JABBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, acc_save_jabber)],
         ACC_WAIT_RESET_CONFIRM: [CallbackQueryHandler(acc_reset_confirm, pattern="^confirm_reset_seed$")],
 
         # --- VÉRIFICATION PERMIS (MULTI & UNIQUE) ---
-        ASK_QTY: [MessageHandler(filters.TEXT, ask_qty)],
+        ASK_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_qty)],
         ASK_MODE: [
             CallbackQueryHandler(choose_mode_manual, pattern="^mode_manual$"),
             CallbackQueryHandler(choose_mode_csv, pattern="^mode_csv$")
         ],
-        MANUAL_PRENOM: [MessageHandler(filters.TEXT, manual_receive_prenom)],
-        MANUAL_NOM: [MessageHandler(filters.TEXT, manual_receive_nom)],
-        MANUAL_DATE: [MessageHandler(filters.TEXT, manual_receive_date)],
+        MANUAL_PRENOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_receive_prenom)],
+        MANUAL_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_receive_nom)],
+        MANUAL_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_receive_date)],
         CSV_WAIT: [MessageHandler(filters.Document.ALL, csv_receive_file)],
-        BULK_CONFIRM: [MessageHandler(filters.TEXT, bulk_confirm)],
+        BULK_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bulk_confirm)],
         
-        ASK_PRENOM: [MessageHandler(filters.TEXT, receive_prenom)],
-        ASK_NOM: [MessageHandler(filters.TEXT, receive_nom)],
-        ASK_DATE: [MessageHandler(filters.TEXT, receive_date)],
-        CONFIRM_VERIF: [MessageHandler(filters.TEXT, confirm_permis)],
+        ASK_PRENOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_prenom)],
+        ASK_NOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_nom)],
+        ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_date)],
+        CONFIRM_VERIF: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_permis)],
         
         # --- SUPPORT CLIENT ---
-        # 👇 CORRECTION ICI : Ajout de "tickets." devant save_category
         tickets.WAIT_CATEGORY: [CallbackQueryHandler(tickets.save_category, pattern="^ticket_cat:")],
-        # 👇 CORRECTION ICI : Ajout de "tickets." devant handle_ticket_msg
-        tickets.WAIT_TICKET_MSG: [MessageHandler(filters.TEXT, tickets.handle_ticket_msg)],
+        tickets.WAIT_TICKET_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, tickets.handle_ticket_msg)],
         
         TICKET_DRAFT: [
             CallbackQueryHandler(ticket_handle_virtual_click, pattern="^vkey:"),
-            MessageHandler(filters.TEXT, ticket_reject_physical)
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_reject_physical)
         ]
     },
     fallbacks=[
         CallbackQueryHandler(goto_menu, pattern="^menu_accueil$"),
-        CommandHandler("start", goto_menu),
+        CommandHandler("start", start), # Retour au start au cas où
         CallbackQueryHandler(ticket_resume, pattern="^ticket_resume:")
     ],
-    name="main_conversation"
+    name="main_conversation",
+    per_chat=True,
+    per_user=True
 )
 
 
