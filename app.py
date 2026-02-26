@@ -894,8 +894,6 @@ def init_db():
     # ==========================================
     # 🚀 OPTIMISATION PERFORMANCE (Mode TURBO)
     # ==========================================
-    # Permet de lire et écrire en même temps.
-    # Réduit drastiquement le lag quand plusieurs utilisateurs sont actifs.
     con.execute("PRAGMA journal_mode=WAL;") 
     con.execute("PRAGMA synchronous=NORMAL;")
     con.execute("PRAGMA cache_size=10000;") 
@@ -903,6 +901,15 @@ def init_db():
 
     cur = con.cursor()
     
+    # --- NOUVEAU : CONFIGURATION GLOBALE (MAINTENANCE) ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS global_config (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    cur.execute("INSERT OR IGNORE INTO global_config (key, value) VALUES ('maintenance_mode', 'OFF')")
+
     # 1. TABLE DES UTILISATEURS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -921,11 +928,13 @@ def init_db():
             custom_username TEXT,
             jabber_id TEXT,
             inactivity_timeout INTEGER DEFAULT 300,
-            pagination INTEGER DEFAULT 2
+            pagination INTEGER DEFAULT 2,
+            referred_by TEXT,
+            ref_bonus_paid INTEGER DEFAULT 0
         )
     """)
     
-    # Patchs de sécurité (Ajoute les colonnes manquantes sans écraser les données)
+    # Patchs de sécurité (Colonnes manquantes incluant le Parrainage et le Bonus)
     columns_to_check = [
         ("user_id", "TEXT"), 
         ("seed_phrase", "TEXT"), 
@@ -934,14 +943,16 @@ def init_db():
         ("custom_username", "TEXT"), 
         ("jabber_id", "TEXT"),
         ("inactivity_timeout", "INTEGER DEFAULT 300"),
-        ("pagination", "INTEGER DEFAULT 2")
+        ("pagination", "INTEGER DEFAULT 2"),
+        ("referred_by", "TEXT"),
+        ("ref_bonus_paid", "INTEGER DEFAULT 0") # <-- AJOUT : SUIVI DU PAIEMENT BONUS 5$
     ]
     
     for col_name, col_type in columns_to_check:
         try:
             cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
         except sqlite3.OperationalError: 
-            pass # La colonne existe déjà, on ignore
+            pass
 
     # 2. TABLE DES TRANSACTIONS
     cur.execute("""
@@ -954,7 +965,7 @@ def init_db():
         )
     """)
 
-    # 3. TABLE DES PRODUITS (Mise à jour défaut USD)
+    # 3. TABLE DES PRODUITS
     cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -983,7 +994,6 @@ def init_db():
         )
     """)
     
-    # Patchs pour support_tickets
     for col in [
         ("username", "TEXT"), 
         ("category", "TEXT"), 
@@ -994,12 +1004,12 @@ def init_db():
             cur.execute(f"ALTER TABLE support_tickets ADD COLUMN {col[0]} {col[1]}")
         except sqlite3.OperationalError: pass
 
-    # 5. HISTORIQUE DES MESSAGES (Chat Support)
+    # 5. HISTORIQUE DES MESSAGES
     cur.execute("""
         CREATE TABLE IF NOT EXISTS ticket_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ticket_id INTEGER,
-            sender_role TEXT, -- 'user' ou 'admin'
+            sender_role TEXT,
             message TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(ticket_id) REFERENCES support_tickets(ticket_id)
@@ -1017,7 +1027,32 @@ def init_db():
 
     con.commit()
     con.close()
-    log("DB initialized (V3.2 + Mode WAL TURBO 🚀)", "SYSTEM")
+    log("DB initialized (V3.5 + Referral Bonus Tracking + Maintenance 🚀)", "SYSTEM")
+
+def get_maintenance_status():
+    try:
+        con = sqlite3.connect(DB_NAME)
+        res = con.execute("SELECT value FROM global_config WHERE key='maintenance_mode'").fetchone()
+        con.close()
+        return res[0] if res else "OFF"
+    except: return "OFF"
+
+def set_maintenance_status(status):
+    con = sqlite3.connect(DB_NAME)
+    con.execute("UPDATE global_config SET value=? WHERE key='maintenance_mode'", (status,))
+    con.commit()
+    con.close()
+
+async def is_maintenance_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if get_maintenance_status() == "ON" and str(user_id) not in ADMIN_IDS:
+        msg = "🛠 **MAINTENANCE EN COURS**\n\nLe bot est gelé pour mise à jour. Revenez dans quelques minutes."
+        if update.callback_query:
+            await update.callback_query.answer(msg, show_alert=True)
+        else:
+            await update.message.reply_text(msg)
+        return True
+    return False
 
 def patch_db_tickets():
     con = sqlite3.connect(DB_NAME)
@@ -1187,6 +1222,8 @@ def credit_and_upgrade(telegram_id: str, montant: float):
     statut = upgrade_user_statut_auto(telegram_id)
     return new_balance, statut
 
+
+
 def get_users(limit: int = 50):
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
@@ -1348,6 +1385,7 @@ def build_main_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("💳 Recharger" if lang == "fr" else "💳 Top up", callback_data="add_balance")],
         [InlineKeyboardButton("🌐 Langue/Language", callback_data="choose_lang")],
         [InlineKeyboardButton(label_support, callback_data="support")], 
+        [InlineKeyboardButton("🤝 Parrainage", callback_data="show_referral")],
         [InlineKeyboardButton("👤 Mon Compte", callback_data="account_menu")],
         [InlineKeyboardButton("🔒 Log Out", callback_data="auth_logout")],
     ]
@@ -1719,6 +1757,62 @@ async def filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     print("[DEBUG] Menu filtre affiché. Passage état CATALOG_FILTER_MAIN", flush=True)
     return CATALOG_FILTER_MAIN
+
+async def check_and_pay_referral_bonus(context: ContextTypes.DEFAULT_TYPE, filleul_id: str):
+    """
+    Vérifie si le dépôt total du filleul est >= 100$.
+    Si oui, verse 5$ au parrain (une seule fois).
+    """
+    try:
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        
+        # 1. On récupère les stats du filleul : total déposé, son parrain, et si le bonus a déjà été payé
+        cur.execute("""
+            SELECT total_recharge, referred_by, ref_bonus_paid 
+            FROM users 
+            WHERE telegram_id = ?
+        """, (str(filleul_id),))
+        
+        row = cur.fetchone()
+        
+        if not row:
+            con.close()
+            return
+
+        total_depose, parrain_id, deja_paye = row
+
+        # 2. Conditions pour verser le bonus :
+        # - Le total déposé doit être >= 100$
+        # - L'utilisateur doit avoir été parrainé (referred_by n'est pas vide)
+        # - Le bonus ne doit pas avoir déjà été versé (ref_bonus_paid == 0)
+        if total_depose >= 100 and parrain_id and parrain_id != "None" and deja_paye == 0:
+            
+            # A. On crédite le parrain de 5$
+            cur.execute("UPDATE users SET balance = balance + 5 WHERE telegram_id = ?", (parrain_id,))
+            
+            # B. On marque le bonus comme payé pour ce filleul
+            cur.execute("UPDATE users SET ref_bonus_paid = 1 WHERE telegram_id = ?", (str(filleul_id),))
+            
+            con.commit()
+            log(f"🎁 BONUS REFERRAL : 5$ versés à {parrain_id} pour le dépôt de {filleul_id}", "REWARD")
+
+            # C. On informe le parrain par message Telegram
+            try:
+                msg_parrain = (
+                    "🎁 **RÉCOMPENSE DE PARRAINAGE**\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "Félicitations ! L'un de vos filleuls a atteint **100$** de dépôt total.\n\n"
+                    "💰 Votre compte a été crédité de **5.00$ USD** !"
+                )
+                await context.bot.send_message(chat_id=parrain_id, text=msg_parrain, parse_mode="Markdown")
+            except Exception as e:
+                print(f"Erreur notif parrain: {e}")
+
+        con.close()
+        
+    except Exception as e:
+        print(f"❌ Erreur check_and_pay_referral_bonus: {e}")
 
 async def filter_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2447,11 +2541,8 @@ async def check_payment_callback(update: Update, context: ContextTypes.DEFAULT_T
 async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
     """Vérifie les paiements et crédite UNIQUEMENT si >= 2 Confirmations."""
     try:
-        # Imports locaux pour éviter les erreurs "name not defined" et les boucles d'import
         import sqlite3
         import requests
-        from hdwallet import HDWallet
-        from hdwallet.cryptocurrencies import Bitcoin as BTC_Class
         
         # 1. Connexion DB sécurisée
         conn = sqlite3.connect(DB_NAME) 
@@ -2478,13 +2569,11 @@ async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
         for row in pending_orders:
             order_id, user_id, btc_addr = row
             
-            # Sécurité : Si l'adresse est mal générée (ERR_GEN), on passe
             if not btc_addr or "ERR" in btc_addr:
                 continue
 
             try:
                 # 3. Récupération des transactions
-                # Utilisation d'un header User-Agent pour éviter d'être bloqué par Mempool
                 headers = {'User-Agent': 'Mozilla/5.0'}
                 r = requests.get(f"https://mempool.space/api/address/{btc_addr}/txs", headers=headers, timeout=10)
                 
@@ -2494,13 +2583,12 @@ async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
                 try:
                     txs = r.json()
                 except Exception:
-                    continue # Stop l'erreur "Expecting value" si l'API renvoie du HTML
+                    continue 
                 
                 total_btc_recu = 0.0
                 confirmations_max = 0
                 
                 for tx in txs:
-                    # On vérifie si la transaction est confirmée
                     status = tx.get('status', {})
                     if status.get('confirmed'):
                         tx_height = status.get('block_height')
@@ -2513,19 +2601,23 @@ async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
 
                 # 4. CRÉDIT SI 2 CONFIRMATIONS
                 if confirmations_max >= 2 and total_btc_recu > 0:
-                    # Import local de la fonction de solde
-                    from app import update_user_balance, get_btc_price_usd
-                    
                     # On marque comme payé AVANT de créditer (Sécurité anti-double débit)
                     c.execute("UPDATE crypto_payments SET status='paid', btc_received=? WHERE id=?", (total_btc_recu, order_id))
                     conn.commit()
                     
                     # Calcul valeur (Prix actuel du BTC - 3% de frais de change)
+                    from app import update_user_balance, get_btc_price_usd, credit_and_upgrade
                     price_btc = get_btc_price_usd()
                     montant_usd = (total_btc_recu * price_btc) * 0.97
                     
-                    update_user_balance(str(user_id), montant_usd)
+                    # Crédit du solde et mise à jour du total_recharge (via ta fonction de grade)
+                    credit_and_upgrade(str(user_id), montant_usd)
                     
+                    # --- 🤝 NOUVEAU : VÉRIFICATION BONUS PARRAINAGE (5$ si total >= 100$) ---
+                    # Cette fonction est appelée automatiquement après chaque dépôt réussi
+                    await check_and_pay_referral_bonus(context, str(user_id))
+                    # -----------------------------------------------------------------------
+
                     # Notification Telegram
                     try:
                         await context.bot.send_message(
@@ -3381,8 +3473,13 @@ def get_pin_keyboard():
     return InlineKeyboardMarkup(keys)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # --- 🛡️ PROTECTION MAINTENANCE ---
+    if await is_maintenance_active(update, context): 
+        return # Arrête tout si la maintenance est ON
+
     user = update.effective_user
     user_id = str(user.id)
+    args = context.args  # Récupère les paramètres après /start (ex: le code parrain)
     
     # Nettoyage préventif
     context.user_data['temp_pin_input'] = "" 
@@ -3390,37 +3487,54 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     
-    # 👇 CORRECTION : On cherche par telegram_id 👇
-    cur.execute("SELECT pin_code, username FROM users WHERE telegram_id=?", (user_id,))
-    
+    # 1. On cherche si l'utilisateur existe déjà
+    cur.execute("SELECT pin_code, username, referred_by FROM users WHERE telegram_id=?", (user_id,))
     row = cur.fetchone()
+
+    # --- 🤝 LOGIQUE PARRAINAGE (Nouveau compte uniquement) ---
+    if not row and args:
+        referrer_id = str(args[0])
+        # Sécurité : On ne peut pas se parrainer soi-même
+        if referrer_id != user_id:
+            # On crée l'entrée avec le parrain pour ne pas perdre l'info lors du setup
+            cur.execute("INSERT OR IGNORE INTO users (telegram_id, referred_by) VALUES (?, ?)", (user_id, referrer_id))
+            con.commit()
+            # Notification optionnelle au parrain
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id, 
+                    text="🤝 **Nouveau parrainage !**\nUn utilisateur a rejoint via votre lien."
+                )
+            except: pass
+
     con.close()
 
-    # CAS A : Déjà sécurisé -> LOGIN AVEC CLAVIER
+    # CAS A : Déjà sécurisé (Possède un PIN) -> LOGIN AVEC CLAVIER
     if row and row[0]: 
         # --- 👇 CORRECTIF ANTI-CRASH 👇 ---
-        # On récupère le nom (soit de la DB, soit de Telegram)
         raw_name = row[1] or user.first_name or "Utilisateur"
-        # On échappe les caractères spéciaux pour le Markdown
         safe_name = str(raw_name).replace("_", "\\_").replace("*", "\\*").replace("`", "\\`")
-        # ----------------------------------
 
-        # On stocke le message ID pour le supprimer plus tard
         msg = await update.message.reply_text(
             f"🔒 **TERMINAL VERROUILLÉ**\n"
             f"Utilisateur : {safe_name}\n\n"
-            f"PIN : `____`", # 4 underscores pour commencer
+            f"PIN : `◯◯◯◯`", 
             reply_markup=get_pin_keyboard(),
             parse_mode="Markdown"
         )
         context.user_data['auth_msg_id'] = msg.message_id
         return ID_AUTH_WAIT_PIN_LOGIN
 
-    # CAS B : Pas de PIN -> SETUP
+    # CAS B : Pas de PIN -> SETUP (Nouveau ou parrainé)
     else:
-        kb = [[InlineKeyboardButton("🆕 Créer un Wallet (Sécuriser)", callback_data="auth_create")]]
+        kb = [
+            [InlineKeyboardButton("🆕 Créer un Wallet (Sécuriser)", callback_data="auth_create")],
+            [InlineKeyboardButton("📥 Importer un compte", callback_data="auth_import_start")]
+        ]
         await update.message.reply_text(
-            f"🕵️‍♂️ **BIENVENUE SUR NOMEN NESCIO**\n━━━━━━━━━━━━━━━━━━\nVotre ligne n'est pas sécurisée.\nCréez une Identité Cryptographique.",
+            f"🕵️‍♂️ **BIENVENUE SUR NOMEN NESCIO**\n━━━━━━━━━━━━━━━━━━\n"
+            f"Votre ligne n'est pas sécurisée.\n"
+            f"Créez une Identité Cryptographique pour accéder au terminal.",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown"
         )
@@ -3498,6 +3612,10 @@ async def auth_create_pin_save(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # --- 🛡️ PROTECTION MAINTENANCE ---
+    if await is_maintenance_active(update, context): 
+        return ID_AUTH_WAIT_PIN_LOGIN # On reste sur l'écran PIN mais bloqué
+
     q = update.callback_query
     # On répond tout de suite pour enlever le sablier
     try: await q.answer() 
@@ -3544,15 +3662,13 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     try: await q.message.delete()
                     except: pass
                     
-                    # FIX CRITIQUE : Appel correct de show_main_menu(user_id, clear)
-                    # On ne passe plus update/context pour éviter l'erreur "multiple values"
+                    # APPEL DU MENU PRINCIPAL
                     try:
                         await show_main_menu(user_id_int, clear=True)
                         return ConversationHandler.END
                     except Exception as e:
                         print(f"Erreur menu: {e}")
-                        # Fallback direct en cas de souci
-                        await context.bot.send_message(chat_id=user_id_int, text="🔓 Accès autorisé.")
+                        await context.bot.send_message(chat_id=user_id_int, text="🔓 Accès autorisé. Faites /start")
                         return ConversationHandler.END
                 else:
                     # ❌ PIN FAUX
@@ -3580,7 +3696,6 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
             
     return ID_AUTH_WAIT_PIN_LOGIN
-
 
 # --- BOUTON LOG OUT ---
 async def auth_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5684,7 +5799,16 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try: await q.answer()
     except: pass
 
-    # --- VÉRIFICATION NOTIFICATIONS ADMIN ---
+    # --- 1. RÉCUPÉRATION DU STATUT MAINTENANCE ---
+    status = get_maintenance_status() # Utilise la fonction qu'on a créée
+    if status == "OFF":
+        maint_text = "🔴 ACTIVER MAINTENANCE (BOT ON)"
+        maint_callback = "maint_on"
+    else:
+        maint_text = "🟢 COUPER MAINTENANCE (BOT GELÉ)"
+        maint_callback = "maint_off"
+
+    # --- 2. VÉRIFICATION NOTIFICATIONS ADMIN ---
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
     cur.execute("SELECT count(*) FROM support_tickets WHERE status='open'")
@@ -5693,7 +5817,10 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     label_tickets = f"📨 Gestion Tickets (🔴 {open_count})" if open_count > 0 else "📨 Gestion Tickets"
 
+    # --- 3. CONSTRUCTION DU CLAVIER ---
     keyboard = [
+        [InlineKeyboardButton(maint_text, callback_data=maint_callback)], # Nouveau bouton
+        [InlineKeyboardButton("📢 Broadcast Fin Maintenance", callback_data="admin_broadcast_done")], # Nouveau bouton
         [InlineKeyboardButton(label_tickets, callback_data="admin_tickets_list")],
         [InlineKeyboardButton("👥 Utilisateurs", callback_data="admin_users")],
         [InlineKeyboardButton("🔁 Redémarrer le bot", callback_data="admin_hard_reboot")],
@@ -5704,8 +5831,40 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")],
     ]
 
-    try: await q.message.edit_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
-    except: await q.message.reply_text("⚙️ Menu admin :", reply_markup=InlineKeyboardMarkup(keyboard))
+    text_admin = "⚙️ **PANNEAU DE CONTRÔLE ADMIN**\n"
+    if status == "ON":
+        text_admin += "⚠️ _Attention : Le mode maintenance est actif. Les utilisateurs sont bloqués._"
+
+    try: 
+        await q.message.edit_text(text_admin, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    except: 
+        await q.message.reply_text(text_admin, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    new_status = "ON" if q.data == "maint_on" else "OFF"
+    set_maintenance_status(new_status)
+    await q.answer(f"Maintenance : {new_status}", show_alert=True)
+    return await admin_menu(update, context)
+
+async def admin_broadcast_maintenance_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer("🚀 Envoi du broadcast...")
+    con = sqlite3.connect(DB_NAME)
+    users = con.execute("SELECT telegram_id FROM users").fetchall()
+    con.close()
+    
+    kb = [[InlineKeyboardButton("🚀 Relancer le Terminal", callback_data="menu_accueil")]]
+    for u in users:
+        try:
+            await context.bot.send_message(
+                chat_id=u[0],
+                text="✅ **MAINTENANCE TERMINÉE**\nLe terminal est de nouveau opérationnel !",
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode="Markdown"
+            )
+        except: continue
+    await q.message.reply_text("📢 Broadcast terminé.")
 
 async def admin_ivr_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Affiche le menu de réglage des temps IVR."""
@@ -7700,6 +7859,7 @@ async def account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     kb = [
         [InlineKeyboardButton("🔐 Changer mon PIN", callback_data="acc_change_pin")],
+        [InlineKeyboardButton("🤝 Parrainage", callback_data="show_referral")],
         [InlineKeyboardButton("⏳ Délai Inactivité", callback_data="acc_timeout_menu")],
         [InlineKeyboardButton("👤 Changer Username", callback_data="acc_set_user")],
         [InlineKeyboardButton("💬 Changer Jabber", callback_data="acc_set_jabber")],
@@ -7714,6 +7874,31 @@ async def account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         
     return SELECT_TOOL 
+
+async def show_referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    bot_username = (await context.bot.get_me()).username
+    ref_link = f"https://t.me/{bot_username}?start={user_id}"
+    
+    con = sqlite3.connect(DB_NAME)
+    # Compter le nombre de filleuls
+    count = con.execute("SELECT count(*) FROM users WHERE referred_by=?", (str(user_id),)).fetchone()[0]
+    con.close()
+
+    text = (
+        "🤝 **PROGRAMME DE PARRAINAGE**\n\n"
+        "Invitez vos amis et gagnez des récompenses sur chaque dépôt !\n\n"
+        f"👥 **Filleuls :** `{count}`\n"
+        f"🔗 **Votre lien :**\n`{ref_link}`\n\n"
+        " _(Appuyez sur le lien pour le copier)_"
+    )
+    
+    kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="account_menu")]]
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 # --- 1. CHANGER PIN (CLEAN) ---
 async def acc_ask_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9126,6 +9311,7 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(auth_logout, pattern="^auth_logout$"),
         CallbackQueryHandler(auth_lock_only, pattern="^auth_lock_only$"),
         CallbackQueryHandler(auth_switch_account, pattern="^auth_switch_account$")
+        
     ],
     states={
         # --- AUTHENTIFICATION ---
@@ -9151,6 +9337,7 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(acc_set_timeout, pattern="^set_timeout_"),
             CallbackQueryHandler(account_menu, pattern="^account_menu$"),
             CallbackQueryHandler(goto_menu, pattern="^menu_accueil$")
+            
         ],
         WAIT_HLR_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, tool_process_hlr)],
         
@@ -9201,12 +9388,15 @@ def setup_all_handlers(application):
     # ====================================================
     # GROUPE -1 : SYSTÈME & DÉBUG (Priorité maximale)
     # ====================================================
+
+    
     
     # 1. L'ESPION (Affiche les messages dans la console sans les arrêter)
     async def espion(update, context):
         if update.message and update.message.text:
             print(f"🕵️ ESPION: Message reçu -> '{update.message.text}'", flush=True)
             
+    application.add_handler(CallbackQueryHandler(show_referral_menu, pattern="^show_referral$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, espion), group=-1)
     application.add_handler(catalog_filter_conv)      # Filtre Pro's
     application.add_handler(ccs_catalog_filter_conv)  # Filtre Cc's
@@ -9220,6 +9410,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(cart_checkout_callback, pattern=r"^cart:checkout$"))
     application.add_handler(CallbackQueryHandler(cart_remove_single, pattern=r"^cart:del:\d+$"))
     application.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_"))
+    
     
 
    
@@ -9251,6 +9442,8 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(admin_ivr_change, pattern="^admin_ivr_change:"))
     application.add_handler(CallbackQueryHandler(admin_deluser_ask, pattern="^admin_deluser_ask_"))
     application.add_handler(CallbackQueryHandler(admin_deluser_confirm, pattern="^admin_deluser_confirm_"))
+    application.add_handler(CallbackQueryHandler(admin_maintenance_toggle, pattern="^maint_"))
+    application.add_handler(CallbackQueryHandler(admin_broadcast_maintenance_done, pattern="^admin_broadcast_done$"))
 
     
     
