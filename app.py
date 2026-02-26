@@ -15,9 +15,14 @@ import threading
 import subprocess
 from datetime import datetime
 
+
 # --- MODULES LOCAUX ---
 import tickets
 # --- TIERCE PARTIES ---
+import io
+import barcode
+from barcode.writer import ImageWriter
+from pdf417gen import encode, render_image
 import pytz
 import base58
 import requests
@@ -1431,7 +1436,7 @@ async def show_main_menu(user_id: int, clear: bool = True):
             sw_bal = get_signalwire_balance()
             bc_bal = get_barcode_balance()
             sim_bal = api_5sim_get_balance()
-            admin_info = f"\n\n🏦 **Admin Stats**:\nSignalWire: {sw_bal}\n🪪 Barcode: {bc_bal}\n📱 5SIM: {sim_bal}"
+            admin_info = f"\n\n📊 **Admin Stats**:\n🏦 SignalWire: {sw_bal}\n🪪 Barcode: {bc_bal}\n📱 5SIM: {sim_bal}"
         except:
             admin_info = "\n\n⚠️ Erreur API Admin"
 
@@ -3468,7 +3473,7 @@ def get_pin_keyboard():
         [InlineKeyboardButton("1", callback_data="pin_1"), InlineKeyboardButton("2", callback_data="pin_2"), InlineKeyboardButton("3", callback_data="pin_3")],
         [InlineKeyboardButton("4", callback_data="pin_4"), InlineKeyboardButton("5", callback_data="pin_5"), InlineKeyboardButton("6", callback_data="pin_6")],
         [InlineKeyboardButton("7", callback_data="pin_7"), InlineKeyboardButton("8", callback_data="pin_8"), InlineKeyboardButton("9", callback_data="pin_9")],
-        [InlineKeyboardButton("🗑 Effacer", callback_data="pin_del"), InlineKeyboardButton("0", callback_data="pin_0"), InlineKeyboardButton("✅ Valider", callback_data="pin_enter")]
+        [InlineKeyboardButton("🗑️", callback_data="pin_del"), InlineKeyboardButton("0", callback_data="pin_0"), InlineKeyboardButton("🔄", callback_data="pin_logout")]
     ]
     return InlineKeyboardMarkup(keys)
 
@@ -3694,27 +3699,59 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         except: pass
+
+    # --- 3. LOG OUT / CHANGER DE COMPTE ---
+    elif data == "pin_logout":
+        # On vide le code tapé
+        context.user_data['temp_pin_input'] = ""
+        # On débloque la session pour permettre la création/importation
+        context.user_data['is_locked'] = False 
+        
+        kb = [
+            [InlineKeyboardButton("🆕 Créer un Wallet (Nouveau)", callback_data="auth_create")],
+            [InlineKeyboardButton("📥 Importer un compte (Existant)", callback_data="auth_import_start")]
+        ]
+        
+        # On supprime le pavé numérique pour faire propre
+        try:
+            await q.message.delete()
+        except: pass
+        
+        # On affiche le menu de configuration initial
+        await context.bot.send_message(
+            chat_id=user_id_int,
+            text=(
+                "🛑 **DÉCONNEXION RÉUSSIE**\n━━━━━━━━━━━━━━━━━━\n"
+                "Votre session a été fermée et le terminal est réinitialisé.\n\n"
+                "👉 Que souhaitez-vous faire ?"
+            ),
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
             
     return ID_AUTH_WAIT_PIN_LOGIN
 
-# --- BOUTON LOG OUT ---
+# --- BOUTON LOG OUT (MENU) ---
 async def auth_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    try: await q.answer("🔒 Options de session...")
-    except: pass
+    try: 
+        await q.answer("🔒 Options de session...")
+    except: 
+        pass
     
     user_id = update.effective_user.id
     
-    # On force le verrouillage sans tout effacer pour garder la fluidité
+    # Verrouillage en mémoire vive
     context.user_data['is_locked'] = True
     context.user_data['temp_pin_input'] = ""
     
-    # Réinitialisation de la session en DB si ton script le gère
+    # Nettoyage en base de données
     reset_session(user_id)
     
     kb = [
         [InlineKeyboardButton("🔒 Verrouiller (PIN requis)", callback_data="auth_lock_only")],
-        [InlineKeyboardButton("🚪 Changer de compte (Importer)", callback_data="auth_switch_account")]
+        [InlineKeyboardButton("🚪 Déconnexion", callback_data="auth_switch_account")]
     ]
     
     await replace_view(
@@ -3750,36 +3787,8 @@ async def auth_lock_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await acc_ask_pin(update, context)
     return ID_AUTH_WAIT_PIN_LOGIN
 
-# --- BOUTON LOG OUT (MENU) ---
-async def auth_logout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    try: 
-        await q.answer("🔒 Options de session...")
-    except: 
-        pass
-    
-    user_id = update.effective_user.id
-    
-    # Verrouillage en mémoire vive
-    context.user_data['is_locked'] = True
-    context.user_data['temp_pin_input'] = ""
-    
-    # Nettoyage en base de données
-    reset_session(user_id)
-    
-    kb = [
-        [InlineKeyboardButton("🔒 Verrouiller (PIN requis)", callback_data="auth_lock_only")],
-        [InlineKeyboardButton("🚪 Changer de compte (Importer)", callback_data="auth_switch_account")]
-    ]
-    
-    await replace_view(
-        q,
-        "🛑 **MENU DÉCONNEXION**\n\n"
-        "Voulez-vous simplement verrouiller l'écran ou changer d'utilisateur ?",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
+
+
 
 # --- ACTION : CHANGER DE COMPTE ---
 async def auth_switch_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7286,6 +7295,37 @@ async def id_receive_new_value(update: Update, context: ContextTypes.DEFAULT_TYP
     # id_show_summary va envoyer un nouveau message ou éditer le dernier connu.
     return await id_show_summary(update, context)
 
+def generate_pdf417_qc(info):
+    header = "@\x0a\x1e\x0dANSI 604428100002DL00410226ZQ02670024DLDCA5"
+    data = (
+        f"\x0aDLDCBnone\x0aDCDnone\x0aDBA{info['exp']}\x0aDCS{info['nom']}\x0a"
+        f"DAC{info['prenom']}\x0aDAD\x0aDBD{info['issue']}\x0aDBB{info['dob']}\x0a"
+        f"DBC{info['sex']}\x0aDAY{info['eyes']}\x0aDAU{info['taille']} cm\x0a"
+        f"DAG{info['adresse']}\x0aDAI{info['ville']}\x0aDAJQC\x0a"
+        f"DAK{info['zip']}\x0aDAQ{info['dl_num']}\x0aDCFR4MT12345\x0a"
+        f"DCGCAN\x0aDDEU\x0aDDFU\x0aDDGU\x0aZQZQAPC\x0aZQBS1P03V5P2-01"
+    )
+    return render_image(encode(header + data, columns=8, security_level=5), scale=4).convert('1')
+
+def generate_pdf417_on(info):
+    header = "@\x0a\x1e\x0dANSI 6044290102DL00410202ZQ03250029DLDAA"
+    data = (
+        f"\x0aDCS{info['nom']}\x0aDAC{info['prenom']}\x0aDAD\x0aDBA{info['exp']}\x0a"
+        f"DBB{info['dob']}\x0aDBC{info['sex']}\x0aDAY{info['eyes']}\x0a"
+        f"DAU{info['taille']} cm\x0aDAG{info['adresse']}\x0aDAITORONTO\x0aDAJON\x0a"
+        f"DAK{info['zip']}\x0aDAQ{info['dl_num']}\x0aDCF123456789012345678\x0a"
+        f"DCGCAN\x0aDDEU\x0aDDFU\x0aDDGU\x0aZQZQAPCON\x0aZQBSN12345678"
+    )
+    return render_image(encode(header + data, columns=8, security_level=5), scale=4).convert('1')
+
+def generate_code128_qc(daq):
+    CODE128 = barcode.get_barcode_class('code128')
+    return CODE128(daq.replace(' ', ''), writer=ImageWriter()).render(writer_options={"write_text": False})
+
+def generate_code39_on(daq):
+    CODE39 = barcode.get_barcode_class('code39')
+    return CODE39(daq.replace(' ', '').replace('-', ''), writer=ImageWriter(), add_checksum=False).render(writer_options={"write_text": False})
+
 def creer_verso_complet(pdf417_bytes, linear_bytes):
     """
     Génère le verso complet avec un alignement horizontal parfait :
@@ -7366,6 +7406,7 @@ def creer_verso_complet(pdf417_bytes, linear_bytes):
 async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import asyncio
     import sqlite3
+    import io  # Nécessaire pour l'outil Barcode
     q = update.callback_query
     
     if q:
@@ -7392,7 +7433,7 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "form_eyes": clean('form_eyes'),
         "form_street": clean('addr_street'),
         "form_city": clean('addr_city'),
-        "form_zip": clean('addr_zip'),
+        "form_zip": clean('addr_zip').replace(' ', ''), # Espace retiré pour éviter les bugs
         "form_dl_number": clean('form_dl_number'),
         "form_ref_number": clean('form_ref_number'),
         "form_issue": clean('form_issue'),
@@ -7402,116 +7443,202 @@ async def id_finalize_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. Calcul du coût
     total_cost = d.get('id_qty', 1) * prod.get('price', 0)
 
-    # 3. Construction du texte Admin
-    admin_txt = (
-        f"🚨 NOUVELLE COMMANDE : {cat.upper()} 🚨\n\n"
-        f"👤 CLIENT : {user.first_name} (@{user.username if user.username else 'N/A'})\n"
-        f"🆔 ID : {user.id}\n"
-        f"🛒 PRODUIT : {prod_name} (x{d.get('id_qty', 1)})\n"
-        f"💰 TOTAL : {total_cost:.2f} $\n"
-        f"--------------\n\n"
-        f"🆔 DOCUMENTS :\n\n"
-        f"💳 Permis : {api_data['form_dl_number']}\n"
-        f"📛 Nom : {api_data['form_lastname']}\n"
-        f"📛 Prénom : {api_data['form_firstname']}\n"
-        f"🎂 DDN : {api_data['form_dob']}\n"
-        f"📍 Adresse : {api_data['form_street']}\n"
-        f"🏙️ Ville: {api_data['form_city']}\n"
-        f"📨 CP: {api_data['form_zip']}\n"
-        f"📏 Taille: {api_data['form_height']} cm\n"
-        f"👁 Yeux : {api_data['form_eyes']}\n"
-        f"🧬 Sexe: {api_data['form_sex']}\n"
-        f"🔢 Référence : {api_data['form_ref_number']}\n"
-        f"📅 Valide : {api_data['form_issue']}\n"
-        f"📅 Expiration : {api_data['form_expiry']}\n"
-    )
-
-    # 4. DOUBLE SAUVEGARDE EN BASE DE DONNÉES
-    try:
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        
-        # A. Sauvegarde dans support_tickets (pour l'admin)
-        cur.execute(
-            "INSERT INTO support_tickets (user_id, username, category, status, message) VALUES (?, ?, ?, ?, ?)",
-            (str(user.id), user.username or "Inconnu", f"ORDER: {prod_name}", "closed", admin_txt)
+    # =========================================================
+    # 🌟 LOGIQUE "TOOL" (BARCODE PACK LOCAL INDÉPENDANT)
+    # =========================================================
+    if cat == "tool":
+        status_msg = await context.bot.send_message(
+            chat_id=user.id, 
+            text="⚡ **Génération instantanée de votre pack Barcodes...**", 
+            parse_mode="Markdown"
         )
-        order_ticket_id = cur.lastrowid
-
-        # B. Sauvegarde détaillée dans id_physical_submissions (pour modifications/historique)
-        cur.execute("""
-            INSERT INTO id_physical_submissions (
-                user_id, type_document, status, last_name, first_name, dob, 
-                street, city, zip, height, eyes, sex, 
-                dl_number, ref_number, issue_date, expiry_date
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            str(user.id), cat.upper(), 'pending',
-            api_data['form_lastname'], api_data['form_firstname'], api_data['form_dob'],
-            api_data['form_street'], api_data['form_city'], api_data['form_zip'],
-            api_data['form_height'], api_data['form_eyes'], api_data['form_sex'],
-            api_data['form_dl_number'], api_data['form_ref_number'],
-            api_data['form_issue'], api_data['form_expiry']
-        ))
         
-        con.commit()
-        con.close()
-        admin_txt = f"🧾 **ORDER #{order_ticket_id}**\n" + admin_txt
-        print(f"[DB] Commande {order_ticket_id} archivée totalement.")
-        
-    except Exception as db_err:
-        print(f"❌ DB SAVE ERROR: {db_err}")
-
-    # 5. Message d'attente client
-    status_msg = await context.bot.send_message(
-        chat_id=user.id, 
-        text="⏳ **Validation et génération des fichiers...**", 
-        parse_mode="Markdown"
-    )
-
-    try:
-        # 6. Débit
+        # Débit
         update_user_balance(str(user.id), -total_cost)
 
-        # 7. Génération Barcode (API)
-        loop = asyncio.get_running_loop()
-        pdf417_raw, linear_raw = await loop.run_in_executor(None, lambda: generate_barcode_via_api(api_data, prod_code))
-
-        # 8. CRÉATION DU VERSO COMPLET
-        final_verso = None
-        if pdf417_raw:
-            final_verso = await loop.run_in_executor(None, lambda: creer_verso_complet(pdf417_raw, linear_raw))
-
-        # 9. Envoi au Canal Logs (Admin)
-        target_id = CHANNEL_LOGS 
+        # Préparation & Correction Auto Ontario
+        dl_clean = api_data['form_dl_number'].replace('-', '').replace(' ', '')
+        nom = api_data['form_lastname']
+        province = "ON" if "ON" in prod_code else "QC"
         
-        if d.get('form_photo_id'):
-            await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_txt)
-        else:
-            await context.bot.send_message(chat_id=target_id, text=admin_txt)
-        
-        if final_verso: 
-            await context.bot.send_document(
-                chat_id=target_id, 
-                document=final_verso, 
-                filename=f"Back_{api_data['form_lastname']}.png",
-                caption="🖨️ **Verso Généré (Prêt à imprimer)**"
-            )
-        else:
-            if pdf417_raw:
-                 await context.bot.send_document(chat_id=target_id, document=pdf417_raw, filename="raw_pdf417.png")
+        if province == "ON" and nom and not dl_clean.startswith(nom[0]):
+            dl_clean = nom[0] + dl_clean
+            
+        info_local = {
+            "nom": nom,
+            "prenom": api_data['form_firstname'],
+            "dob": api_data['form_dob'].replace('-', ''),
+            "exp": api_data['form_expiry'].replace('-', ''),
+            "issue": api_data['form_issue'].replace('-', ''),
+            "sex": api_data['form_sex'],
+            "eyes": api_data['form_eyes'],
+            "taille": api_data['form_height'].replace('CM', '').strip(),
+            "adresse": api_data['form_street'],
+            "ville": api_data['form_city'],
+            "zip": api_data['form_zip'],
+            "dl_num": dl_clean[:15] if province == "ON" else dl_clean
+        }
 
-        # 10. Succès Client
-        await status_msg.edit_text("✅ **Commande reçue !**\nLes fichiers ont été envoyés à l'équipe.\nVotre solde a été débité.", parse_mode="Markdown")
-
-    except Exception as e:
-        print(f"CRITICAL ERROR in Order: {e}")
-        await status_msg.edit_text(f"⚠️ **Commande enregistrée mais erreur technique.**\nL'admin a reçu les détails.")
         try:
-            await context.bot.send_message(chat_id=CHANNEL_LOGS, text=f"⚠️ ERREUR TECHNIQUE {user.id}: {e}")
-        except: pass
+            loop = asyncio.get_running_loop()
+            
+            # Appel des fonctions de génération locale
+            if province == "ON":
+                img_pdf = await loop.run_in_executor(None, lambda: generate_pdf417_on(info_local))
+                img_linear = await loop.run_in_executor(None, lambda: generate_code39_on(info_local['dl_num']))
+                label = "Ontario (MTO 604429)"
+            else:
+                img_pdf = await loop.run_in_executor(None, lambda: generate_pdf417_qc(info_local))
+                img_linear = await loop.run_in_executor(None, lambda: generate_code128_qc(info_local['dl_num']))
+                label = "Québec (SAAQ 604428)"
 
-    # 11. Nettoyage et Retour Menu
+            # Conversion en Bytes pour envoi Telegram
+            bio_pdf = io.BytesIO()
+            img_pdf.save(bio_pdf, format='PNG')
+            bio_pdf.seek(0)
+
+            bio_linear = io.BytesIO()
+            img_linear.save(bio_linear, format='PNG')
+            bio_linear.seek(0)
+            
+            caption_msg = (
+                "🎯 **VOTRE PACK BARCODE EST PRÊT**\n\n"
+                f"👤 **Détails :** {info_local['prenom']} {info_local['nom']}\n"
+                f"📍 **Format :** {label}\n"
+                f"🆔 **DL :** `{info_local['dl_num']}`\n\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "✅ **Inclus dans ce pack :**\n"
+                "1️⃣ **PDF417 (Verso)** : Haute densité, conforme AAMVA.\n"
+                "2️⃣ **Code Linéaire** : Lecture standard.\n\n"
+                "⚠️ *Conseil : Luminosité de l'écran au maximum lors du scan.*"
+            )
+
+            # Envoi direct au client
+            await context.bot.send_photo(chat_id=user.id, photo=bio_pdf, caption=caption_msg, parse_mode="Markdown")
+            await context.bot.send_photo(chat_id=user.id, photo=bio_linear)
+            
+            await status_msg.delete()
+            
+        except Exception as e:
+            print(f"Erreur Tool Local: {e}")
+            await status_msg.edit_text(f"❌ Erreur technique locale : {e}")
+
+    # =========================================================
+    # 🪪 LOGIQUE "PHYSICAL / DOCUMENT" (VIA API + ADMIN)
+    # =========================================================
+    else:
+        # 3. Construction du texte Admin
+        admin_txt = (
+            f"🚨 NOUVELLE COMMANDE : {cat.upper()} 🚨\n\n"
+            f"👤 CLIENT : {user.first_name} (@{user.username if user.username else 'N/A'})\n"
+            f"🆔 ID : {user.id}\n"
+            f"🛒 PRODUIT : {prod_name} (x{d.get('id_qty', 1)})\n"
+            f"💰 TOTAL : {total_cost:.2f} $\n"
+            f"--------------\n\n"
+            f"🆔 DOCUMENTS :\n\n"
+            f"💳 Permis : {api_data['form_dl_number']}\n"
+            f"📛 Nom : {api_data['form_lastname']}\n"
+            f"📛 Prénom : {api_data['form_firstname']}\n"
+            f"🎂 DDN : {api_data['form_dob']}\n"
+            f"📍 Adresse : {api_data['form_street']}\n"
+            f"🏙️ Ville: {api_data['form_city']}\n"
+            f"📨 CP: {api_data['form_zip']}\n"
+            f"📏 Taille: {api_data['form_height']} cm\n"
+            f"👁 Yeux : {api_data['form_eyes']}\n"
+            f"🧬 Sexe: {api_data['form_sex']}\n"
+            f"🔢 Référence : {api_data['form_ref_number']}\n"
+            f"📅 Valide : {api_data['form_issue']}\n"
+            f"📅 Expiration : {api_data['form_expiry']}\n"
+        )
+
+        # 4. DOUBLE SAUVEGARDE EN BASE DE DONNÉES
+        try:
+            con = sqlite3.connect(DB_NAME)
+            cur = con.cursor()
+            
+            # A. Sauvegarde dans support_tickets (pour l'admin)
+            cur.execute(
+                "INSERT INTO support_tickets (user_id, username, category, status, message) VALUES (?, ?, ?, ?, ?)",
+                (str(user.id), user.username or "Inconnu", f"ORDER: {prod_name}", "closed", admin_txt)
+            )
+            order_ticket_id = cur.lastrowid
+
+            # B. Sauvegarde détaillée dans id_physical_submissions (pour modifications/historique)
+            cur.execute("""
+                INSERT INTO id_physical_submissions (
+                    user_id, type_document, status, last_name, first_name, dob, 
+                    street, city, zip, height, eyes, sex, 
+                    dl_number, ref_number, issue_date, expiry_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(user.id), cat.upper(), 'pending',
+                api_data['form_lastname'], api_data['form_firstname'], api_data['form_dob'],
+                api_data['form_street'], api_data['form_city'], api_data['form_zip'],
+                api_data['form_height'], api_data['form_eyes'], api_data['form_sex'],
+                api_data['form_dl_number'], api_data['form_ref_number'],
+                api_data['form_issue'], api_data['form_expiry']
+            ))
+            
+            con.commit()
+            con.close()
+            admin_txt = f"🧾 **ORDER #{order_ticket_id}**\n" + admin_txt
+            print(f"[DB] Commande {order_ticket_id} archivée totalement.")
+            
+        except Exception as db_err:
+            print(f"❌ DB SAVE ERROR: {db_err}")
+
+        # 5. Message d'attente client
+        status_msg = await context.bot.send_message(
+            chat_id=user.id, 
+            text="⏳ **Validation et génération des fichiers...**", 
+            parse_mode="Markdown"
+        )
+
+        try:
+            # 6. Débit
+            update_user_balance(str(user.id), -total_cost)
+
+            # 7. Génération Barcode (API)
+            loop = asyncio.get_running_loop()
+            pdf417_raw, linear_raw = await loop.run_in_executor(None, lambda: generate_barcode_via_api(api_data, prod_code))
+
+            # 8. CRÉATION DU VERSO COMPLET
+            final_verso = None
+            if pdf417_raw:
+                final_verso = await loop.run_in_executor(None, lambda: creer_verso_complet(pdf417_raw, linear_raw))
+
+            # 9. Envoi au Canal Logs (Admin)
+            target_id = CHANNEL_LOGS 
+            
+            if d.get('form_photo_id'):
+                await context.bot.send_photo(chat_id=target_id, photo=d['form_photo_id'], caption=admin_txt)
+            else:
+                await context.bot.send_message(chat_id=target_id, text=admin_txt)
+            
+            if final_verso: 
+                await context.bot.send_document(
+                    chat_id=target_id, 
+                    document=final_verso, 
+                    filename=f"Back_{api_data['form_lastname']}.png",
+                    caption="🖨️ **Verso Généré (Prêt à imprimer)**"
+                )
+            else:
+                if pdf417_raw:
+                     await context.bot.send_document(chat_id=target_id, document=pdf417_raw, filename="raw_pdf417.png")
+
+            # 10. Succès Client
+            await status_msg.edit_text("✅ **Commande reçue !**\nLes fichiers ont été envoyés à l'équipe.\nVotre solde a été débité.", parse_mode="Markdown")
+
+        except Exception as e:
+            print(f"CRITICAL ERROR in Order: {e}")
+            await status_msg.edit_text(f"⚠️ **Commande enregistrée mais erreur technique.**\nL'admin a reçu les détails.")
+            try:
+                await context.bot.send_message(chat_id=CHANNEL_LOGS, text=f"⚠️ ERREUR TECHNIQUE {user.id}: {e}")
+            except: pass
+
+    # =========================================================
+    # 🧹 NETTOYAGE FIN DE COMMANDE (Commun aux deux)
+    # =========================================================
     await asyncio.sleep(2)
     for mid in d.get('cleanup_ids', []):
         try: await context.bot.delete_message(chat_id=user.id, message_id=mid)
