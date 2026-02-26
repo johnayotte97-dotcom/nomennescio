@@ -7903,33 +7903,164 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
-async def id_save_employer(u,c): 
-    c.user_data['form_employer'] = u.message.text
-    await u.message.reply_text("Poste ?")
-    return ID_ASK_DOC_JOB
-
-async def id_save_job(u,c): 
-    c.user_data['form_job'] = u.message.text
-    await u.message.reply_text("Adresse Emp ?")
+async def id_save_employer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_employer'] = update.message.text.strip().upper()
+    await clean_chat(update, context)
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_EMPLOYER}")]]
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📍 **Adresse de l'Employeur ?**\n(Ex: 123 Rue Principale, Montréal QC)",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_DOC_ADDR
 
-async def id_save_emp_addr(u,c): 
-    c.user_data['form_emp_addr'] = u.message.text
-    await u.message.reply_text("Revenu ?")
+async def id_save_emp_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_emp_addr'] = update.message.text.strip().upper()
+    await clean_chat(update, context)
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_ADDR}")]]
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🔢 **Numéro d'Assurance Sociale (NAS) ?**\n(Ex: 123 456 789)",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_DOC_SIN
 
-async def id_income_mode(u,c): 
-    pass
+async def id_save_sin_for_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['form_sin'] = update.message.text.strip()
+    await clean_chat(update, context)
+    kb = [
+        [InlineKeyboardButton("45,000$", callback_data="t4_sal:45000"), InlineKeyboardButton("65,000$", callback_data="t4_sal:65000")],
+        [InlineKeyboardButton("85,000$", callback_data="t4_sal:85000"), InlineKeyboardButton("110,000$", callback_data="t4_sal:110000")],
+        [InlineKeyboardButton("✏️ Montant Personnalisé", callback_data="t4_sal:custom")],
+        [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_SIN}")]
+    ]
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="💰 **Quel est le Salaire Brut (Case 14) ?**\n_Le bot calculera automatiquement les impôts (RRQ, AE)._",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    context.user_data['cleanup_ids'] = [m.message_id]
+    return ID_CHOOSE_INxCOME_MODE
 
-async def id_save_hours(u,c): 
-    pass
+async def id_handle_t4_salary_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    val = q.data.split(":")[1]
 
-async def id_save_rate(u,c): 
-    pass
+    if val == "custom":
+        await clean_chat(update, context)
+        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CHOOSE_INxCOME_MODE}")]]
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✍️ **Saisie du salaire :**\nEntrez le montant exact (ex: `72500`) :",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+        context.user_data['cleanup_ids'] = [m.message_id]
+        return ID_ASK_DOC_RATE
+    else:
+        context.user_data['form_t4_salary'] = float(val)
+        await clean_chat(update, context)
+        return await id_show_summary_t4(update, context)
 
-async def id_save_sin_or_range(u,c): 
-    c.user_data['form_sin'] = (u.message.text if u.message else "Range")
-    return await id_finalize_order(u,c)
+async def id_save_t4_salary_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip().replace('$', '').replace(' ', '').replace(',', '.')
+    try:
+        context.user_data['form_t4_salary'] = float(txt)
+    except:
+        m = await update.message.reply_text("❌ Montant invalide.")
+        context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
+        return ID_ASK_DOC_RATE
+    await clean_chat(update, context)
+    return await id_show_summary_t4(update, context)
+
+async def id_show_summary_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = context.user_data
+    # On utilise ton calculateur de la ligne 170 !
+    calc = calculer_tout_depuis_case14(d['form_t4_salary'])
+    d.update(calc)
+    
+    txt = (
+        f"📝 **RÉSUMÉ T4 2025**\n\n"
+        f"👤 **Employé**\n"
+        f"• Nom : `{d.get('form_firstname')} {d.get('form_lastname')}`\n"
+        f"• NAS : `{d.get('form_sin')}`\n"
+        f"• Adresse : `{d.get('addr_street')}, {d.get('addr_city')} {d.get('addr_zip')}`\n\n"
+        f"🏢 **Employeur**\n"
+        f"• Nom : `{d.get('form_employer')}`\n"
+        f"• Adresse : `{d.get('form_emp_addr')}`\n\n"
+        f"💰 **Chiffres Calculés Automatiquement**\n"
+        f"• Case 14 (Revenu) : `{d.get('salaire')} $`\n"
+        f"• Case 22 (Impôt) : `{d.get('impot')} $`\n"
+        f"• Case 17 (RRQ) : `{d.get('cpp_rrq')} $`\n"
+        f"• Case 18 (AE) : `{d.get('ae')} $`\n"
+    )
+    
+    prod_price = d.get('id_product', {}).get('price', 50.0)
+    kb = [
+        [InlineKeyboardButton(f"💳 PAYER ET GÉNÉRER ({prod_price:.2f}$)", callback_data="confirm_gen_t4")],
+        [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]
+    ]
+    
+    target = update.message or update.callback_query.message
+    if update.callback_query: m = await target.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else: m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    
+    context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
+    return ID_CONFIRM_SUMMARY
+
+async def id_finalize_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    user = update.effective_user
+    d = context.user_data
+    
+    prod_price = d.get('id_product', {}).get('price', 50.0)
+    if get_user_balance(str(user.id)) < prod_price:
+        await q.edit_message_text("❌ Solde insuffisant. Veuillez recharger.")
+        return ConversationHandler.END
+    
+    update_user_balance(str(user.id), -prod_price)
+    m_wait = await q.edit_message_text("⏳ **Génération du document T4 en cours...**")
+    
+    try:
+        t4_data = {
+            "employeur": d.get('form_employer', ''),
+            "employeur_adr1": d.get('form_emp_addr', ''),
+            "employeur_adr2": "", 
+            "annee": "2025",
+            "nas": d.get('form_sin', ''),
+            "nom": d.get('form_lastname', ''),
+            "prenom": d.get('form_firstname', ''),
+            "adresse1": d.get('addr_street', ''),
+            "adresse2": f"{d.get('addr_city', '')} {d.get('addr_zip', '')}",
+            "salaire": d.get('salaire', '0.00'),
+            "impot": d.get('impot', '0.00'),
+            "cpp_rrq": d.get('cpp_rrq', '0.00'),
+            "ae": d.get('ae', '0.00'),
+            "province": "QC"
+        }
+        
+        file_name = f"T4_2025_{user.id}_{int(time.time())}.jpg"
+        loop = asyncio.get_running_loop()
+        # On utilise ton générateur de la ligne 200 !
+        await loop.run_in_executor(None, lambda: generer_t4_double_arial(t4_data, file_name))
+        
+        with open(file_name, 'rb') as doc:
+            await context.bot.send_document(chat_id=user.id, document=doc, caption="✅ **Voici votre document T4 2025.**\nMerci de votre confiance !")
+        with open(file_name, 'rb') as doc:
+             await context.bot.send_document(chat_id=CHANNEL_LOGS, document=doc, caption=f"📦 NOUVEAU T4 VENDU ({prod_price}$)\nClient: @{user.username or user.id}")
+            
+        await m_wait.delete()
+    except Exception as e:
+        print(f"Erreur T4: {e}")
+        await m_wait.edit_text("❌ Erreur technique. L'admin a été notifié.")
+        
+    await show_main_menu(user.id, clear=False)
+    return ConversationHandler.END
 
 # Handlers Dummy (au cas où)
 async def admin_prod_list_dummy(u,c): pass
