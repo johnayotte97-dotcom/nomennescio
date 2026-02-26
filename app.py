@@ -2606,7 +2606,7 @@ async def task_check_crypto_deposits(context: ContextTypes.DEFAULT_TYPE):
                     conn.commit()
                     
                     # Calcul valeur (Prix actuel du BTC - 3% de frais de change)
-                    from app import update_user_balance, get_btc_price_usd, credit_and_upgrade
+                    # CORRECTION : Suppression de l'import interne inutile
                     price_btc = get_btc_price_usd()
                     montant_usd = (total_btc_recu * price_btc) * 0.97
                     
