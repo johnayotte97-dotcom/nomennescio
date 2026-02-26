@@ -6648,47 +6648,53 @@ async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     
+    # Récupération et sauvegarde de la catégorie dans user_data (Essentiel pour le bouton Retour)
     cat = q.data.split(":")[1]
     context.user_data['id_category'] = cat
     
     con = sqlite3.connect(DB_NAME)
     cur = con.cursor()
+    # On récupère les produits actifs de la catégorie
     rows = cur.execute("SELECT id, title, price, tier FROM products WHERE category=? AND is_active=1", (cat,)).fetchall()
     con.close()
     
     if not rows:
-        await q.edit_message_text("❌ Aucun produit.", reply_markup=kb_back_to_menu())
+        # Si vide, on propose de retourner au menu principal des IDs
+        await q.edit_message_text("❌ Aucun produit disponible dans cette catégorie.", reply_markup=kb_back_to_menu())
         return ConversationHandler.END
 
-    
+    # Mapping des noms longs vers les noms de boutons courts
     short_names = {
         "Quebec Driver License (Full)": "QC DRIVER LICENSE",
         "Ontario Driver License": "ON DRIVER LICENSE",
         "Quebec RESIDENCE": "CA RESIDENT PERMANENT",
         "SIN Card (Plastic)": "CA SIN",
-        "Barcode Generator QC": "Gen QC",
-        "Barcode Generator ON": "Gen ON"
+        "Barcode Pack (Quebec)": "Pack Barcodes QC (5$)",
+        "Barcode Pack (Ontario)": "Pack Barcodes ON (5$)"
     }
 
     kb = []
     for pid, title, price, code in rows:
-        # On utilise le nom court si dispo, sinon le titre normal
+        # On utilise le nom court défini au-dessus, sinon le titre de la DB
         display_name = short_names.get(title, title)
         
-        # On n'affiche PAS le prix ici, et on pointe vers 'id_view'
-        kb.append([InlineKeyboardButton(f"🪪 {display_name}", callback_data=f"id_view:{pid}")])
+        # Ajout du bouton vers la vue détaillée du produit (id_view)
+        kb.append([InlineKeyboardButton(f"➡️ {display_name}", callback_data=f"id_view:{pid}")])
     
+    # Bouton de retour vers la sélection du type d'ID (Physical, Tools, etc.)
     kb.append([InlineKeyboardButton("⬅️ Retour", callback_data="id_menu_entry")])
     
     titles = {
-        "physical": "🪪 **Physical ID**",
-        "numerical": "🔢 **Numerical ID**",
-        "document": "📄 **Documents**",
-        "tool": "🛠️ **Tools**"
+        "physical": "🪪 **PHYSICAL ID**",
+        "numerical": "🔢 **NUMERICAL ID**",
+        "document": "📄 **DOCUMENTS**",
+        "tool": "🛠️ **TOOLS & BARCODES**"
     }
     
+    # Affichage du catalogue
+    text_header = titles.get(cat, "📂 **CATALOGUE**")
     await q.edit_message_text(
-        f"{titles.get(cat, 'Catalogue')}\nSélectionnez un produit :", 
+        f"{text_header}\n\nSélectionnez un modèle ci-dessous :", 
         reply_markup=InlineKeyboardMarkup(kb), 
         parse_mode="Markdown"
     )
@@ -6696,51 +6702,68 @@ async def id_show_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def id_view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    # On supprime le menu précédent pour afficher la photo proprement
+    # On supprime le menu précédent pour un affichage propre
     try: await q.message.delete()
     except: pass
     
-    pid = int(q.data.split(":")[1])
+    # Sécurité pour éviter le crash si les données sont mal formées
+    try:
+        pid = int(q.data.split(":")[1])
+    except (IndexError, ValueError):
+        return await q.message.reply_text("❌ Erreur de produit.", reply_markup=kb_back_to_menu())
     
     con = sqlite3.connect(DB_NAME)
     row = con.execute("SELECT title, price, tier, content FROM products WHERE id=?", (pid,)).fetchone()
     con.close()
     
+    if not row:
+        return await context.bot.send_message(chat_id=q.message.chat_id, text="❌ Produit introuvable.", reply_markup=kb_back_to_menu())
+
     title, price, tier, desc = row
     
-    # Mapping des images (Assure-toi d'avoir ces fichiers dans le dossier assets/)
-    # Si tu n'as pas les images, le bot enverra juste le texte.
-    assets = {
-        'QC': 'assets/qc_sample.jpg', # Pour QC DL
-        'ON': 'assets/on_sample.jpg', # Pour ON DL
-        'Physical': 'assets/physical_sample.jpg', # Défaut physique
-        'T4': 'assets/t4_sample.jpg',
-        'PAY': 'assets/paystub_sample.jpg',
-        'BAR-QC': 'assets/barcode_sample.jpg'
-    }
+    # 1. Préparation du texte (Caption)
+    is_barcode = tier.startswith("BAR")
+    if is_barcode:
+        caption = (
+            f"🛠️ **{title}**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📝 {desc}\n\n"
+            f"💰 Prix : `{price:.2f}$ USD`\n"
+            f"📦 Livraison : `Instantanée`"
+        )
+    else:
+        caption = (
+            f"🪪 **{title}**\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📝 {desc}\n\n"
+            f"💰 Prix : `{price:.2f}$ USD`\n"
+            f"✅ Qualité : `Bankgrade, Scannable & UV`"
+        )
     
-    # On essaie de trouver une image basée sur le titre ou le tier
-    photo_path = None
-    if "Quebec" in title or "QC" in title: photo_path = assets.get('QC')
-    elif "Ontario" in title or "ON" in title: photo_path = assets.get('ON')
-    elif "SIN" in title: photo_path = assets.get('Physical')
-    elif "Generator" in title: photo_path = assets.get('BAR-QC')
-    
-    # Texte de description
-    caption = (
-        f"🪪 **{title}**\n\n"
-        f"💰 Prix : **{price:.2f}$**\n\n"
-        f"🌎 Province : {tier}\n\n"
-        f"ℹ️ _Bankgrade, Scannable et UV. Inclut Recto/Verso._"
-    )
-    
-    # Bouton Acheter qui redirige vers id_buy (la fonction qui demande la quantité)
+    # 2. Détermination de la destination du bouton Retour
+    # On récupère la catégorie stockée, sinon on met 'physical' par défaut
+    last_cat = context.user_data.get('id_category', 'physical')
+    callback_retour = f"id_cat:{last_cat}"
+
+    # 3. Boutons
     kb = [
         [InlineKeyboardButton("🛒 Commander maintenant", callback_data=f"id_buy:{pid}")],
-        [InlineKeyboardButton("⬅️ Retour au menu", callback_data="id_menu_entry")]
+        [InlineKeyboardButton("⬅️ Retour", callback_data=callback_retour)]
     ]
     
-    # Envoi Photo + Texte ou Texte seul
+    # 4. Gestion de la Photo (Uniquement pour les IDs non-barcodes)
+    photo_path = None
+    if not is_barcode:
+        assets = {
+            'QC': 'assets/qc_sample.jpg',
+            'ON': 'assets/on_sample.jpg',
+            'Physical': 'assets/physical_sample.jpg'
+        }
+        if "Quebec" in title or "QC" in title: photo_path = assets.get('QC')
+        elif "Ontario" in title or "ON" in title: photo_path = assets.get('ON')
+        else: photo_path = assets.get('Physical')
+
+    # 5. ENVOI
     if photo_path and os.path.exists(photo_path):
         await context.bot.send_photo(
             chat_id=q.message.chat_id,
@@ -6750,7 +6773,6 @@ async def id_view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
-        # Fallback si pas d'image
         await context.bot.send_message(
             chat_id=q.message.chat_id,
             text=caption,
@@ -6759,7 +6781,6 @@ async def id_view_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     return ID_PROD_VIEW
-
 
 async def id_start_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Initialise le produit et demande la quantité avant le formulaire."""
@@ -9410,6 +9431,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(cart_checkout_callback, pattern=r"^cart:checkout$"))
     application.add_handler(CallbackQueryHandler(cart_remove_single, pattern=r"^cart:del:\d+$"))
     application.add_handler(CallbackQueryHandler(check_payment_callback, pattern=r"^check_pay_"))
+  
     
     
 
@@ -9549,22 +9571,31 @@ def run_bot_polling():
 # ====================================================
 
 def check_and_restore_default_ids():
-    """Force l'apparition des produits QC/ON dans Physical ID."""
+    """Force l'apparition des produits par défaut avec les bons prix."""
     try:
         con = sqlite3.connect(DB_NAME)
         cur = con.cursor()
+        
+        # 1. Restaurer Physical ID (si vide)
         cur.execute("SELECT count(*) FROM products WHERE category='physical'")
         if cur.fetchone()[0] == 0:
-            print("⚠️ Restauration des produits Physical ID...")
-            prods = [
+            prods_phy = [
                 ('physical', 'Quebec Driver License (Full)', 150.0, 'USD', 999, 'QC', 1, 'BASE: QC'),
                 ('physical', 'Ontario Driver License', 150.0, 'USD', 999, 'ON', 1, 'BASE: ON')
             ]
-            cur.executemany("""
-                INSERT INTO products (category, title, price, currency, stock, tier, is_active, content)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", prods)
-            con.commit()
-            print("✅ Produits Physical ID restaurés.")
+            cur.executemany("INSERT INTO products (category, title, price, currency, stock, tier, is_active, content) VALUES (?,?,?,?,?,?,?,?)", prods_phy)
+        
+        # 2. Restaurer les Barcodes à 5$ (si vide)
+        cur.execute("SELECT count(*) FROM products WHERE category='tool'")
+        if cur.fetchone()[0] == 0:
+            prods_tool = [
+            ('tool', 'Barcode Pack (Quebec)', 5.0, 'USD', 999, 'BAR-QC', 1, 'Génération de données : PDF417 (Verso scannable) + Code 128 (Linéaire). Aucun aperçu photo requis.'),
+            ('tool', 'Barcode Pack (Ontario)', 5.0, 'USD', 999, 'BAR-ON', 1, 'Génération de données : CODE 39 (Verso scannable) + Code 128 (Linéaire). Aucun aperçu photo requis.')
+]
+            cur.executemany("INSERT INTO products (category, title, price, currency, stock, tier, is_active, content) VALUES (?,?,?,?,?,?,?,?)", prods_tool)
+            print("✅ Barcodes restaurés à 5.00$")
+        
+        con.commit()
         con.close()
     except Exception as e:
         print(f"⚠️ Erreur restauration : {e}")
