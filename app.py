@@ -99,37 +99,39 @@ HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
 # ⚙️ MOTEUR DE CALCUL ET GÉNÉRATION T4
 # ==========================================
 
-def calculer_tout_depuis_case14(montant_base):
-    # Ajout d'un petit montant aléatoire pour le réalisme (-150$ à +150$)
+def calculer_tout_depuis_case14(montant_base, province="QC"):
+    import random
     ajustement = random.uniform(-150, 150)
     montant_final = round(montant_base + ajustement, 2)
     
-    # Taux officiels 2025 (Québec)
-    taux_ae = 0.0132
-    taux_rrq = 0.0640
-    exemption_rrq = 3500
-    
-    # Calculs automatiques
+    if province == "ON":
+        taux_ae = 0.0164
+        taux_rrq = 0.0595 # C'est le CPP en Ontario
+        exemption_rrq = 3500
+        # Impôts Ontario + Fédéral
+        if montant_final <= 53000: impot = montant_final * 0.150
+        elif montant_final <= 106000: impot = montant_final * 0.205
+        else: impot = montant_final * 0.260
+    else: # QC par défaut
+        taux_ae = 0.0132
+        taux_rrq = 0.0640 # RRQ du Québec
+        exemption_rrq = 3500
+        # Impôts Québec + Fédéral
+        if montant_final <= 52000: impot = montant_final * 0.142
+        elif montant_final <= 95000: impot = montant_final * 0.195
+        else: impot = montant_final * 0.248
+
     ae = round(montant_final * taux_ae, 2)
     rrq = round(max(0, (montant_final - exemption_rrq) * taux_rrq), 2)
-    
-    # Impôt progressif réaliste
-    if montant_final <= 52000:
-        impot = montant_final * 0.142
-    elif montant_final <= 95000:
-        impot = montant_final * 0.195
-    else:
-        impot = montant_final * 0.248
 
-    # Formatage (ex: 50,142.67)
-    def format_money(n):
-        return "{:,.2f}".format(n)
+    def format_money(n): return "{:,.2f}".format(n)
 
     return {
         "salaire": format_money(montant_final),
         "impot": format_money(impot),
         "cpp_rrq": format_money(rrq),
-        "ae": format_money(ae)
+        "ae": format_money(ae),
+        "province": province
     }
 
 def generer_t4_double_arial(data, output_name):
@@ -852,7 +854,15 @@ client = SignalWireClient(SW_PROJECT_ID, SW_TOKEN)
  ID_ASK_LASTNAME, ID_ASK_ISSUE, ID_ASK_EXPIRY, 
  ID_ASK_DL_NUM, ID_ASK_REF_NUM, ID_ASK_SEX, ID_CONFIRM_SUMMARY,
  TICKET_DRAFT
- ) = range(3000, 3029) # On augmente le range à 3028
+ ) = range(3000, 3029)
+
+# --- SECTION T4 (Chiffres uniques pour éviter les bugs) ---
+ID_ASK_T4_PROVINCE = 3060
+ID_ASK_DOC_CITY     = 3061  # Ville employeur
+ID_ASK_DOC_ZIP      = 3062  # Code Postal employeur
+ID_CONFIRM_EMP_ADDR = 3063  # Postes Canada Employeur
+ID_ASK_T4_SALAIRE   = 3064
+
 # Étapes Conversation (1 permis historique)
 ASK_PRENOM, ASK_NOM, ASK_DATE, CONFIRM_VERIF = range(4)
 
@@ -865,22 +875,21 @@ ADMIN_WAIT_PRODUCT_TEXT = 201
 ADMIN_WAIT_CSV = 202
 ADMIN_WAIT_SEARCH_ID = 203
 HISTORY_FILTER_CHOICE, HISTORY_FILTER_INPUT = range(300, 302)
-ADMIN_IVR_AWAIT_VALUE = 400 # Nouvelle constante
+ADMIN_IVR_AWAIT_VALUE = 400 
 IVR_TIMINGS_FILE = "ivr_timings.json"
 CATALOG_FILTER_MAIN, CATALOG_FILTER_AWAIT_VALUE = range(500, 502)
 CCS_FILTER_MAIN, CCS_FILTER_AWAIT_VALUE = range(600, 602)
 WAIT_AMOUNT_CRYPTO = 800
 ADMIN_XPUB = os.environ.get("ADMIN_XPUB")
-ID_AUTH_WAIT_PIN_CREATE = 1500  # Création du PIN
-ID_AUTH_WAIT_PIN_LOGIN = 1501  # Connexion (Entrée du PIN)
-ID_AUTH_WAIT_SEED = 1502       # Import d'un wallet existant
+
+# Auth & Tools
+ID_AUTH_WAIT_PIN_CREATE = 1500  
+ID_AUTH_WAIT_PIN_LOGIN = 1501  
+ID_AUTH_WAIT_SEED = 1502       
 SELECT_TOOL = 900
 WAIT_HLR_NUMBER = 901
 ID_EDIT_MENU, ID_EDIT_INPUT = range(4000, 4002)
 BTC = BTC_Class
-ID_ASK_T4_EMPLOYER, ID_ASK_T4_SALAIRE = range(3500, 3502)
-
-
 
 (ACC_WAIT_NEW_PIN, ACC_WAIT_USERNAME, ACC_WAIT_JABBER, ACC_WAIT_RESET_CONFIRM) = range(3200, 3204)
 
@@ -7743,18 +7752,13 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cleanup_list = context.user_data.get('cleanup_ids', [])
     
-    # On supprime tout ce qui est dans la liste (vieilles questions + vos réponses Benjamin etc.)
-    # Sauf le tout dernier message qui est celui que nous allons éditer pour afficher le "Retour"
     if len(cleanup_list) > 1:
         for msg_id in cleanup_list[:-1]:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
             except:
-                pass # Déjà supprimé ou trop vieux
-        
-        # On ne garde que le message actuel (le menu) dans la liste
+                pass 
         context.user_data['cleanup_ids'] = [cleanup_list[-1]]
-    # --------------------------------------------------
 
     try:
         target_state = int(q.data.split(":")[1])
@@ -7767,8 +7771,6 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{kb_back_state}")])
         else:
             kb.append([InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")])
-            
-        # On édite le message actuel qui est maintenant le seul message visible
         await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
     # --- ROUTAGE DES ÉTAPES DE RETOUR ---
@@ -7786,7 +7788,6 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ID_ASK_DOB
         
     elif target_state == ID_ASK_STREET:
-        # On vérifie si c'est un Document ou une ID pour savoir si on retourne à DOB ou Nom
         prev = ID_ASK_DOB if context.user_data.get('id_category') != 'document' else ID_ASK_LASTNAME
         await show("📍 **Adresse (1/3)**\nEntrez le **Numéro et la Rue** :", kb_back_state=prev)
         return ID_ASK_STREET
@@ -7800,30 +7801,61 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ID_ASK_ZIP
         
     elif target_state == ID_CONFIRM_ADDR:
-        suggs = context.user_data.get('addr_suggestions', [])
-        raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}"
-        if not suggs: suggs = [raw]
-        
-        kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(suggs)]
-        kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
-        kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")])
-        
-        await q.edit_message_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
-        return ID_CONFIRM_ADDR
+        # Si c'est un document (T4), on propose de revenir au choix de la province
+        if context.user_data.get('id_category') == 'document':
+            kb = [
+                [InlineKeyboardButton("⚜️ Québec (QC)", callback_data="t4_prov:QC")],
+                [InlineKeyboardButton("🍁 Ontario (ON)", callback_data="t4_prov:ON")],
+                [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")]
+            ]
+            await q.edit_message_text("🌎 **Province d'emploi ?**\n_(Les impôts, AE et RRQ/CPP seront ajustés en fonction)_", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+            return ID_ASK_T4_PROVINCE
+        else:
+            # Pour les cartes d'identité, on revient à la confirmation d'adresse standard
+            suggs = context.user_data.get('addr_suggestions', [])
+            raw = f"{context.user_data.get('addr_street')}, {context.user_data.get('addr_city')}"
+            if not suggs: suggs = [raw]
+            kb = [[InlineKeyboardButton(f"📍 {a[:40]}", callback_data=f"addr_pick:{i}")] for i, a in enumerate(suggs)]
+            kb.append([InlineKeyboardButton("✍️ Réécrire", callback_data="addr_retry")])
+            kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")])
+            await q.edit_message_text("✅ Confirmez l'adresse :", reply_markup=InlineKeyboardMarkup(kb))
+            return ID_CONFIRM_ADDR
 
     # ==========================================
     # 📄 ROUTAGE DES RETOURS POUR DOCUMENTS (T4)
     # ==========================================
+    elif target_state == ID_ASK_T4_PROVINCE:
+        kb = [
+            [InlineKeyboardButton("⚜️ Québec (QC)", callback_data="t4_prov:QC")],
+            [InlineKeyboardButton("🍁 Ontario (ON)", callback_data="t4_prov:ON")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_ZIP}")]
+        ]
+        await q.edit_message_text("🌎 **Province d'emploi ?**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return ID_ASK_T4_PROVINCE
+
     elif target_state == ID_ASK_DOC_EMPLOYER:
-        await show("🏢 **Nom de l'Employeur ?**", kb_back_state=ID_CONFIRM_ADDR)
+        await show("🏢 **Nom de l'Employeur ?**", kb_back_state=ID_ASK_T4_PROVINCE)
         return ID_ASK_DOC_EMPLOYER
         
-    elif target_state == ID_ASK_DOC_ADDR:
-        await show("📍 **Adresse de l'Employeur ?**\n(Ex: 123 Rue Principale, Montréal QC)", kb_back_state=ID_ASK_DOC_EMPLOYER)
+    elif target_state == ID_ASK_DOC_ADDR: # RUE de l'employeur
+        await show("📍 **Adresse de l'Employeur (1/3)**\nEntrez le **Numéro et la Rue** :", kb_back_state=ID_ASK_DOC_EMPLOYER)
         return ID_ASK_DOC_ADDR
+
+    elif target_state == ID_ASK_DOC_CITY: # VILLE de l'employeur
+        await show("🏙️ **Adresse de l'Employeur (2/3)**\nQuelle est la **Ville** ?", kb_back_state=ID_ASK_DOC_ADDR)
+        return ID_ASK_DOC_CITY
+
+    elif target_state == ID_ASK_DOC_ZIP: # CP de l'employeur
+        await show("📮 **Adresse de l'Employeur (3/3)**\nQuel est le **Code Postal** ?", kb_back_state=ID_ASK_DOC_CITY)
+        return ID_ASK_DOC_ZIP
+
+    elif target_state == ID_CONFIRM_EMP_ADDR: # Menu Postes Canada Employeur
+        # On renvoie à la saisie du ZIP pour relancer la recherche si besoin
+        await show("📍 **Adresse de l'Employeur (3/3)**\nQuel est le **Code Postal** ?", kb_back_state=ID_ASK_DOC_CITY)
+        return ID_ASK_DOC_ZIP
         
     elif target_state == ID_ASK_DOC_SIN:
-        await show("🔢 **Numéro d'Assurance Sociale (NAS) ?**\n(Ex: 123 456 789)", kb_back_state=ID_ASK_DOC_ADDR)
+        await show("🔢 **Numéro d'Assurance Sociale (NAS) ?**\n(Ex: 123 456 789)", kb_back_state=ID_ASK_DOC_ZIP)
         return ID_ASK_DOC_SIN
 
     elif target_state == ID_CHOOSE_INxCOME_MODE:
@@ -7870,7 +7902,6 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ID_ASK_DL_NUM
         
     elif target_state == ID_ASK_REF_NUM:
-        # Appel de la fonction interactive qui gère sa propre édition de message
         return await ask_ref_number_interactive(update, context)
         
     elif target_state == ID_ASK_SEX:
@@ -7903,27 +7934,191 @@ async def id_form_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+async def id_save_t4_province(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    
+    if q.data.startswith("t4_prov:"):
+        context.user_data['form_province'] = q.data.split(":")[1]
+    
+    await clean_chat(update, context)
+    
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_T4_PROVINCE}")]]
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="🏢 **Nom de l'Employeur ?**",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    context.user_data['cleanup_ids'] = [m.message_id]
+    return ID_ASK_DOC_EMPLOYER
+
 async def id_save_employer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['form_employer'] = update.message.text.strip().upper()
     await clean_chat(update, context)
+    
+    # On demande la RUE d'abord
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_EMPLOYER}")]]
     m = await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text="📍 **Adresse de l'Employeur ?**\n(Ex: 123 Rue Principale, Montréal QC)",
+        text="📍 **Adresse de l'Employeur (1/3)**\nEntrez le **Numéro et la Rue** :",
         reply_markup=InlineKeyboardMarkup(kb)
     )
     context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_DOC_ADDR
 
-async def id_save_emp_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['form_emp_addr'] = update.message.text.strip().upper()
+async def id_save_emp_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enregistre la ville de l'employeur et demande le code postal (3/3)."""
+    # On enregistre la ville
+    context.user_data['emp_city'] = update.message.text.strip().upper()
     await clean_chat(update, context)
+    
+    # Le bouton retour ramène à la rue de l'employeur (ID_ASK_DOC_ADDR)
     kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_ADDR}")]]
+    
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="📮 **Adresse de l'Employeur (3/3)**\nQuel est le **Code Postal** ?",
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data['cleanup_ids'] = [m.message_id]
+    
+    # On passe à l'étape du Code Postal qui déclenchera la recherche
+    return ID_ASK_DOC_ZIP
+
+async def id_save_emp_zip_and_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Enregistre le ZIP et lance l'interrogation Postes Canada pour l'employeur."""
+    zip_val = update.message.text.strip().upper()
+    context.user_data['emp_zip'] = zip_val
+    
+    # On récupère les morceaux enregistrés aux étapes précédentes
+    street = context.user_data.get('emp_street', '')
+    city = context.user_data.get('emp_city', '')
+    
+    # On assemble proprement pour une recherche ultra-précise
+    full_query = f"{street}, {city} {zip_val}"
+    context.user_data['form_emp_addr_raw'] = full_query # Pour le mode manuel au cas où
+    
+    await clean_chat(update, context)
+    
+    # Message d'attente
+    m_wait = await context.bot.send_message(
+        chat_id=update.effective_chat.id, 
+        text="📮 **Interrogation Postes Canada pour l'employeur...**"
+    )
+    
+    # Appel à ton API Postes Canada
+    suggestions = validate_address_canada_post(full_query)
+    
+    # Fallback : si rien n'est trouvé, on propose ce que l'utilisateur a tapé
+    if not suggestions:
+        suggestions = [full_query]
+        
+    context.user_data['emp_addr_suggestions'] = suggestions
+    
+    # Création des boutons (on limite à 55 caractères pour l'affichage Telegram)
+    kb = [[InlineKeyboardButton(f"📍 {a[:55]}", callback_data=f"emp_addr_pick:{i}")] for i, a in enumerate(suggestions)]
+    
+    # Boutons de contrôle
+    kb.append([InlineKeyboardButton("✍️ Garder ma saisie manuelle", callback_data="emp_addr_manual")])
+    # Le retour ramène à la VILLE (étape 2/3)
+    kb.append([InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_CITY}")])
+    
+    await m_wait.edit_text(
+        "✅ **Adresses officielles trouvées :**\nChoisissez l'adresse exacte de l'employeur :", 
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+    
+    context.user_data['cleanup_ids'] = [m_wait.message_id]
+    
+    return ID_CONFIRM_EMP_ADDR
+
+async def id_save_emp_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reçoit la RUE de l'employeur et demande la VILLE (Même logique que le client)."""
+    # On enregistre la rue
+    context.user_data['emp_street'] = update.message.text.upper().strip()
+    await clean_chat(update, context)
+    
+    # Bouton retour vers le nom de l'employeur
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_ASK_DOC_EMPLOYER}")]]
+    
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id, 
+        text="🏙️ **Adresse de l'Employeur (2/3)**\nQuelle est la **Ville** ?", 
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
+    
+    context.user_data['cleanup_ids'] = [m.message_id]
+    
+    # On passe à l'étape de la VILLE
+    return ID_ASK_DOC_CITY
+
+async def id_confirm_emp_addr_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le clic sur l'adresse Postes Canada de l'employeur avec parsing intelligent."""
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    # --- 1. RÉCUPÉRATION ET DÉCOUPAGE DE L'ADRESSE ---
+    if data == "emp_addr_manual":
+        # Saisie manuelle : on met tout dans la rue par défaut
+        raw_addr = context.user_data.get('form_emp_addr_raw', 'Adresse Inconnue')
+        context.user_data['form_emp_addr'] = raw_addr
+        context.user_data['emp_street'] = raw_addr
+        context.user_data['emp_city'] = ""
+        context.user_data['emp_zip'] = ""
+        
+    elif data.startswith("emp_addr_pick:"):
+        idx = int(data.split(":")[1])
+        suggestions = context.user_data.get('emp_addr_suggestions', [])
+        
+        if suggestions and 0 <= idx < len(suggestions):
+            full_addr = suggestions[idx]
+            context.user_data['form_emp_addr'] = full_addr
+            
+            # --- PARSING INTELLIGENT (Comme pour le client) ---
+            parts = [p.strip() for p in full_addr.split(',')]
+            
+            if len(parts) >= 3:
+                # Format classique: Rue, Ville, Prov CP
+                context.user_data['emp_zip'] = parts[-1] # CP (+ Province souvent inclus)
+                candidate_city = parts[-3]
+                
+                # Sécurité si la structure est décalée
+                if candidate_city and candidate_city[0].isdigit():
+                     candidate_city = parts[-2]
+                     if len(candidate_city) == 2: candidate_city = parts[-3]
+
+                context.user_data['emp_city'] = candidate_city
+                context.user_data['emp_street'] = parts[0]
+            else:
+                # Format court
+                context.user_data['emp_street'] = parts[0]
+                context.user_data['emp_city'] = parts[1] if len(parts) > 1 else ""
+                context.user_data['emp_zip'] = ""
+        else:
+            # Fallback
+            raw = context.user_data.get('form_emp_addr_raw', '')
+            context.user_data['form_emp_addr'] = raw
+            context.user_data['emp_street'] = raw
+
+    # --- 2. NETTOYAGE ---
+    try: await q.message.delete()
+    except: pass
+    context.user_data['cleanup_ids'] = []
+
+    # --- 3. PASSAGE AU NAS (Avec bouton Retour vers la Province) ---
+    # Note: On retourne à la Province car c'est l'étape juste avant l'adresse employeur
+    kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_EMP_ADDR}")]]
+    
     m = await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text="🔢 **Numéro d'Assurance Sociale (NAS) ?**\n(Ex: 123 456 789)",
         reply_markup=InlineKeyboardMarkup(kb)
     )
+    
     context.user_data['cleanup_ids'] = [m.message_id]
     return ID_ASK_DOC_SIN
 
@@ -7980,7 +8175,7 @@ async def id_save_t4_salary_custom(update: Update, context: ContextTypes.DEFAULT
 async def id_show_summary_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = context.user_data
     # On utilise ton calculateur de la ligne 170 !
-    calc = calculer_tout_depuis_case14(d['form_t4_salary'])
+    calc = calculer_tout_depuis_case14(d['form_t4_salary'], d.get('form_province', 'QC'))
     d.update(calc)
     
     txt = (
@@ -8005,9 +8200,13 @@ async def id_show_summary_t4(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton("❌ Annuler", callback_data="id_menu_entry")]
     ]
     
-    target = update.message or update.callback_query.message
-    if update.callback_query: m = await target.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    else: m = await target.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    # CORRECTION : On envoie toujours un nouveau message au lieu d'éditer
+    m = await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=txt,
+        reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown"
+    )
     
     context.user_data.setdefault('cleanup_ids', []).append(m.message_id)
     return ID_CONFIRM_SUMMARY
@@ -8027,26 +8226,48 @@ async def id_finalize_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     m_wait = await q.edit_message_text("⏳ **Génération du document T4 en cours...**")
     
     try:
+        # --- ✂️ SAUT DE LIGNE EMPLOYÉ (Rue / Ville+Prov+CP) ---
+        user_full = d.get('form_address', f"{d.get('addr_street', '')}, {d.get('addr_city', '')} QC {d.get('addr_zip', '')}")
+        if ',' in user_full:
+            u_parts = [p.strip() for p in user_full.split(',', 1)]
+            user_ligne1 = u_parts[0]
+            user_ligne2 = u_parts[1] # Contient Ville, Prov, CP
+        else:
+            user_ligne1 = d.get('addr_street', '')
+            user_ligne2 = f"{d.get('addr_city', '')} {d.get('form_province', 'QC')} {d.get('addr_zip', '')}"
+
+        # --- ✂️ SAUT DE LIGNE EMPLOYEUR (Rue / Ville+Prov+CP) ---
+        emp_full = d.get('form_emp_addr', '')
+        if ',' in emp_full:
+            e_parts = [p.strip() for p in emp_full.split(',', 1)]
+            emp_ligne1 = e_parts[0]
+            emp_ligne2 = e_parts[1] # Contient Ville, Prov, CP
+        else:
+            mots = emp_full.split()
+            moitie = len(mots) // 2
+            emp_ligne1 = " ".join(mots[:moitie]) if moitie > 0 else emp_full
+            emp_ligne2 = " ".join(mots[moitie:]) if moitie > 0 else ""
+
+        # --- PRÉPARATION DES DONNÉES ---
         t4_data = {
             "employeur": d.get('form_employer', ''),
-            "employeur_adr1": d.get('form_emp_addr', ''),
-            "employeur_adr2": "", 
+            "employeur_adr1": emp_ligne1,     # Ligne 1 EMPLOYEUR
+            "employeur_adr2": emp_ligne2,     # Ligne 2 EMPLOYEUR (Avec Province)
             "annee": "2025",
             "nas": d.get('form_sin', ''),
             "nom": d.get('form_lastname', ''),
             "prenom": d.get('form_firstname', ''),
-            "adresse1": d.get('addr_street', ''),
-            "adresse2": f"{d.get('addr_city', '')} {d.get('addr_zip', '')}",
+            "adresse1": user_ligne1,          # Ligne 1 EMPLOYE
+            "adresse2": user_ligne2,          # Ligne 2 EMPLOYE (Avec Province)
             "salaire": d.get('salaire', '0.00'),
             "impot": d.get('impot', '0.00'),
             "cpp_rrq": d.get('cpp_rrq', '0.00'),
             "ae": d.get('ae', '0.00'),
-            "province": "QC"
+            "province": d.get('form_province', 'QC')
         }
         
         file_name = f"T4_2025_{user.id}_{int(time.time())}.jpg"
         loop = asyncio.get_running_loop()
-        # On utilise ton générateur de la ligne 200 !
         await loop.run_in_executor(None, lambda: generer_t4_double_arial(t4_data, file_name))
         
         with open(file_name, 'rb') as doc:
@@ -9218,11 +9439,22 @@ async def id_confirm_addr_handler(update: Update, context: ContextTypes.DEFAULT_
 
     # --- SUITE DU FORMULAIRE ---
     if context.user_data.get('id_category') == 'document':
-        kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
-        m = await context.bot.send_message(chat_id=update.effective_chat.id, text="🏢 **Nom de l'Employeur** ?", reply_markup=InlineKeyboardMarkup(kb))
+        # 🍁 AJOUT DE LA QUESTION DE LA PROVINCE (T4)
+        kb = [
+            [InlineKeyboardButton("⚜️ Québec (QC)", callback_data="t4_prov:QC")],
+            [InlineKeyboardButton("🍁 Ontario (ON)", callback_data="t4_prov:ON")],
+            [InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]
+        ]
+        m = await context.bot.send_message(
+            chat_id=update.effective_chat.id, 
+            text="🌎 **Province d'emploi ?**\n_(Les impôts, AE et RRQ/CPP seront ajustés en fonction)_", 
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
         context.user_data['cleanup_ids'] = [m.message_id]
-        return ID_ASK_DOC_EMPLOYER
+        return ID_ASK_T4_PROVINCE
     else:
+        # 🪪 CHEMIN CARTE ID PHYSIQUE
         kb = [[InlineKeyboardButton("🔙 Retour", callback_data=f"form_back:{ID_CONFIRM_ADDR}")]]
         m = await context.bot.send_message(chat_id=update.effective_chat.id, text="📅 **Date d'Émission (4d) ?**\n(Ex: 15/01/2023 ou Aujourd'hui)", reply_markup=InlineKeyboardMarkup(kb))
         context.user_data['cleanup_ids'] = [m.message_id]
@@ -9627,7 +9859,6 @@ admin_ticket_conv = ConversationHandler(
 id_docs_conv = ConversationHandler(
     entry_points=[
         CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
-        # Permet d'entrer directement dans les catégories (y compris Barcodes)
         CallbackQueryHandler(id_show_category, pattern="^id_cat:") 
     ],
     states={
@@ -9636,7 +9867,7 @@ id_docs_conv = ConversationHandler(
             CallbackQueryHandler(id_view_product, pattern="^id_view:"),
             CallbackQueryHandler(id_start_buy, pattern="^id_buy:"),
             CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$"),
-            CallbackQueryHandler(id_show_category, pattern="^id_cat:") # Navigation interne
+            CallbackQueryHandler(id_show_category, pattern="^id_cat:")
         ],
         ID_ASK_QTY: [
             CallbackQueryHandler(id_handle_qty_buttons, pattern="^qty_"),
@@ -9653,11 +9884,30 @@ id_docs_conv = ConversationHandler(
         ID_ASK_ZIP: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_zip)],
         ID_CONFIRM_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_confirm_addr_handler, pattern="^addr_")],
         
+        # --- PROVINCE T4 ---
+        ID_ASK_T4_PROVINCE: [
+            CallbackQueryHandler(id_form_back, pattern="^form_back:"),
+            CallbackQueryHandler(id_save_t4_province, pattern="^t4_prov:")
+        ],
+        
         # ==========================================
         # 📄 CHEMIN SPÉCIFIQUE : DOCUMENTS (T4)
         # ==========================================
         ID_ASK_DOC_EMPLOYER: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_employer)],
-        ID_ASK_DOC_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_emp_addr)],
+        
+        # --- ADRESSE EMPLOYEUR EN 3 PARTIES (CORRIGÉ) ---
+        # 1. Rue -> appelle id_save_emp_city
+        ID_ASK_DOC_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_emp_city)],
+        
+        # 2. Ville -> appelle id_save_emp_zip_and_search
+        ID_ASK_DOC_CITY: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_emp_zip_and_search)],
+        
+        # 3. Code Postal -> gère la recherche finale (C'est l'étape qui manquait dans le menu)
+        ID_ASK_DOC_ZIP: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_emp_zip_and_search)],
+        
+        # 4. Confirmation Postes Canada (Employeur)
+        ID_CONFIRM_EMP_ADDR: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), CallbackQueryHandler(id_confirm_emp_addr_handler, pattern="^emp_addr_")],
+        
         ID_ASK_DOC_SIN: [CallbackQueryHandler(id_form_back, pattern="^form_back:"), MessageHandler(filters.TEXT, id_save_sin_for_t4)],
         ID_CHOOSE_INxCOME_MODE: [
             CallbackQueryHandler(id_form_back, pattern="^form_back:"), 
@@ -9691,7 +9941,7 @@ id_docs_conv = ConversationHandler(
         # --- RÉSUMÉ ET PAIEMENT ---
         ID_CONFIRM_SUMMARY: [
             CallbackQueryHandler(id_finalize_order, pattern="^confirm_gen$"), 
-            CallbackQueryHandler(id_finalize_t4, pattern="^confirm_gen_t4$"), # <--- Le paiement du T4
+            CallbackQueryHandler(id_finalize_t4, pattern="^confirm_gen_t4$"), 
             CallbackQueryHandler(id_open_edit_menu, pattern="^edit_open_menu$"),
             CallbackQueryHandler(id_menu_entry, pattern="^id_menu_entry$")
         ],
