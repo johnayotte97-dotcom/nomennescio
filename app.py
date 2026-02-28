@@ -10158,25 +10158,30 @@ conv_handler = ConversationHandler(
 
 
 def setup_all_handlers(application):
+    
     # ====================================================
-    # GROUPE -1 : SYSTÈME & DÉBUG
+    # GROUPE -1 : L'ESPION (Intercepte tout sans bloquer)
     # ====================================================
     async def espion(update, context):
-     if update.message and update.message.text:
-        user = update.effective_user
-        user_id = user.id
-        username = user.username or "Inconnu"
-        text = update.message.text
+        if update.message and update.message.text:
+            user = update.effective_user
+            user_id = user.id
+            username = user.username or "Inconnu"
+            text = update.message.text
 
-        # 1. Logage isolé
-        log_custom_event(
-            user_id=user_id, 
-            username=username, 
-            action=f"Message reçu: {text}", 
-            status="MSG"
-        )
-        # 2. Print minimaliste pour garder le terminal propre
-        print(f"🕵️ Log ({username}): {text[:30]}...", flush=True)
+            # 1. Logage isolé
+            log_custom_event(
+                user_id=user_id, 
+                username=username, 
+                action=f"Message reçu: {text}", 
+                status="MSG"
+            )
+            # 2. Print minimaliste pour garder le terminal propre
+            print(f"🕵️ Log ({username}): {text[:30]}...", flush=True)
+
+    # ---> LA LIGNE CRUCIALE À AJOUTER EST CELLE-CI <---
+    # Le group=-1 permet de lire le message avant les autres commandes
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, espion), group=-1)
     
     # ACTIONS BOUTIQUE
     application.add_handler(CallbackQueryHandler(handle_buy_callback, pattern=r"^buy:\d+$"))
