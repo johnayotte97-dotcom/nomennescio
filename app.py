@@ -9,6 +9,7 @@ import atexit
 import random
 import string
 import asyncio
+import traceback
 import logging
 import sqlite3
 import threading
@@ -98,6 +99,25 @@ HEARTBEAT_URL = "https://hc-ping.com/e02d463d-737c-4455-b12e-d307eb7313e4"
 # ==========================================
 # ⚙️ MOTEUR DE CALCUL ET GÉNÉRATION T4
 # ==========================================
+
+def log_custom_event(user_id, username, action, status="INFO", reason="N/A"):
+    # 1. On détermine si c'est un admin (en utilisant ta liste ADMIN_IDS)
+    is_admin = str(user_id) in ADMIN_IDS
+    folder = f"logs/{'admins' if is_admin else 'users'}"
+    
+    # 2. Création des dossiers si absent
+    if not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+    
+    # 3. Fichier unique par utilisateur
+    filename = f"{folder}/{user_id}_{username or 'inconnu'}.log"
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # 4. Format de ligne propre
+    log_line = f"[{timestamp}] [{status}] {action} | Raison: {reason}\n"
+    
+    with open(filename, "a", encoding="utf-8") as f:
+        f.write(log_line)
 
 def calculer_tout_depuis_case14(montant_base, province="QC"):
     import random
@@ -303,15 +323,22 @@ def full_product_text(p: Dict[str, Any]) -> str:
 async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    
+    # Récupération immédiate des infos utilisateur pour le log
+    user = update.effective_user
+    user_id = str(user.id)
+    username = user.username or "Inconnu"
+    
     try:
         pid = int(q.data.split(":")[-1])
-        user_id = str(update.effective_user.id)
         chat_id = update.effective_chat.id
+        
+        # --- LOG : TENTATIVE D'ACHAT ---
+        log_custom_event(user.id, username, f"Tentative d'achat Produit ID: {pid}", status="ACTION")
         
         # --- RÉCUPÉRATION SÉCURISÉE DE LA CONNEXION ---
         db = context.bot_data.get("db_conn")
         if db is None:
-            # Reconnexion manuelle si la session est perdue
             import sqlite3
             db = sqlite3.connect(DB_NAME, check_same_thread=False)
             context.bot_data["db_conn"] = db
@@ -321,7 +348,9 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         c.execute("SELECT * FROM products WHERE id=?", (pid,))
         row = c.fetchone()
-        if not row: return await q.message.reply_text("❌ Produit introuvable.")
+        if not row: 
+            log_custom_event(user.id, username, "Achat annulé", status="BLOCKED", reason=f"Produit {pid} introuvable")
+            return await q.message.reply_text("❌ Produit introuvable.")
 
         colnames = [d[0] for d in c.description]
         prod = dict(zip(colnames, row))
@@ -331,7 +360,9 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         price = get_final_price(user_id, prod["price"])
         balance = get_user_balance(user_id)
 
+        # --- LOG : BLOCAGE POUR SOLDE INSUFFISANT ---
         if balance < price:
+            log_custom_event(user.id, username, f"Achat refusé (Produit {pid})", status="BLOCKED", reason=f"Solde insuffisant: {balance:.2f} < {price:.2f}")
             return await q.message.reply_text(f"⚠️ Solde insuffisant ({balance:.2f} USD).")
 
         # --- 1. NETTOYAGE VISUEL IMMÉDIAT ---
@@ -351,7 +382,6 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         update_user_balance(user_id, -price)
         
         try:
-            # Insertion explicite pour respecter la structure avec created_at (index 6)
             c.execute("""
                 INSERT INTO purchases (user_id, product_id, price, full_data, status, title, amount) 
                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -361,8 +391,14 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             c.execute("UPDATE products SET stock = stock - 1 WHERE id=? AND stock > 0", (pid,))
             c.execute("DELETE FROM cart_items WHERE user_id=? AND product_id=?", (user_id, pid))
             db.commit()
+            
+            # --- LOG : SUCCÈS DE L'ACHAT ---
+            log_custom_event(user.id, username, f"Achat réussi (Produit {pid})", status="SUCCESS", reason=f"Payé: {price:.2f} USD")
+            
         except Exception as sql_e:
             db.rollback()
+            # --- LOG : ERREUR SQL ---
+            log_custom_event(user.id, username, f"Erreur SQL Achat (Produit {pid})", status="ERROR", reason=str(sql_e))
             logger.error(f"SQL Transaction Error: {sql_e}")
             return await context.bot.send_message(chat_id=chat_id, text=f"❌ Erreur base de données : {sql_e}")
 
@@ -389,8 +425,15 @@ async def handle_buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return await show_main_menu(int(user_id), clear=True)
 
     except Exception as e:
+        # --- LOG : CRASH GLOBAL AVEC TRACEBACK ---
+        error_detail = traceback.format_exc()
+        log_custom_event(user.id, username, "CRASH CRITIQUE ACHAT", status="ERROR", reason=str(e))
+        
+        with open("logs/debug_crash.log", "a") as f:
+            f.write(f"--- CRASH {datetime.now()} ---\nUSER: {user.id}\n{error_detail}\n")
+            
         logger.error(f"Global Buy Error: {e}")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Erreur critique : {e}")
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Erreur technique. L'admin a été notifié.")
 
 async def cart_add_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -6509,57 +6552,70 @@ def analyze_response():
 # ========================== MENU/ROUTEUR CALLBACKS ==========================
 async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    
-    # 1. Réponse unique au clic (Indispensable pour débloquer le bouton gris)
+    user = update.effective_user
+    user_id = user.id
+    username = user.username or "Inconnu"
+    data = q.data
+
+    # 1. LOGGING ISOLÉ : On enregistre l'action dans le fichier personnel de l'user
+    # Le statut est "INTERACTION" pour les clics de boutons
+    log_custom_event(user_id, username, f"Clic bouton: {data}", status="INTERACTION")
+
+    # 2. Réponse au clic pour débloquer l'interface
     try: 
         await q.answer()
     except:
         pass
 
-    data = q.data
-    user_id = update.effective_user.id
-    
-    # DEBUG Simple (Utile pour voir si le clic arrive)
-    print(f"DEBUG: Clic détecté -> {data}", flush=True)
+    try:
+        # --- LOGIQUE DE RETOUR / ACCUEIL ---
+        if data == "menu_accueil":
+            context.user_data['cart_return_to'] = "menu_accueil"
+            return await goto_menu(update, context)
 
-    # --- LOGIQUE DE RETOUR / ACCUEIL ---
-    if data == "menu_accueil":
-        context.user_data['cart_return_to'] = "menu_accueil"
-        return await goto_menu(update, context)
+        # --- SECTION HISTORIQUE ---
+        if data == "hist:view":
+            return await hist_view_callback(update, context)
 
+        if data.startswith("hist:pros"):
+            return await hist_pros(update, context)
 
-    # --- SECTION HISTORIQUE ---
-    if data == "hist:view":
-        return await hist_view_callback(update, context)
+        if data == "hist:permis":
+            return await show_permis_history(update, context)
 
-    if data.startswith("hist:pros"):
-        return await hist_pros(update, context)
+        if data == "hist:ids":
+            return await show_ids_history(update, context)
 
-    if data == "hist:permis":
-        return await show_permis_history(update, context)
+        # --- SECTION BOUTIQUE ---
+        if data in ["propro", "cat:propro"]:
+            context.user_data["prod_tier"] = None
+            context.user_data['cart_return_to'] = "cat:propro"
+            return await show_products(update, context, page=0, tier=None)
 
-    if data == "hist:ids":
-        return await show_ids_history(update, context)
+        if data.startswith("prod:page:"):
+            page = int(data.split(":")[2])
+            tier = context.user_data.get("prod_tier")
+            return await show_products(update, context, page=page, tier=tier)
 
-    # --- SECTION BOUTIQUE ---
-    if data in ["propro", "cat:propro"]:
-        context.user_data["prod_tier"] = None
-        context.user_data['cart_return_to'] = "cat:propro"
-        return await show_products(update, context, page=0, tier=None)
+        if data.startswith("ccs:page:"):
+            page = int(data.split(":")[2])
+            tier = context.user_data.get("prod_tier")
+            return await show_products_ccs(update, context, page=page, tier=tier)
 
-    if data.startswith("prod:page:"):
-        page = int(data.split(":")[2])
-        tier = context.user_data.get("prod_tier")
-        return await show_products(update, context, page=page, tier=tier)
+        if data == "noop":
+            return
 
-    if data.startswith("ccs:page:"):
-        page = int(data.split(":")[2])
-        tier = context.user_data.get("prod_tier")
-        return await show_products_ccs(update, context, page=page, tier=tier)
-
-    if data == "noop":
-        return
-
+    except Exception as e:
+        # 3. LOGGING D'ERREUR : Si une fonction (ex: hist_view) crash, on le sait
+        error_detail = traceback.format_exc()
+        log_custom_event(user_id, username, f"CRASH sur bouton: {data}", status="ERROR", reason=str(e))
+        
+        # On logue le détail technique pour l'admin
+        with open("logs/debug_crash.log", "a") as f:
+            f.write(f"USER {user_id} - {datetime.now()} - BOUTON {data}:\n{error_detail}\n")
+            
+        await q.message.reply_text("⚠️ Une erreur est survenue lors du traitement de votre demande.")
+        
 async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         q = update.callback_query
@@ -8232,15 +8288,23 @@ async def id_finalize_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     user = update.effective_user
+    user_id_str = str(user.id)
+    username = user.username or "Inconnu"
     d = context.user_data
     
     prod_price = d.get('id_product', {}).get('price', 50.0)
-    if get_user_balance(str(user.id)) < prod_price:
+    
+    # --- LOG : BLOCAGE POUR SOLDE INSUFFISANT ---
+    if get_user_balance(user_id_str) < prod_price:
+        log_custom_event(user.id, username, "Génération T4 refusée", status="BLOCKED", reason=f"Solde insuffisant (< {prod_price}$)")
         await q.edit_message_text("❌ Solde insuffisant. Veuillez recharger.")
         return ConversationHandler.END
     
-    update_user_balance(str(user.id), -prod_price)
-    m_wait = await q.edit_message_text("⏳ **Génération du document T4 en cours...**")
+    # --- LOG : DÉBUT DE LA GÉNÉRATION (Action lourde pour la 4090) ---
+    log_custom_event(user.id, username, "Début génération T4 HD", status="ACTION", reason=f"Déduction: {prod_price}$")
+    
+    update_user_balance(user_id_str, -prod_price)
+    m_wait = await q.edit_message_text("⏳ **Génération du document T4 en cours...**\n_(Traitement haute qualité sur serveur...)_")
     
     try:
         # --- ✂️ SAUT DE LIGNE EMPLOYÉ (Rue / Ville+Prov+CP) ---
@@ -8301,17 +8365,26 @@ async def id_finalize_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
              await context.bot.send_document(
                  chat_id=CHANNEL_LOGS, 
                  document=doc, 
-                 caption=f"📦 NOUVEAU T4 VENDU ({prod_price}$)\nClient: @{user.username or user.id}"
+                 caption=f"📦 NOUVEAU T4 VENDU ({prod_price}$)\nClient: @{username} (ID: {user.id})"
              )
             
         await m_wait.delete()
+        
+        # --- LOG : SUCCÈS DE LA GÉNÉRATION ---
+        log_custom_event(user.id, username, f"Génération T4 Réussie ({file_name})", status="SUCCESS")
         
         # Nettoyage du fichier local après envoi
         if os.path.exists(file_name):
             os.remove(file_name)
 
     except Exception as e:
-        print(f"Erreur T4: {e}")
+        # --- LOG : CRASH CRITIQUE (Ex: Surcharge GPU ou erreur PIL) ---
+        error_detail = traceback.format_exc()
+        log_custom_event(user.id, username, "CRASH GÉNÉRATION T4", status="ERROR", reason=str(e))
+        
+        with open("logs/debug_crash.log", "a", encoding="utf-8") as f:
+            f.write(f"--- CRASH T4 {time.strftime('%Y-%m-%d %H:%M:%S')} ---\nUSER: {user.id}\n{error_detail}\n")
+            
         await m_wait.edit_text("❌ Erreur technique lors de la génération HD. L'admin a été notifié.")
         
     await show_main_menu(user.id, clear=False)
@@ -10089,13 +10162,21 @@ def setup_all_handlers(application):
     # GROUPE -1 : SYSTÈME & DÉBUG
     # ====================================================
     async def espion(update, context):
-        if update.message and update.message.text:
-            print(f"🕵️ ESPION: Message reçu -> '{update.message.text}'", flush=True)
-            
-    application.add_handler(CallbackQueryHandler(show_referral_menu, pattern="^show_referral$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, espion), group=-1)
-    application.add_handler(catalog_filter_conv)
-    application.add_handler(ccs_catalog_filter_conv)
+     if update.message and update.message.text:
+        user = update.effective_user
+        user_id = user.id
+        username = user.username or "Inconnu"
+        text = update.message.text
+
+        # 1. Logage isolé
+        log_custom_event(
+            user_id=user_id, 
+            username=username, 
+            action=f"Message reçu: {text}", 
+            status="MSG"
+        )
+        # 2. Print minimaliste pour garder le terminal propre
+        print(f"🕵️ Log ({username}): {text[:30]}...", flush=True)
     
     # ACTIONS BOUTIQUE
     application.add_handler(CallbackQueryHandler(handle_buy_callback, pattern=r"^buy:\d+$"))
