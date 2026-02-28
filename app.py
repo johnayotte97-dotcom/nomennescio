@@ -8467,7 +8467,7 @@ catalog_filter_conv = ConversationHandler(
 ccs_catalog_filter_conv = ConversationHandler(
     entry_points=[
         CallbackQueryHandler(filter_start_ccs, pattern="^ccs_filter_open$"),
-        CallbackQueryHandler(ccs_catalog_start, pattern="^ccs_catalog_start$"),
+        # 🟢 SUPPRESSION de ccs_catalog_start ici pour éviter le conflit avec le menu_handler
     ],
     states={
         CCS_FILTER_MAIN: [
