@@ -6592,6 +6592,13 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['cart_return_to'] = "cat:propro"
             return await show_products(update, context, page=0, tier=None)
 
+        # 🟢 ---> LA RÉPARATION DU BOUTON CC'S EST ICI <--- 🟢
+        if data == "ccs_catalog_start":
+            context.user_data["prod_tier"] = None
+            context.user_data['cart_return_to'] = "ccs_catalog_start"
+            return await show_products_ccs(update, context, page=0, tier=None)
+        # ----------------------------------------------------
+
         if data.startswith("prod:page:"):
             page = int(data.split(":")[2])
             tier = context.user_data.get("prod_tier")
@@ -6606,15 +6613,14 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     except Exception as e:
-        # 3. LOGGING D'ERREUR : Si une fonction (ex: hist_view) crash, on le sait
         error_detail = traceback.format_exc()
+        
         log_custom_event(user_id, username, f"CRASH sur bouton: {data}", status="ERROR", reason=str(e))
         
-        # On logue le détail technique pour l'admin
-        with open("logs/debug_crash.log", "a") as f:
+        with open("logs/debug_crash.log", "a", encoding="utf-8") as f:
             f.write(f"USER {user_id} - {datetime.now()} - BOUTON {data}:\n{error_detail}\n")
             
-        await q.message.reply_text("⚠️ Une erreur est survenue lors du traitement de votre demande.")
+        await q.message.reply_text("⚠️ Une erreur technique est survenue. L'admin a été prévenu.")
         
 async def hist_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -10235,6 +10241,8 @@ def setup_all_handlers(application):
     application.add_handler(admin_ivr_conv, group=7)
     application.add_handler(admin_search_conv, group=8)
     application.add_handler(admin_ticket_conv, group=9)
+    application.add_handler(catalog_filter_conv, group=10)
+    application.add_handler(ccs_catalog_filter_conv, group=11)
 
     application.add_handler(CallbackQueryHandler(menu_handler))
 
