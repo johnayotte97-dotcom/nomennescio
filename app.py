@@ -140,27 +140,40 @@ def generer_t4_double_arial(data, output_name):
         print(f"❌ Erreur : {source_path} introuvable.")
         return
 
+    # On convertit en RGB pour une manipulation propre
     img = Image.open(source_path).convert("RGB")
     draw = ImageDraw.Draw(img)
 
-    # Recherche de la police sur le serveur Ubuntu
+    # Recherche de la police
     font_paths = [
         "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
     ]
     font_path = next((p for p in font_paths if os.path.exists(p)), None)
     
-    # Coordonnées (Haut et Bas)
+    # --- CALCUL DE L'ALIGNEMENT EMPLOYEUR ---
+    # On définit un départ et un saut fixe (ex: 32 pixels)
+    emp_x = 136
+    emp_start_y_haut = 90
+    emp_start_y_bas = 1165
+    saut = 32  # Espace constant entre les lignes
+
+    # Coordonnées corrigées (x, y_haut, y_bas, size)
+    # J'ai uniformisé les écarts pour l'employeur et pour l'employé
     MAP_COORDS = {
-        "employeur":      (136, 90,   1165, 28),
-        "employeur_adr1": (137, 120,  1196, 26),
-        "employeur_adr2": (136, 156,  1233, 26),
+        "employeur":      (emp_x, emp_start_y_haut,            emp_start_y_bas,            28),
+        "employeur_adr1": (emp_x, emp_start_y_haut + saut,     emp_start_y_bas + saut,     26),
+        "employeur_adr2": (emp_x, emp_start_y_haut + (saut*2), emp_start_y_bas + (saut*2), 26),
+        
         "annee":          (864, 115,  1191, 32),
         "nas":            (254, 419,  1494, 32),
         "nom":            (174, 584,  1660, 32),
         "prenom":         (551, 584,  1660, 32),
+        
+        # Alignement corrigé pour l'employé aussi (saut de 31px)
         "adresse1":       (139, 690,  1765, 28),
-        "adresse2":       (140, 721,  1797, 28),
+        "adresse2":       (139, 721,  1796, 28), 
+        
         "salaire":        (1081, 213, 1293, 32),
         "impot":          (1456, 217, 1293, 32),
         "cpp_rrq":        (1467, 308, 1387, 30),
@@ -172,11 +185,15 @@ def generer_t4_double_arial(data, output_name):
         if champ in data and data[champ]:
             font = ImageFont.truetype(font_path, size) if font_path else ImageFont.load_default()
             valeur = str(data[champ]).upper()
-            draw.text((x, y_haut), valeur, fill=(0, 0, 0), font=font)
-            draw.text((x, y_bas), valeur, fill=(0, 0, 0), font=font)
+            
+            # --- AJOUT DU GRAS (STROKE) ---
+            # stroke_width=1 simule le Arial Bold sans changer de fichier
+            draw.text((x, y_haut), valeur, fill=(0, 0, 0), font=font, stroke_width=1, stroke_fill=(0,0,0))
+            draw.text((x, y_bas), valeur, fill=(0, 0, 0), font=font, stroke_width=1, stroke_fill=(0,0,0))
 
-    img.save(output_name, quality=100, subsampling=0)
-    print(f"✅ T4 généré : {output_name}")
+    # Sauvegarde en haute qualité (le format sera PNG si output_name finit par .png)
+    img.save(output_name, optimize=True)
+    print(f"✅ T4 HD généré : {output_name}")
 # ==========================================
 
 def get_final_price(user_id, base_price):
@@ -834,7 +851,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 DESTINATION_NUMBER = os.environ.get("DESTINATION_NUMBER")
 SIGNALWIRE_NUMBER = os.environ.get("SIGNALWIRE_NUMBER")
 SERVER_URL = os.environ.get("SERVER_URL")
-ADMIN_IDS = ["7573645008", "8409831904"]
+ADMIN_IDS = ["7573645008"]
 CHANNEL_LOGS = "-1003589564052"
 NUMVERIFY_API_KEY = os.environ.get("NUMVERIFY_API_KEY")
 DB_NAME = os.environ.get("DB_NAME", DB_PATH)
@@ -8266,19 +8283,36 @@ async def id_finalize_t4(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "province": d.get('form_province', 'QC')
         }
         
-        file_name = f"T4_2025_{user.id}_{int(time.time())}.jpg"
+        # CHANGEMENT : Extension .png pour la haute qualité
+        file_name = f"T4_2025_{user.id}_{int(time.time())}.png"
+        
         loop = asyncio.get_running_loop()
+        # La fonction de génération utilisera le format PNG grâce au nom du fichier
         await loop.run_in_executor(None, lambda: generer_t4_double_arial(t4_data, file_name))
         
         with open(file_name, 'rb') as doc:
-            await context.bot.send_document(chat_id=user.id, document=doc, caption="✅ **Voici votre document T4 2025.**\nMerci de votre confiance !")
+            await context.bot.send_document(
+                chat_id=user.id, 
+                document=doc, 
+                caption="✅ **Voici votre document T4 2025 (Haute Qualité).**\nMerci de votre confiance !"
+            )
+            
         with open(file_name, 'rb') as doc:
-             await context.bot.send_document(chat_id=CHANNEL_LOGS, document=doc, caption=f"📦 NOUVEAU T4 VENDU ({prod_price}$)\nClient: @{user.username or user.id}")
+             await context.bot.send_document(
+                 chat_id=CHANNEL_LOGS, 
+                 document=doc, 
+                 caption=f"📦 NOUVEAU T4 VENDU ({prod_price}$)\nClient: @{user.username or user.id}"
+             )
             
         await m_wait.delete()
+        
+        # Nettoyage du fichier local après envoi
+        if os.path.exists(file_name):
+            os.remove(file_name)
+
     except Exception as e:
         print(f"Erreur T4: {e}")
-        await m_wait.edit_text("❌ Erreur technique. L'admin a été notifié.")
+        await m_wait.edit_text("❌ Erreur technique lors de la génération HD. L'admin a été notifié.")
         
     await show_main_menu(user.id, clear=False)
     return ConversationHandler.END
