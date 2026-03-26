@@ -2143,6 +2143,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     
     query = getattr(update, "callback_query", None)
     chat_id = query.message.chat_id if query else update.effective_chat.id
+    user_id = str(update.effective_user.id) # Récupération de l'ID pour la vue Admin et la pagination
     
     # 1. UX : CHARGEMENT + PAUSE
     loading_msg = None
@@ -2172,14 +2173,15 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
             except: pass
     except: pass
 
-    # 3. Recherche SQL
+    # 3. Recherche SQL (⚡ OPTIMISÉE EN ARRIÈRE-PLAN)
     try:
         filters = context.user_data.get('ccs_active_filters', {})
-        PER_PAGE = 5 
+        PER_PAGE = get_user_pagination(user_id) # 🟢 Pagination custom au lieu de 5
         try:
-            chunk, total_items = _get_products_optimized(category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
+            # L'appel asyncio.to_thread empêche le bot de figer pendant la recherche
+            chunk, total_items = await asyncio.to_thread(_get_products_optimized, category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
         except NameError:
-            chunk, total_items = _get_products(category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
+            chunk, total_items = await asyncio.to_thread(_get_products, category="ccs", page=page, per_page=PER_PAGE, filters=filters, tier=tier)
     except Exception as e:
         if loading_msg:
             try: await loading_msg.edit_text(f"⚠️ Erreur DB: {e}")
@@ -2195,7 +2197,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
     page = max(0, min(page, total_pages - 1))
     sent_ids = []
 
-    # --- FONCTION D'AFFICHAGE (PRÉNOM + VILLE) ---
+    # --- FONCTION D'AFFICHAGE (VUE ADMIN + VUE CLIENT) ---
     def fmt_product_ccs(p):
         try:
             lines = []
@@ -2205,9 +2207,10 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
                 m = re.search(f"{key}:\\s*(.+)", content, re.IGNORECASE)
                 return m.group(1).strip() if m else None
 
-            # A. Infos Bancaires
-            cc = get_val("CC") or get_val("BINS") or get_val("CCNUMBER")
-            exp = get_val("EXP") or get_val("CCEXP")
+            # A. Infos Bancaires complètes
+            cc = get_val("CC") or get_val("BINS") or get_val("CCNUMBER") or "N/A"
+            exp = get_val("EXP") or get_val("CCEXP") or "N/A"
+            cvc = get_val("CVC") or get_val("CCCVV") or get_val("CVV") or "N/A"
             
             # B. Identité (Prénom seulement)
             fname = get_val("FIRST NAME")
@@ -2215,25 +2218,32 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
                 display_name = fname.strip()
             else:
                 raw_title = str(p.get('title', ''))
-                # Nettoyage "💳 CC" du titre
                 clean_title = raw_title.split('•')[0].replace("💳 CC", "").replace("💳", "").replace("CC", "").strip()
                 display_name = clean_title.split()[0] if clean_title else "N/A"
 
             # C. Ville (Extraction de CITY ou VILLE)
             city = get_val("CITY") or get_val("VILLE") or p.get('city') or "N/A"
-
-            # Construction du message
-            if cc: lines.append(f"💳 **BINS:** {cc[:6]}")
-            if exp: lines.append(f"📅 **EXP:** {exp}")
-            
-            lines.append(f"👤 **FIRST NAME:** {display_name}")
-            lines.append(f"📍 **CITY:** {city.upper()}") # Ville en majuscule
-            
-            lines.append(f"🏷️ **BASE:** {p.get('tier', 'Recycle')}")
             
             try: price_val = float(p.get('price', 0))
             except: price_val = 0.0
-            lines.append(f"💰 **PRICE:** {price_val:.2f} USD")
+
+            # 🟢 LOGIQUE ADMIN VS CLIENT 🟢
+            if str(user_id) in ADMIN_IDS:
+                lines.append(f"👁️ **VUE ADMIN (Produit #{p['id']})**")
+                lines.append(f"━━━━━━━━━━━━━━━━━━")
+                lines.append(f"💳 **CC:** `{cc}`")
+                lines.append(f"📅 **EXP:** `{exp}`  |  🔐 **CVC:** `{cvc}`")
+                lines.append(f"👤 **NOM:** `{display_name}`")
+                lines.append(f"📍 **VILLE:** `{city.upper()}`")
+                lines.append(f"━━━━━━━━━━━━━━━━━━")
+                lines.append(f"💰 **PRIX:** `{price_val:.2f} USD` | 🏷️ **BASE:** `{p.get('tier', 'Recycle')}`")
+            else:
+                if cc != "N/A": lines.append(f"💳 **BINS:** {cc[:6]}")
+                if exp != "N/A": lines.append(f"📅 **EXP:** {exp}")
+                lines.append(f"👤 **FIRST NAME:** {display_name}")
+                lines.append(f"📍 **CITY:** {city.upper()}") 
+                lines.append(f"🏷️ **BASE:** {p.get('tier', 'Recycle')}")
+                lines.append(f"💰 **PRICE:** {price_val:.2f} USD")
             
             return "\n".join(lines)
         except Exception as e:
@@ -2275,7 +2285,7 @@ async def show_products_ccs(update, context, page=0, tier=None, from_filter=Fals
         ]
         
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔎 Filter / Rechercher", callback_data="ccs_filter_open")],
+            [InlineKeyboardButton("🔎 Filter / Rechercher", callback_data="ccs_filter_open"), InlineKeyboardButton("⚙️ Vue", callback_data="open_pagination_menu")],
             nav_buttons,
             [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
         ])
