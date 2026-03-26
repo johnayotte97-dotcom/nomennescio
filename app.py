@@ -894,7 +894,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 DESTINATION_NUMBER = os.environ.get("DESTINATION_NUMBER")
 SIGNALWIRE_NUMBER = os.environ.get("SIGNALWIRE_NUMBER")
 SERVER_URL = os.environ.get("SERVER_URL")
-ADMIN_IDS = ["7573645008"]
+ADMIN_IDS = ["7573645008", "6324461031"]
 CHANNEL_LOGS = "-1003589564052"
 NUMVERIFY_API_KEY = os.environ.get("NUMVERIFY_API_KEY")
 DB_NAME = os.environ.get("DB_NAME", DB_PATH)
@@ -1744,7 +1744,6 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     chat_id = update.effective_chat.id
     
     # --- 1. SUPPRESSION DU MENU D'ACCUEIL (OU PRÉCÉDENT) ---
-    # Si on arrive du menu principal (pas d'un filtre), on efface le menu d'accueil
     if query and not from_filter:
         try:
             await query.message.delete()
@@ -1754,26 +1753,20 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     # --- 2. NETTOYAGE DES ANCIENNES FICHES ET NAVIGATION ---
     msgs_to_del = context.user_data.pop("catalog_msg_ids", [])
     
-    # Si on vient du filtre, on nettoie spécifiquement les messages de l'interface filtre
     if from_filter:
         msgs_to_del += context.user_data.pop("filter_fiches_msg_ids", [])
-        msgs_to_del += context.user_data.pop("filter_msgs", []) # Efface le menu "🔎 MODE FILTRE"
-        # On efface aussi le message de confirmation du filtre si présent
+        msgs_to_del += context.user_data.pop("filter_msgs", []) 
         if query:
             msgs_to_del.append(query.message.message_id)
 
-    # Exécution de la suppression
     for mid in set(msgs_to_del):
-        try:
-            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
-        except:
-            pass
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except: pass
 
     # --- 3. RÉCUPÉRATION DES DONNÉES ---
     PER_PAGE = get_user_pagination(user_id)
     filters = context.user_data.get('active_filters', {})
     
-    # Utilisation du moteur SQL V6
     chunk, total_items = _get_products_optimized("propro", page, PER_PAGE, filters, tier)
 
     if not chunk:
@@ -1784,18 +1777,36 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     sent_ids = []
 
-    # --- 4. AFFICHAGE DES PRODUITS (EN PREMIER) ---
+    # --- 4. AFFICHAGE DES PRODUITS ---
     for p in chunk:
-        # Sécurité pour le nom (title contient souvent NOM • VILLE)
         clean_name = p['title'].split('•')[0].strip()
         
-        txt = (
-            f"👤 **NOM** : `{clean_name}`\n"
-            f"🏙️ **VILLE** : `{p.get('city', 'N/A')}`\n"
-            f"📅 **ANNÉE** : `{p.get('year', 'N/A')}`\n"
-            f"📂 **BASE** : `{p.get('tier', 'N/A')}`\n"
-            f"💰 **PRIX** : `{p['price']:.2f} USD`"
-        )
+        # 🟢 LOGIQUE D'AFFICHAGE : VUE ADMIN VS VUE CLIENT 🟢
+        if str(user_id) in ADMIN_IDS:
+            # Vue Admin : Fiche complète directe, toutes les infos visibles
+            f = _parse_product_fields(p)
+            txt = (
+                f"👁️ **VUE ADMIN (Produit #{p['id']})**\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"👤 **NOM**: `{f['first']} {f['last']}`\n"
+                f"🎂 **DOB**: `{f['dob']}`\n"
+                f"🧾 **SIN**: `{f['sin'] or 'N/A'}`\n"
+                f"📞 **TÉL**: `{f['phone'] or 'N/A'}`\n"
+                f"🏠 **ADRESSE**: `{f['address']}`\n"
+                f"🏙️ **VILLE**: `{f['city']} {f['postal']}`\n"
+                f"📧 **EMAIL**: `{f['email'] or 'N/A'}`\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"💰 **PRIX**: `{p['price']:.2f} USD` | 📂 **BASE**: `{p.get('tier', 'N/A')}`"
+            )
+        else:
+            # Vue Client : Résumé masqué
+            txt = (
+                f"👤 **NOM** : `{clean_name}`\n"
+                f"🏙️ **VILLE** : `{p.get('city', 'N/A')}`\n"
+                f"📅 **ANNÉE** : `{p.get('year', 'N/A')}`\n"
+                f"📂 **BASE** : `{p.get('tier', 'N/A')}`\n"
+                f"💰 **PRIX** : `{p['price']:.2f} USD`"
+            )
         
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("🛒 Add", callback_data=f"cart:add:{p['id']}"), 
@@ -1805,10 +1816,9 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
         try:
             m = await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb, parse_mode="Markdown")
             sent_ids.append(m.message_id)
-        except:
-            pass
+        except: pass
 
-    # --- 5. MENU DE NAVIGATION (EN DERNIER -> TOUJOURS EN BAS) ---
+    # --- 5. MENU DE NAVIGATION ---
     con = sqlite3.connect(DB_NAME)
     cart_count = con.execute("SELECT count(*) FROM cart_items WHERE user_id=?", (user_id,)).fetchone()[0]
     con.close()
@@ -1838,7 +1848,6 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     )
     sent_ids.append(m_nav.message_id)
     
-    # Sauvegarde pour le prochain tour
     context.user_data['catalog_msg_ids'] = sent_ids
 
         
