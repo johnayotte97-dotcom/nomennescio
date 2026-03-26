@@ -1711,15 +1711,28 @@ def _build_products_keyboard(page, total_pages, tier=None):
     back_row = [InlineKeyboardButton("⬅️ Retour", callback_data="menu_accueil")]
     return InlineKeyboardMarkup([filt_row, nav_row, back_row])
 
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+
 async def open_pagination_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche le choix du nombre d'articles par page."""
+    """Affiche le choix du nombre d'articles par page avec protection contre les vieilles requêtes."""
     q = update.callback_query
-    await q.answer()
+    
+    # 1. Protection contre le "Query is too old"
+    try:
+        await q.answer()
+    except Exception:
+        # Si la requête a expiré (plus de 30-60s), on ignore l'erreur
+        pass
     
     user_id = str(update.effective_user.id)
+    
+    # On récupère la valeur actuelle (assure-toi que cette fonction existe dans tes helpers)
     current = get_user_pagination(user_id)
     
-    def txt(val): return f"✅ {val}" if current == val else f"{val}"
+    # Petite fonction pour mettre un ✅ sur le choix actuel
+    def txt(val): 
+        return f"✅ {val}" if int(current) == int(val) else f"{val}"
     
     kb = [
         [
@@ -1731,11 +1744,23 @@ async def open_pagination_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         [InlineKeyboardButton("🔙 Retour Catalogue", callback_data="propro")]
     ]
     
-    await q.message.edit_text(
-        f"📄 **RÉGLAGE AFFICHAGE**\n\nCombien de produits voulez-vous voir par page ?\nActuel : **{current}**",
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode="Markdown"
-    )
+    # 2. Utilisation de edit_text avec sécurité
+    try:
+        await q.message.edit_text(
+            f"📄 **RÉGLAGE AFFICHAGE**\n\n"
+            f"Choisissez le nombre de produits à afficher par page pour une navigation plus fluide.\n\n"
+            f"Actuel : **{current}** produits/page",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        # Si le message ne peut pas être édité (ex: déjà supprimé), on en renvoie un nouveau
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"📄 **RÉGLAGE AFFICHAGE**\n\nActuel : **{current}**",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown"
+        )
 
 
 async def show_products(update, context, page=0, tier=None, from_filter=False):
@@ -3423,33 +3448,40 @@ async def show_permis_history(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Affiche les derniers permis générés avec un style UX (une bulle par item)."""
     q = update.callback_query
     
-    try: await q.answer()
-    except: pass
+    # 1. Protection Query Timeout
+    try: 
+        await q.answer()
+    except: 
+        pass
     
     user_id = str(update.effective_user.id)
     chat_id = update.effective_chat.id
 
-    # 1. Nettoyage de l'écran (On efface le menu historique)
+    # 2. Nettoyage de l'écran
     try:
         await q.message.delete()
     except:
         pass
 
-    # 2. Récupération des données en DB
-    con = sqlite3.connect(DB_NAME)
-    con.row_factory = sqlite3.Row
-    cur = con.cursor()
-    
-    # On récupère les 5 dernières vérifications réussies
-    cur.execute("""
-        SELECT fullname, permis, status, created_at 
-        FROM verifications 
-        WHERE user_id = ? AND status = 'valide'
-        ORDER BY id DESC LIMIT 5
-    """, (user_id,))
-    
-    rows = cur.fetchall()
-    con.close()
+    # 3. Récupération des données en DB (Mode sécurisé)
+    try:
+        con = sqlite3.connect(DB_NAME, timeout=10) # Ajout d'un timeout
+        con.row_factory = sqlite3.Row
+        cur = con.cursor()
+        
+        # On récupère les 5 dernières vérifications réussies
+        cur.execute("""
+            SELECT fullname, permis, status, created_at 
+            FROM verifications 
+            WHERE user_id = ? AND status = 'valide'
+            ORDER BY id DESC LIMIT 5
+        """, (user_id,))
+        
+        rows = cur.fetchall()
+        con.close()
+    except Exception as e:
+        print(f"⚠️ Erreur DB historique : {e}")
+        return await context.bot.send_message(chat_id=chat_id, text="❌ Erreur lors de la lecture de l'historique.")
 
     if not rows:
         kb_vide = [[InlineKeyboardButton("⬅️ Retour", callback_data="hist:view")]]
@@ -3460,9 +3492,10 @@ async def show_permis_history(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown"
         )
 
-    # 3. Envoi des fiches (Style UX)
+    # 4. Envoi des fiches (Corrigé pour éviter la SyntaxError)
     sent_ids = []
     for r in rows:
+        # Utilisation de f-string propre sur plusieurs lignes
         txt = (
             f"🚗 **PERMIS GÉNÉRÉ**\n"
             f"━━━━━━━━━━━━━━━━━━\n"
@@ -3471,20 +3504,25 @@ async def show_permis_history(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"📅 **DATE** : `{r['created_at']}`\n"
             f"━━━━━━━━━━━━━━━━━━"
         )
-        # On peut ajouter un bouton pour copier le numéro facilement
-        m = await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="Markdown")
-        sent_ids.append(m.message_id)
+        try:
+            m = await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode="Markdown")
+            sent_ids.append(m.message_id)
+        except:
+            pass
 
-    # 4. Bulle de navigation finale
+    # 5. Bulle de navigation finale
     kb_fin = [[InlineKeyboardButton("⬅️ Retour à l'Historique", callback_data="hist:view")]]
-    m_fin = await context.bot.send_message(
-        chat_id=chat_id, 
-        text="🔻 **Fin de votre historique Permis** 🔻", 
-        reply_markup=InlineKeyboardMarkup(kb_fin)
-    )
-    sent_ids.append(m_fin.message_id)
+    try:
+        m_fin = await context.bot.send_message(
+            chat_id=chat_id, 
+            text="🔻 **Fin de votre historique Permis** 🔻", 
+            reply_markup=InlineKeyboardMarkup(kb_fin)
+        )
+        sent_ids.append(m_fin.message_id)
+    except:
+        pass
 
-    # On stocke les IDs pour que le bouton "Retour" puisse tout effacer d'un coup
+    # On stocke les IDs pour le nettoyage futur
     context.user_data["hist_msgs"] = sent_ids
 
 async def history_filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9156,8 +9194,7 @@ async def ticket_finalize_send(update: Update, context: ContextTypes.DEFAULT_TYP
     con.commit()
     con.close()
     
-    # --- 4. Notification Admin (MODIFIÉE) ---
-    # Pas de bouton, juste le texte demandé
+    
     admin_txt = f"⚠️ **Vous avez reçu une notification (Ticket #{ticket_id}).**\nConsultez la section ticket."
     
     try: 
