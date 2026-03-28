@@ -565,15 +565,13 @@ async def cart_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
         except: pass
 
-    # 3. MESSAGE DE CONFIRMATION (Temporaire)
+
     m = await context.bot.send_message(chat_id=chat_id, text="🗑 **Panier vidé.** Retour au catalogue...", parse_mode="Markdown")
     await asyncio.sleep(1.0) # Pause courte pour que l'utilisateur lise
     try: await m.delete()
     except: pass
 
-    # 4. RETOUR AU CATALOGUE (Pro's)
-    # On appelle show_products pour réafficher la liste des produits
-    # Note: On remet page=0 pour revenir au début
+  
     return await show_products(update, context, page=0, tier=None)
 
 async def cart_remove_single(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1648,12 +1646,17 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
             conditions.append("city LIKE ? COLLATE NOCASE")
             params.append(f"%{filters['city'].strip()}%")
 
+        # NOUVEAU : Filtre par Province (si tu l'utilises dans ton menu filter)
+        if filters.get('province'):
+            conditions.append("province LIKE ? COLLATE NOCASE")
+            params.append(f"%{filters['province'].strip()}%")
+
         # BINS : Spécifique Cc's
         if filters.get('bins'):
              conditions.append("content LIKE ?")
              params.append(f"%{filters['bins'].strip()}%")
 
-        # NOM / TITRE : Correction ici (title au lieu de name)
+        # NOM / TITRE
         if filters.get('name'):
             conditions.append("title LIKE ? COLLATE NOCASE")
             params.append(f"%{filters['name'].strip()}%")
@@ -1671,6 +1674,7 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
         cur.execute(f"SELECT COUNT(*) FROM products WHERE {where_sql}", params)
         total_count = cur.fetchone()[0]
 
+        # On récupère bien toutes les colonnes avec SELECT *
         data_query = f"SELECT * FROM products WHERE {where_sql} ORDER BY id DESC LIMIT ? OFFSET ?"
         rows = cur.execute(data_query, params + [per_page, page * per_page]).fetchall()
         con.close()
@@ -1678,6 +1682,16 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
         prods = []
         for row in rows:
             p = dict(row)
+            
+            # --- LOGIQUE DE CONVERSION PROVINCE (ONTARIO -> ON) ---
+            prov_raw = p.get('province', 'N/A')
+            if prov_raw == "Ontario": 
+                prov_display = "ON"
+            elif prov_raw == "Quebec": 
+                prov_display = "QC"
+            else: 
+                prov_display = prov_raw
+
             prods.append({
                 "id": p['id'], 
                 "title": p['title'], 
@@ -1685,6 +1699,8 @@ def _get_products_optimized(category, page=0, per_page=2, filters=None, tier=Non
                 "stock": p['stock'], 
                 "tier": p['tier'], 
                 "city": p.get('city', 'N/A'),
+                "province": prov_display,             # 👈 AJOUTÉ
+                "postal_code": p.get('postal_code', ''), # 👈 AJOUTÉ
                 "year": p.get('year', 'N/A'),
                 "content": p.get('content', '')
             })
@@ -1803,13 +1819,17 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     total_pages = max(1, (total_items + PER_PAGE - 1) // PER_PAGE)
     sent_ids = []
 
-    # --- 4. AFFICHAGE DES PRODUITS ---
+# --- 4. AFFICHAGE DES PRODUITS ---
     for p in chunk:
         clean_name = p['title'].split('•')[0].strip()
         
+        # Récupération sécurisée des nouvelles données géographiques
+        ville_actuelle = p.get('city', 'N/A')
+        province_actuelle = p.get('province', 'N/A')
+        code_postal_actuel = p.get('postal_code', 'N/A')
+        
         # 🟢 LOGIQUE D'AFFICHAGE : VUE ADMIN VS VUE CLIENT 🟢
         if str(user_id) in ADMIN_IDS:
-            # Vue Admin : Fiche complète directe, toutes les infos visibles
             f = _parse_product_fields(p)
             txt = (
                 f"👁️ **VUE ADMIN (Produit #{p['id']})**\n"
@@ -1819,16 +1839,18 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
                 f"🧾 **SIN**: `{f['sin'] or 'N/A'}`\n"
                 f"📞 **TÉL**: `{f['phone'] or 'N/A'}`\n"
                 f"🏠 **ADRESSE**: `{f['address']}`\n"
-                f"🏙️ **VILLE**: `{f['city']} {f['postal']}`\n"
+                f"🏙️ **VILLE**: `{p['city']}`\n"
+                f"🏙️ **PROVINCE**: `{p['province']}`\n"
+                f"📮 **CODE POSTAL**: `{p['postal_code']}`\n"
                 f"📧 **EMAIL**: `{f['email'] or 'N/A'}`\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"💰 **PRIX**: `{p['price']:.2f} USD` | 📂 **BASE**: `{p.get('tier', 'N/A')}`"
             )
         else:
-            # Vue Client : Résumé masqué
+            # Vue Client : Résumé masqué, on donne la région mais ON CACHE le code postal
             txt = (
                 f"👤 **NOM** : `{clean_name}`\n"
-                f"🏙️ **VILLE** : `{p.get('city', 'N/A')}`\n"
+                f"🏙️ **RÉGION** : `{ville_actuelle}, {province_actuelle}`\n"
                 f"📅 **ANNÉE** : `{p.get('year', 'N/A')}`\n"
                 f"📂 **BASE** : `{p.get('tier', 'N/A')}`\n"
                 f"💰 **PRIX** : `{p['price']:.2f} USD`"
@@ -1878,12 +1900,18 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
 
         
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
-    """Construit le menu de filtre dynamique, AVEC pagination optionnelle."""
+    """Construit le menu de filtre dynamique, AVEC Province et pagination optionnelle."""
     filters = context.user_data.get('pending_filters', {})
     
     def get_label(key, default):
         val = filters.get(key)
-        return f"✅ {default}: {val}" if val else default
+        # Pour la province, on peut afficher le code court (ON/QC) dans le label s'il existe
+        display_val = val
+        if key == "province":
+            if val.lower() in ['ontario', 'on']: display_val = "ON"
+            elif val.lower() in ['quebec', 'qc', 'québec']: display_val = "QC"
+            
+        return f"✅ {default}: {display_val}" if val else default
 
     kb = [
         [
@@ -1891,10 +1919,14 @@ def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = Non
             InlineKeyboardButton(get_label("city", "City"),  callback_data="filter:city")
         ],
         [
+            # --- AJOUT DU BOUTON PROVINCE ICI ---
+            InlineKeyboardButton(get_label("province", "Province"), callback_data="filter:province"),
+            InlineKeyboardButton(get_label("year", "Year"),  callback_data="filter:year")
+        ],
+        [
             InlineKeyboardButton(get_label("base", "Base"),  callback_data="filter:base"),
             InlineKeyboardButton(get_label("price", "Price"), callback_data="filter:price")
         ],
-        [InlineKeyboardButton(get_label("year", "Year"),  callback_data="filter:year")],
         [
             InlineKeyboardButton("🔄 Reset", callback_data="filter_reset"),
             InlineKeyboardButton("🔎 Search ", callback_data="filter_search")
@@ -1916,7 +1948,7 @@ def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = Non
             kb.append(nav_row)
     # --- FIN DU BLOC AJOUTÉ ---
 
-    kb.append([InlineKeyboardButton("⬅️ Annuler (logue)", callback_data="filter_cancel")])
+    kb.append([InlineKeyboardButton("⬅️ Annuler", callback_data="filter_cancel")])
     return InlineKeyboardMarkup(kb)
 
 # ==============================================================================
