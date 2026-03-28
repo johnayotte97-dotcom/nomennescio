@@ -1779,6 +1779,62 @@ async def open_pagination_menu(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="Markdown"
         )
 
+async def check_and_pay_referral_bonus(context: ContextTypes.DEFAULT_TYPE, filleul_id: str):
+    """
+    Vérifie si le dépôt total du filleul est >= 100$.
+    Si oui, verse 5$ au parrain (une seule fois).
+    """
+    try:
+        con = sqlite3.connect(DB_NAME)
+        cur = con.cursor()
+        
+        # 1. On récupère les stats du filleul : total déposé, son parrain, et si le bonus a déjà été payé
+        cur.execute("""
+            SELECT total_recharge, referred_by, ref_bonus_paid 
+            FROM users 
+            WHERE telegram_id = ?
+        """, (str(filleul_id),))
+        
+        row = cur.fetchone()
+        
+        if not row:
+            con.close()
+            return
+
+        total_depose, parrain_id, deja_paye = row
+
+        # 2. Conditions pour verser le bonus :
+        # - Le total déposé doit être >= 100$
+        # - L'utilisateur doit avoir été parrainé (referred_by n'est pas vide)
+        # - Le bonus ne doit pas avoir déjà été versé (ref_bonus_paid == 0)
+        if total_depose >= 100 and parrain_id and parrain_id != "None" and deja_paye == 0:
+            
+            # A. On crédite le parrain de 5$
+            cur.execute("UPDATE users SET balance = balance + 5 WHERE telegram_id = ?", (parrain_id,))
+            
+            # B. On marque le bonus comme payé pour ce filleul
+            cur.execute("UPDATE users SET ref_bonus_paid = 1 WHERE telegram_id = ?", (str(filleul_id),))
+            
+            con.commit()
+            log(f"🎁 BONUS REFERRAL : 5$ versés à {parrain_id} pour le dépôt de {filleul_id}", "REWARD")
+
+            # C. On informe le parrain par message Telegram
+            try:
+                msg_parrain = (
+                    "🎁 **RÉCOMPENSE DE PARRAINAGE**\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "Félicitations ! L'un de vos filleuls a atteint **100$** de dépôt total.\n\n"
+                    "💰 Votre compte a été crédité de **5.00$ USD** !"
+                )
+                await context.bot.send_message(chat_id=parrain_id, text=msg_parrain, parse_mode="Markdown")
+            except Exception as e:
+                print(f"Erreur notif parrain: {e}")
+
+        con.close()
+        
+    except Exception as e:
+        print(f"❌ Erreur check_and_pay_referral_bonus: {e}")
+
 
 async def show_products(update, context, page=0, tier=None, from_filter=False):
     query = update.callback_query
@@ -1899,19 +1955,29 @@ async def show_products(update, context, page=0, tier=None, from_filter=False):
     context.user_data['catalog_msg_ids'] = sent_ids
 
         
+# ==============================================================================
+# 🕵️ SYSTÈME DE FILTRAGE OPTIMISÉ (UX & STABILITÉ)
+# ==============================================================================
+
 def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = None) -> InlineKeyboardMarkup:
-    """Construit le menu de filtre dynamique, AVEC Province et pagination optionnelle."""
+    """Construit le menu de filtre dynamique avec labels et Province."""
     filters = context.user_data.get('pending_filters', {})
     
     def get_label(key, default):
         val = filters.get(key)
-        # Pour la province, on peut afficher le code court (ON/QC) dans le label s'il existe
+        if not val:
+            return default
+            
+        # Sécurité anti-crash si val est None et formatage court
         display_val = val
         if key == "province":
-            if val.lower() in ['ontario', 'on']: display_val = "ON"
-            elif val.lower() in ['quebec', 'qc', 'québec']: display_val = "QC"
+            try:
+                low_val = str(val).lower()
+                if low_val in ['ontario', 'on']: display_val = "ON"
+                elif low_val in ['quebec', 'qc', 'québec']: display_val = "QC"
+            except: pass
             
-        return f"✅ {default}: {display_val}" if val else default
+        return f"✅ {default}: {display_val}"
 
     kb = [
         [
@@ -1919,7 +1985,6 @@ def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = Non
             InlineKeyboardButton(get_label("city", "City"),  callback_data="filter:city")
         ],
         [
-            # --- AJOUT DU BOUTON PROVINCE ICI ---
             InlineKeyboardButton(get_label("province", "Province"), callback_data="filter:province"),
             InlineKeyboardButton(get_label("year", "Year"),  callback_data="filter:year")
         ],
@@ -1929,245 +1994,169 @@ def _build_filter_menu(context: ContextTypes.DEFAULT_TYPE, page_info: dict = Non
         ],
         [
             InlineKeyboardButton("🔄 Reset", callback_data="filter_reset"),
-            InlineKeyboardButton("🔎 Search ", callback_data="filter_search")
+            InlineKeyboardButton("🔎 Search", callback_data="filter_search")
         ]
     ]
     
-    # --- BLOC AJOUTÉ : Ajoute la pagination si fournie ---
     if page_info:
         page = page_info.get('page', 0)
         total_pages = page_info.get('total_pages', 1)
-        
-        # N'affiche la pagination que s'il y a plus d'une page
         if total_pages > 1:
-            nav_row = [
+            kb.append([
                 InlineKeyboardButton("«", callback_data=f"filter:page:{max(0, page-1)}"),
                 InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"),
-                InlineKeyboardButton("»", callback_data=f"filter:page:{min(total_pages-1, page+1)}"),
-            ]
-            kb.append(nav_row)
-    # --- FIN DU BLOC AJOUTÉ ---
+                InlineKeyboardButton("»", callback_data=f"filter:page:{min(total_pages-1, page+1)}")
+            ])
 
     kb.append([InlineKeyboardButton("⬅️ Annuler", callback_data="filter_cancel")])
     return InlineKeyboardMarkup(kb)
 
-# ==============================================================================
-# 🕵️ VERSION DEBUG DU SYSTÈME DE FILTRE
-# ==============================================================================
-
 async def filter_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("\n[DEBUG] 🟢 filter_start : L'utilisateur a cliqué sur Filter", flush=True)
-    q = update.callback_query
-    await q.answer()
-    chat_id = q.message.chat_id
+    """Lance le menu de filtre et nettoie les produits affichés."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = update.effective_chat.id
 
-    # Reset
-    context.user_data['pending_filters'] = {}
-    context.user_data.pop('active_filters', None)
-    print("[DEBUG] Filtres nettoyés. Envoi du menu...", flush=True)
-    
-    # Nettoyage visuel
-    old_catalog_msgs = CATALOG_MSGS.pop(chat_id, [])
-    for mid in old_catalog_msgs:
-        try: await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+    # --- NETTOYAGE RADICAL DES PRODUITS ---
+    sent_msg_ids = context.user_data.get('catalog_msg_ids', [])
+    for msg_id in sent_msg_ids:
+        try: await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
         except: pass
+    context.user_data['catalog_msg_ids'] = []
 
-    kb = _build_filter_menu(context)
-    # On supprime l'ancien message et on envoie du neuf pour éviter les bugs d'ID
-    try: await q.message.delete()
-    except: pass
+    # Initialisation des filtres
+    context.user_data['pending_filters'] = dict(context.user_data.get('active_filters', {}))
     
-    m = await q.message.reply_text("🔎 **MODE FILTRE ACTIVÉ**\nChoisissez un critère ci-dessous :", reply_markup=kb)
-    context.user_data['filter_msgs'] = [m.message_id]
+    txt = "🔎 **OPTIONS DE FILTRAGE**\nConfigurez vos critères :"
+    try:
+        await query.edit_message_text(txt, reply_markup=_build_filter_menu(context), parse_mode="Markdown")
+    except:
+        await context.bot.send_message(chat_id=chat_id, text=txt, reply_markup=_build_filter_menu(context), parse_mode="Markdown")
     
-    print("[DEBUG] Menu filtre affiché. Passage état CATALOG_FILTER_MAIN", flush=True)
     return CATALOG_FILTER_MAIN
 
-async def check_and_pay_referral_bonus(context: ContextTypes.DEFAULT_TYPE, filleul_id: str):
-    """
-    Vérifie si le dépôt total du filleul est >= 100$.
-    Si oui, verse 5$ au parrain (une seule fois).
-    """
-    try:
-        con = sqlite3.connect(DB_NAME)
-        cur = con.cursor()
-        
-        # 1. On récupère les stats du filleul : total déposé, son parrain, et si le bonus a déjà été payé
-        cur.execute("""
-            SELECT total_recharge, referred_by, ref_bonus_paid 
-            FROM users 
-            WHERE telegram_id = ?
-        """, (str(filleul_id),))
-        
-        row = cur.fetchone()
-        
-        if not row:
-            con.close()
-            return
-
-        total_depose, parrain_id, deja_paye = row
-
-        # 2. Conditions pour verser le bonus :
-        # - Le total déposé doit être >= 100$
-        # - L'utilisateur doit avoir été parrainé (referred_by n'est pas vide)
-        # - Le bonus ne doit pas avoir déjà été versé (ref_bonus_paid == 0)
-        if total_depose >= 100 and parrain_id and parrain_id != "None" and deja_paye == 0:
-            
-            # A. On crédite le parrain de 5$
-            cur.execute("UPDATE users SET balance = balance + 5 WHERE telegram_id = ?", (parrain_id,))
-            
-            # B. On marque le bonus comme payé pour ce filleul
-            cur.execute("UPDATE users SET ref_bonus_paid = 1 WHERE telegram_id = ?", (str(filleul_id),))
-            
-            con.commit()
-            log(f"🎁 BONUS REFERRAL : 5$ versés à {parrain_id} pour le dépôt de {filleul_id}", "REWARD")
-
-            # C. On informe le parrain par message Telegram
-            try:
-                msg_parrain = (
-                    "🎁 **RÉCOMPENSE DE PARRAINAGE**\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "Félicitations ! L'un de vos filleuls a atteint **100$** de dépôt total.\n\n"
-                    "💰 Votre compte a été crédité de **5.00$ USD** !"
-                )
-                await context.bot.send_message(chat_id=parrain_id, text=msg_parrain, parse_mode="Markdown")
-            except Exception as e:
-                print(f"Erreur notif parrain: {e}")
-
-        con.close()
-        
-    except Exception as e:
-        print(f"❌ Erreur check_and_pay_referral_bonus: {e}")
-
 async def filter_select_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère le clic sur un critère (Texte ou Province)."""
     q = update.callback_query
     await q.answer()
-    
     field = q.data.split(':', 1)[1]
     context.user_data['current_filter_key'] = field
-    print(f"\n[DEBUG] 🟡 filter_select_type : Catégorie choisie = {field}", flush=True)
-    
-    # Suppression du menu pour afficher la question
+
+    if field == 'province':
+        kb = [
+            [InlineKeyboardButton("🟦 Québec", callback_data="filter_select_prov:Quebec"),
+             InlineKeyboardButton("🟥 Ontario", callback_data="filter_select_prov:Ontario")],
+            [InlineKeyboardButton("🟨 Alberta", callback_data="filter_select_prov:Alberta"),
+             InlineKeyboardButton("🟩 BC", callback_data="filter_select_prov:British Columbia")],
+            [InlineKeyboardButton("🟧 Manitoba", callback_data="filter_select_prov:Manitoba"),
+             InlineKeyboardButton("🟦 Sask.", callback_data="filter_select_prov:Saskatchewan")],
+            [InlineKeyboardButton("🌊 Maritimes", callback_data="filter_select_prov:Maritimes"),
+             InlineKeyboardButton("❄️ Nord", callback_data="filter_select_prov:North")],
+            [InlineKeyboardButton("⬅️ Retour", callback_data="filter_open")]
+        ]
+        await q.edit_message_text("📍 **SÉLECTION PROVINCE**", reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return 
+
+    # Pour les autres (Input texte)
     try: await q.message.delete()
     except: pass
 
     prompts = {
-        'name':  "✍️ **FILTRE NOM**\nEntrez une partie du nom (ex: `Tremblay`) :",
-        'city':  "✍️ **FILTRE VILLE**\nEntrez la ville (ex: `Montreal`) :",
-        'base':  "✍️ **FILTRE BASE**\nEntrez la base (ex: `PROPRO`) :",
-        'price': "✍️ **FILTRE PRIX**\nEntrez le prix max (ex: `10`) :",
-        'year':  "✍️ **FILTRE ANNÉE**\nEntrez l'année (ex: `1995`) :",
+        'name': "✍️ **NOM**\nEntrez une partie du nom :",
+        'city': "✍️ **VILLE**\nEntrez la ville :",
+        'base': "✍️ **BASE**\nEntrez la base :",
+        'price': "✍️ **PRIX**\nEntrez le prix max :",
+        'year': "✍️ **ANNÉE**\nEntrez l'année :",
     }
-    txt = prompts.get(field, f"Entrez la valeur pour {field} :")
-
     msg = await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=txt,
+        text=prompts.get(field, "Entrez la valeur :"),
         reply_markup=kb_back_cancel(), 
         parse_mode="Markdown"
     )
     context.user_data['filter_prompt_id'] = msg.message_id
-    
-    print("[DEBUG] Question posée. Passage état CATALOG_FILTER_AWAIT_VALUE", flush=True)
     return CATALOG_FILTER_AWAIT_VALUE
 
+async def handle_province_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handler spécial pour enregistrer le clic sur une province."""
+    query = update.callback_query
+    selected = query.data.split(":")[1]
+    
+    context.user_data.setdefault('pending_filters', {})['province'] = selected
+    await query.answer(f"✅ {selected}")
+    
+    # Retour automatique au menu principal
+    await query.edit_message_text(
+        "🔎 **OPTIONS DE FILTRAGE**",
+        reply_markup=_build_filter_menu(context),
+        parse_mode="Markdown"
+    )
+
 async def filter_receive_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"\n[DEBUG] 🔵 filter_receive_value : Texte reçu = '{update.message.text}'", flush=True)
-    
-    user_id = update.effective_chat.id
+    """Reçoit la valeur texte et nettoie les messages de question."""
+    val = update.message.text.strip()
     key = context.user_data.get('current_filter_key')
+    user_id = update.effective_chat.id
 
-    if not key:
-        print("[DEBUG] ❌ ERREUR : Pas de clé", flush=True)
-        await context.bot.send_message(chat_id=user_id, text="⚠️ Erreur session. Recommencez.")
-        return await show_products(update, context, page=0)
+    if key:
+        context.user_data.setdefault('pending_filters', {})[key] = val
 
-    # 1. Sauvegarde de la valeur
-    value = update.message.text.strip()
-    context.user_data.setdefault('pending_filters', {})[key] = value
-    
-    # 2. 🧹 NETTOYAGE VISUEL (La solution à ton problème)
+    # Nettoyage automatique
     try:
-        # Supprime ton message (ex: "1997")
         await update.message.delete() 
-        
-        # Supprime la question du bot (ex: "Entrez l'année")
         prompt_id = context.user_data.get('filter_prompt_id')
-        if prompt_id:
-            await context.bot.delete_message(chat_id=user_id, message_id=prompt_id)
-            print(f"[DEBUG] Question {prompt_id} supprimée.", flush=True)
-    except Exception as e:
-        print(f"[DEBUG] Erreur nettoyage : {e}", flush=True)
+        if prompt_id: await context.bot.delete_message(chat_id=user_id, message_id=prompt_id)
+    except: pass
 
-    # 3. Reconstruction et Envoi du menu de résumé
-    kb = _build_filter_menu(context)
-    summary = "🔎 **FILTRES EN COURS**\n\n"
+    summary = "🔎 **FILTRES EN COURS**\n"
     for k, v in context.user_data.get('pending_filters', {}).items():
         summary += f"• {k.capitalize()}: `{v}`\n"
-    summary += "\n👇 Ajoutez un autre critère ou cliquez sur **Search**."
-
-    m = await context.bot.send_message(chat_id=user_id, text=summary, reply_markup=kb, parse_mode="Markdown")
     
-    # On mémorise ce nouveau message pour pouvoir le supprimer au prochain tour
+    m = await context.bot.send_message(
+        chat_id=user_id, 
+        text=summary + "\n👇 Autre critère ou Search ?", 
+        reply_markup=_build_filter_menu(context), 
+        parse_mode="Markdown"
+    )
     context.user_data['filter_msgs'] = [m.message_id]
-    
     return CATALOG_FILTER_MAIN
 
 async def filter_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("\n[DEBUG] 🟣 filter_search : Bouton Search cliqué", flush=True)
+    """Applique les filtres et relance l'affichage."""
     q = update.callback_query
+    await q.answer("🔍 Recherche...")
     
-    # --- AJOUT DU SABLIER ---
-    try:
-        await q.answer("⏳")
-    except:
-        pass
-    # -----------------------
+    context.user_data['active_filters'] = context.user_data.get('pending_filters', {})
     
-    pending = context.user_data.get('pending_filters', {})
-    print(f"[DEBUG] Filtres à appliquer : {pending}", flush=True)
-    
-    context.user_data['active_filters'] = pending
-    
-    # Appel du catalogue
-    print("[DEBUG] Appel de show_products...", flush=True)
-    await show_products(update, context, page=0, tier=None, from_filter=True)
-    
-    print("[DEBUG] Fin recherche. Retour CATALOG_FILTER_MAIN", flush=True)
-    return CATALOG_FILTER_MAIN
-
-async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("\n[DEBUG] 🟠 filter_reset cliqué", flush=True)
-    q = update.callback_query
-    await q.answer("Filtres réinitialisés")
-    
-    context.user_data.pop('pending_filters', None)
-    context.user_data.pop('active_filters', None)
-    
-    # Nettoyage fiches
-    prev = context.user_data.pop("filter_fiches_msg_ids", [])
-    for mid in prev:
-        try: await context.bot.delete_message(chat_id=q.message.chat_id, message_id=mid)
-        except: pass
-
-    kb = _build_filter_menu(context)
-    await q.message.edit_text("🔎 **FILTRES VIDE**\nRecommencez :", reply_markup=kb, parse_mode="Markdown")
-    return CATALOG_FILTER_MAIN
-
-async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print("\n[DEBUG] 🔴 filter_cancel cliqué", flush=True)
-    q = update.callback_query
-    await q.answer()
-    
-    # Nettoyage
-    context.user_data.pop('pending_filters', None)
-    context.user_data.pop('current_filter_key', None)
+    # On supprime le menu de filtrage avant d'afficher les résultats
     try: await q.message.delete()
     except: pass
 
-    print("[DEBUG] Retour catalogue normal", flush=True)
-    await show_products(update, context, page=0, tier=None, from_filter=False)
+    await show_products(update, context, page=0, from_filter=True)
+    return CATALOG_FILTER_MAIN
+
+async def filter_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Efface tout."""
+    q = update.callback_query
+    context.user_data.pop('pending_filters', None)
+    context.user_data.pop('active_filters', None)
+    await q.answer("🔄 Reset terminé")
+    await q.message.edit_text("🔎 **FILTRES VIDE**", reply_markup=_build_filter_menu(context), parse_mode="Markdown")
+    return CATALOG_FILTER_MAIN
+
+async def filter_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Annule et réaffiche les produits originaux."""
+    q = update.callback_query
+    await q.answer()
+    context.user_data.pop('pending_filters', None)
+    
+    try: await q.message.delete()
+    except: pass
+
+    await show_products(update, context, page=0, from_filter=False)
     return ConversationHandler.END
+
+############################################################################################################
 
 CCS_CATALOG_MSGS = {} 
 
@@ -10187,6 +10176,7 @@ id_docs_conv = ConversationHandler(
 #      CONVERSATION PRINCIPALE (Auth & Menu)
 # ====================================================
 
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
@@ -10296,9 +10286,11 @@ def setup_all_handlers(application):
 
     # ---> LA LIGNE CRUCIALE À AJOUTER EST CELLE-CI <---
     # Le group=-1 permet de lire le message avant les autres commandes
+    
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, espion), group=-1)
     
     # ACTIONS BOUTIQUE
+    
     application.add_handler(CallbackQueryHandler(handle_buy_callback, pattern=r"^buy:\d+$"))
     application.add_handler(CallbackQueryHandler(cart_add_callback, pattern=r"^cart:add:\d+$"))
     application.add_handler(CallbackQueryHandler(handle_view_callback, pattern=r"^prod:view:\d+$"))
@@ -10343,6 +10335,7 @@ def setup_all_handlers(application):
     application.add_handler(CallbackQueryHandler(open_pagination_menu, pattern="^open_pagination_menu$"))
     application.add_handler(CallbackQueryHandler(set_pg_callback, pattern="^set_pg_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, custom_pg_receive), group=50)
+    application.add_handler(CallbackQueryHandler(handle_province_selection, pattern="^filter_select_prov:"), group=10)
 
     # GROUPES SECONDAIRES
     application.add_handler(history_filter_conv, group=5)
