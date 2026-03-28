@@ -656,7 +656,7 @@ def generate_ref_number():
     return f"{prefix}{suffix}"
 
 def get_signalwire_balance():
-    """Vérifie la connexion SignalWire."""
+    """Vérifie la connexion SignalWire de manière robuste pour éviter les lags du menu."""
     from dotenv import load_dotenv
     load_dotenv(override=True)
 
@@ -667,34 +667,33 @@ def get_signalwire_balance():
     if not pid or not token:
         return "Clés manquantes"
 
+    # Nettoyage de l'URL
     host = space_url.replace("https://", "").replace("/", "").strip()
-    
-    # On tente de lire l'historique juste pour tester la connexion
     url = f"https://{host}/api/laml/2010-04-01/Accounts/{pid}/Calls.json"
     params = {"PageSize": 1}
 
     try:
-        response = requests.get(url, auth=(pid, token), params=params, timeout=5)
+        # Augmentation du timeout à 15s pour laisser une chance au VPS
+        response = requests.get(url, auth=(pid, token), params=params, timeout=15)
         
         if response.status_code == 200:
             return "✅ Connecté (Full)"
-            
         elif response.status_code == 403:
-            # 403 = Authentifié mais lecture interdite.
-            # C'est bon signe : les clés sont valides pour envoyer des appels.
             return "✅ Connecté (Appels OK)"
-            
         elif response.status_code == 401:
             return "❌ Erreur Clés (401)"
-        
         elif response.status_code == 404:
             return "❌ Erreur Projet (404)"
 
         return f"Erreur {response.status_code}"
 
+    except requests.exceptions.Timeout:
+        # En cas de timeout, on renvoie un message discret pour ne pas effrayer l'admin
+        logger.warning(f"[SW TIMEOUT] SignalWire n'a pas répondu en 15s.")
+        return "⏳ Timeout Réseau"
     except Exception as e:
         logger.error(f"[SW ERROR] {e}")
-        return "Erreur Connexion"
+        return "❌ Erreur Connexion"
 
 def get_barcode_balance():
     """Récupère le solde Barcode Solution (Clé: credits)."""
@@ -1582,14 +1581,17 @@ async def show_main_menu(user_id: int, clear: bool = True):
     statut_code = get_user_statut(str(u_id)) 
     lang = get_user_lang(str(u_id))
     
-    # --- LOGIQUE ADMIN INFO ---
+    # --- LOGIQUE ADMIN INFO (Uniforme sans l'en-tête Stats) ---
     admin_info = ""
     if str(u_id) in ADMIN_IDS:
         try:
-            sw_bal = get_signalwire_balance()
-            bc_bal = get_barcode_balance()
-            sim_bal = api_5sim_get_balance()
-            admin_info = f"\n\n📊 **Admin Stats**:\n🏦 SignalWire: {sw_bal}\n🪪 Barcode: {bc_bal}\n📱 5SIM: {sim_bal}"
+            # On passe par asyncio.to_thread pour éviter le lag au PIN
+            sw_bal = await asyncio.to_thread(get_signalwire_balance)
+            bc_bal = await asyncio.to_thread(get_barcode_balance)
+            sim_bal = await asyncio.to_thread(api_5sim_get_balance)
+            
+            # Ici on a juste enlevé l'en-tête "📊 Admin Stats"
+            admin_info = f"\n🏦 SignalWire: {sw_bal}\n🪪 Barcode: {bc_bal}\n📱 5SIM: {sim_bal}"
         except:
             admin_info = "\n\n⚠️ Erreur API Admin"
 
@@ -1603,7 +1605,6 @@ async def show_main_menu(user_id: int, clear: bool = True):
     statut_label = f"🏆 Statut : {details_forfait['label']}"
     
     # --- ENVOI DU MESSAGE ---
-    # On utilise directement app_telegram.bot pour être sûr d'atteindre le chat
     try:
         await app_telegram.bot.send_message(
             chat_id=u_id,
@@ -3829,17 +3830,15 @@ async def auth_create_pin_save(update: Update, context: ContextTypes.DEFAULT_TYP
 async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- 🛡️ PROTECTION MAINTENANCE ---
     if await is_maintenance_active(update, context): 
-        return ID_AUTH_WAIT_PIN_LOGIN # On reste sur l'écran PIN mais bloqué
+        return ID_AUTH_WAIT_PIN_LOGIN
 
     q = update.callback_query
-    # On répond tout de suite pour enlever le sablier
     try: await q.answer() 
     except: pass
     
     data = q.data
     user_id_int = update.effective_user.id
     user_id_str = str(user_id_int)
-    
     current_input = context.user_data.get('temp_pin_input', "")
 
     # --- 1. CHIFFRES ---
@@ -3849,20 +3848,9 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current_input += digit
             context.user_data['temp_pin_input'] = current_input
             
-            mask = "⚫" * len(current_input) + "◯" * (4 - len(current_input))
-            try:
-                await q.edit_message_text(
-                    f"🔒 **TERMINAL VERROUILLÉ**\nPIN : `{mask}`",
-                    reply_markup=get_pin_keyboard(),
-                    parse_mode="Markdown"
-                )
-            except: pass
-
-            # --- VALIDATION AUTO ---
+            # --- VALIDATION INSTANTANÉE (Dès le 4ème chiffre) ---
             if len(current_input) == 4:
-                import asyncio
-                await asyncio.sleep(0.1) 
-                
+                # On cherche uniquement le PIN pour la vitesse
                 con = sqlite3.connect(DB_NAME)
                 row = con.execute("SELECT pin_code FROM users WHERE telegram_id=?", (user_id_str,)).fetchone()
                 con.close()
@@ -3873,18 +3861,13 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     context.user_data['temp_pin_input'] = ""
                     context.user_data['last_login_time'] = time.time()
                     
-                    # On supprime le clavier PIN proprement
+                    # Nettoyage ultra-rapide
                     try: await q.message.delete()
                     except: pass
                     
-                    # APPEL DU MENU PRINCIPAL
-                    try:
-                        await show_main_menu(user_id_int, clear=True)
-                        return ConversationHandler.END
-                    except Exception as e:
-                        print(f"Erreur menu: {e}")
-                        await context.bot.send_message(chat_id=user_id_int, text="🔓 Accès autorisé. Faites /start")
-                        return ConversationHandler.END
+                    # On lance le menu SANS attendre (asyncio.create_task si nécessaire, mais ici direct c'est mieux)
+                    await show_main_menu(user_id_int, clear=True)
+                    return ConversationHandler.END
                 else:
                     # ❌ PIN FAUX
                     context.user_data['temp_pin_input'] = ""
@@ -3896,12 +3879,22 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             parse_mode="Markdown"
                         )
                     except: pass
+            else:
+                # Mise à jour du masque visuel pendant la saisie (1, 2 ou 3 chiffres)
+                mask = "⚫" * len(current_input) + "◯" * (4 - len(current_input))
+                try:
+                    await q.edit_message_text(
+                        f"🔒 **TERMINAL VERROUILLÉ**\nPIN : `{mask}`",
+                        reply_markup=get_pin_keyboard(),
+                        parse_mode="Markdown"
+                    )
+                except: pass
 
     # --- 2. EFFACER ---
     elif data == "pin_del":
         current_input = current_input[:-1]
         context.user_data['temp_pin_input'] = current_input
-        mask = "⚫" * len(current_input) + "◯" * (4 - len(current_input))
+        mask = "⚫" * len(current_input) + "◯" * (4 - len(current_input)) if current_input else "◯◯◯◯"
         try:
             await q.edit_message_text(
                 f"🔒 **TERMINAL VERROUILLÉ**\nPIN : `{mask}`",
@@ -3912,29 +3905,18 @@ async def auth_pin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- 3. LOG OUT / CHANGER DE COMPTE ---
     elif data == "pin_logout":
-        # On vide le code tapé
         context.user_data['temp_pin_input'] = ""
-        # On débloque la session pour permettre la création/importation
         context.user_data['is_locked'] = False 
-        
-        kb = [
-            [InlineKeyboardButton("🆕 Créer un Wallet (Nouveau)", callback_data="auth_create")],
-            [InlineKeyboardButton("📥 Importer un compte (Existant)", callback_data="auth_import_start")]
-        ]
-        
-        # On supprime le pavé numérique pour faire propre
-        try:
-            await q.message.delete()
+        try: await q.message.delete()
         except: pass
         
-        # On affiche le menu de configuration initial
+        kb = [
+            [InlineKeyboardButton("🆕 Créer un Wallet", callback_data="auth_create")],
+            [InlineKeyboardButton("📥 Importer un compte", callback_data="auth_import_start")]
+        ]
         await context.bot.send_message(
             chat_id=user_id_int,
-            text=(
-                "🛑 **DÉCONNEXION RÉUSSIE**\n━━━━━━━━━━━━━━━━━━\n"
-                "Votre session a été fermée et le terminal est réinitialisé.\n\n"
-                "👉 Que souhaitez-vous faire ?"
-            ),
+            text="🛑 **DÉCONNEXION RÉUSSIE**\nLe terminal a été réinitialisé.",
             reply_markup=InlineKeyboardMarkup(kb),
             parse_mode="Markdown"
         )
@@ -6614,11 +6596,10 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = user.username or "Inconnu"
     data = q.data
 
-    # 1. LOGGING ISOLÉ : On enregistre l'action dans le fichier personnel de l'user
-    # Le statut est "INTERACTION" pour les clics de boutons
+    # 1. LOGGING ISOLÉ
     log_custom_event(user_id, username, f"Clic bouton: {data}", status="INTERACTION")
 
-    # 2. Réponse au clic pour débloquer l'interface
+    # 2. Réponse au clic
     try: 
         await q.answer()
     except:
@@ -6629,6 +6610,17 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "menu_accueil":
             context.user_data['cart_return_to'] = "menu_accueil"
             return await goto_menu(update, context)
+
+        # --- SECTION PARRAINAGE (RÉPARATION) ---
+        if data == "show_referral":
+            return await show_referral_menu(update, context)
+
+        # --- SECTION COMPTE & TOOLS ---
+        if data == "account_menu":
+            return await account_menu(update, context)
+        
+        if data == "section_tools":
+            return await show_tools_menu(update, context)
 
         # --- SECTION HISTORIQUE ---
         if data == "hist:view":
@@ -6643,19 +6635,19 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "hist:ids":
             return await show_ids_history(update, context)
 
-        # --- SECTION BOUTIQUE ---
+        # --- SECTION BOUTIQUE PROPRO ---
         if data in ["propro", "cat:propro"]:
             context.user_data["prod_tier"] = None
             context.user_data['cart_return_to'] = "cat:propro"
             return await show_products(update, context, page=0, tier=None)
 
-        # 🟢 ---> LA RÉPARATION DU BOUTON CC'S EST ICI <--- 🟢
+        # --- SECTION BOUTIQUE CC'S ---
         if data == "ccs_catalog_start":
             context.user_data["prod_tier"] = None
             context.user_data['cart_return_to'] = "ccs_catalog_start"
             return await show_products_ccs(update, context, page=0, tier=None)
-        # ----------------------------------------------------
 
+        # --- NAVIGATION PAGES ---
         if data.startswith("prod:page:"):
             page = int(data.split(":")[2])
             tier = context.user_data.get("prod_tier")
@@ -6671,7 +6663,6 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         error_detail = traceback.format_exc()
-        
         log_custom_event(user_id, username, f"CRASH sur bouton: {data}", status="ERROR", reason=str(e))
         
         with open("logs/debug_crash.log", "a", encoding="utf-8") as f:
@@ -8663,29 +8654,59 @@ async def account_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return SELECT_TOOL 
 
 async def show_referral_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Affiche le menu de parrainage avec les statistiques et le lien unique."""
     user_id = update.effective_user.id
-    bot_username = (await context.bot.get_me()).username
-    ref_link = f"https://t.me/{bot_username}?start={user_id}"
     
-    con = sqlite3.connect(DB_NAME)
-    # Compter le nombre de filleuls
-    count = con.execute("SELECT count(*) FROM users WHERE referred_by=?", (str(user_id),)).fetchone()[0]
-    con.close()
+    # 1. Récupération du pseudo du bot pour le lien
+    try:
+        bot_info = await context.bot.get_me()
+        bot_username = bot_info.username
+        ref_link = f"https://t.me/{bot_username}?start={user_id}"
+    except Exception as e:
+        print(f"Erreur get_me parrainage: {e}")
+        ref_link = f"Lien indisponible"
 
+    # 2. Récupération du nombre de filleuls en DB
+    try:
+        con = sqlite3.connect(DB_NAME)
+        # On s'assure de chercher par string car telegram_id est souvent stocké en TEXT
+        count = con.execute("SELECT count(*) FROM users WHERE referred_by=?", (str(user_id),)).fetchone()[0]
+        con.close()
+    except Exception as e:
+        print(f"Erreur SQL parrainage: {e}")
+        count = 0
+
+    # 3. Préparation du message
     text = (
-        "🤝 **PROGRAMME DE PARRAINAGE**\n\n"
-        "Invitez vos amis et gagnez des récompenses sur chaque dépôt !\n\n"
-        f"👥 **Filleuls :** `{count}`\n"
-        f"🔗 **Votre lien :**\n`{ref_link}`\n\n"
-        " _(Appuyez sur le lien pour le copier)_"
+        "🤝 **PROGRAMME DE PARRAINAGE**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "Invitez vos amis et gagnez des récompenses sur chaque dépôt qualifié !\n\n"
+        f"👥 **Filleuls actifs :** `{count}`\n"
+        f"🔗 **Votre lien unique :**\n`{ref_link}`\n\n"
+        "⚡ _Appuyez sur le lien ci-dessus pour le copier._"
     )
     
+    # 4. Clavier de retour
+    # Si l'utilisateur vient du menu "Mon Compte", on le renvoie là-bas
     kb = [[InlineKeyboardButton("⬅️ Retour", callback_data="account_menu")]]
     
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    # 5. Envoi/Édition
+    try:
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(
+                text, 
+                reply_markup=InlineKeyboardMarkup(kb), 
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                text, 
+                reply_markup=InlineKeyboardMarkup(kb), 
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        print(f"Erreur affichage parrainage: {e}")
 
 # --- 1. CHANGER PIN (CLEAN) ---
 async def acc_ask_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
